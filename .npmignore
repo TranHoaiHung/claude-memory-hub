@@ -1,0 +1,25 @@
+# Development files
+plans/
+hooks/
+src/
+.claude/
+*.ts
+tsconfig.json
+bunfig.toml
+install.sh
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# Test
+*.test.ts
+__tests__/
+
+# OS
+.DS_Store
+Thumbs.db

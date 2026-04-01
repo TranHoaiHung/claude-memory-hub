@@ -1,0 +1,26 @@
+# Source code — protected in private repo
+src/
+hooks/
+plans/
+tsconfig.json
+install.sh
+.claude/
+
+# Build artifacts tracked in public repo (dist/ IS committed)
+# dist/ — intentionally NOT ignored
+
+# Dependencies
+node_modules/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*

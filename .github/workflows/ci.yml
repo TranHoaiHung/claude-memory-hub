@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Verify Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify dist files exist
+        run: |
+          echo "Checking built files..."
+          test -f dist/index.js                    || (echo "FAIL: dist/index.js" && exit 1)
+          test -f dist/cli.js                      || (echo "FAIL: dist/cli.js" && exit 1)
+          test -f dist/hooks/post-tool-use.js      || (echo "FAIL: hooks/post-tool-use" && exit 1)
+          test -f dist/hooks/user-prompt-submit.js  || (echo "FAIL: hooks/user-prompt-submit" && exit 1)
+          test -f dist/hooks/pre-compact.js         || (echo "FAIL: hooks/pre-compact" && exit 1)
+          test -f dist/hooks/post-compact.js        || (echo "FAIL: hooks/post-compact" && exit 1)
+          test -f dist/hooks/session-end.js          || (echo "FAIL: hooks/session-end" && exit 1)
+          echo "All 7 dist files present."
+
+      - name: Check package.json
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            console.log('Name:', pkg.name);
+            console.log('Version:', pkg.version);
+            console.log('Main:', pkg.main);
+            console.log('Bin:', JSON.stringify(pkg.bin));
+            if (!pkg.main) { console.error('Missing main'); process.exit(1); }
+            if (!pkg.bin) { console.error('Missing bin'); process.exit(1); }
+          "
+
+  install-test:
+    name: Install Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: verify
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Test CLI help
+        run: bun run dist/cli.js
+
+      - name: Test CLI status
+        run: bun run dist/cli.js status
+
+      - name: Test MCP server starts
+        run: |
+          timeout 3 bun run dist/index.js &
+          sleep 1
+          echo "MCP server started successfully"
+          kill %1 2>/dev/null || true

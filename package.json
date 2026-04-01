@@ -1,0 +1,56 @@
+{
+  "name": "claude-memory-hub",
+  "version": "0.4.0",
+  "description": "Persistent memory system for Claude Code. Zero API key. Zero Python. 5 hooks + MCP server + SQLite FTS5.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claude-memory-hub": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun --entry-naming [name].js",
+    "build:cli": "bun build src/cli/main.ts --outdir dist --target bun --entry-naming cli.js",
+    "build:hooks": "bun build src/hooks-entry/post-tool-use.ts src/hooks-entry/session-end.ts src/hooks-entry/user-prompt-submit.ts src/hooks-entry/pre-compact.ts src/hooks-entry/post-compact.ts --outdir dist/hooks --target bun --entry-naming [name].js",
+    "build:all": "bun run build && bun run build:cli && bun run build:hooks",
+    "dev": "bun run --watch src/index.ts",
+    "prepublishOnly": "bun run build:all",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "memory",
+    "mcp",
+    "context",
+    "persistent-memory",
+    "sqlite",
+    "fts5"
+  ],
+  "author": "TranHoaiHung",
+  "license": "MIT",
+  "homepage": "https://github.com/TranHoaiHung/claude-memory-hub#readme",
+  "bugs": {
+    "url": "https://github.com/TranHoaiHung/claude-memory-hub/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TranHoaiHung/claude-memory-hub.git"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}
