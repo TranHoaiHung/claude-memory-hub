@@ -737,49 +737,52 @@ __export(exports_viewer, {
 function handleApi(url) {
   const db = getDatabase();
   const path = url.pathname;
-  if (path === "/api/health") {
-    const report = runHealthCheck(db);
-    return json(report);
-  }
-  if (path === "/api/stats") {
-    const sessions = db.query("SELECT COUNT(*) as c FROM sessions").get()?.c ?? 0;
-    const entities = db.query("SELECT COUNT(*) as c FROM entities").get()?.c ?? 0;
-    const summaries = db.query("SELECT COUNT(*) as c FROM long_term_summaries").get()?.c ?? 0;
-    const notes = db.query("SELECT COUNT(*) as c FROM session_notes").get()?.c ?? 0;
-    return json({ sessions, entities, summaries, notes });
-  }
-  if (path === "/api/search") {
-    const query = url.searchParams.get("q") || "";
-    const limit = parseInt(url.searchParams.get("limit") || "20");
-    const offset = parseInt(url.searchParams.get("offset") || "0");
-    const project = url.searchParams.get("project") || undefined;
-    const results = searchIndex(query, { limit, offset, project }, db);
-    return json(results);
-  }
-  if (path === "/api/sessions") {
-    const limit = parseInt(url.searchParams.get("limit") || "50");
-    const offset = parseInt(url.searchParams.get("offset") || "0");
-    const rows = db.query("SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?", limit, offset).all();
-    return json(rows);
-  }
-  if (path === "/api/summaries") {
-    const limit = parseInt(url.searchParams.get("limit") || "50");
-    const offset = parseInt(url.searchParams.get("offset") || "0");
-    const rows = db.query("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ? OFFSET ?", limit, offset).all();
-    return json(rows);
-  }
-  if (path === "/api/entities") {
-    const sessionId = url.searchParams.get("session_id");
-    const limit = parseInt(url.searchParams.get("limit") || "100");
-    const offset = parseInt(url.searchParams.get("offset") || "0");
-    if (sessionId) {
-      const rows2 = db.query("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", sessionId, limit, offset).all();
-      return json(rows2);
+  try {
+    if (path === "/api/health") {
+      return json(runHealthCheck(db));
     }
-    const rows = db.query("SELECT * FROM entities ORDER BY created_at DESC LIMIT ? OFFSET ?", limit, offset).all();
-    return json(rows);
+    if (path === "/api/stats") {
+      const sessions = db.prepare("SELECT COUNT(*) as c FROM sessions").get()?.c ?? 0;
+      const entities = db.prepare("SELECT COUNT(*) as c FROM entities").get()?.c ?? 0;
+      const summaries = db.prepare("SELECT COUNT(*) as c FROM long_term_summaries").get()?.c ?? 0;
+      const notes = db.prepare("SELECT COUNT(*) as c FROM session_notes").get()?.c ?? 0;
+      return json({ sessions, entities, summaries, notes });
+    }
+    if (path === "/api/search") {
+      const query = url.searchParams.get("q") || "";
+      const limit = parseInt(url.searchParams.get("limit") || "20");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const project = url.searchParams.get("project");
+      return json(searchIndex(query, { limit, offset, ...project ? { project } : {} }, db));
+    }
+    if (path === "/api/sessions") {
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const rows = db.prepare("SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+      return json(rows);
+    }
+    if (path === "/api/summaries") {
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const rows = db.prepare("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+      return json(rows);
+    }
+    if (path === "/api/entities") {
+      const sessionId = url.searchParams.get("session_id");
+      const limit = parseInt(url.searchParams.get("limit") || "100");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      if (sessionId) {
+        const rows2 = db.prepare("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?").all(sessionId, limit, offset);
+        return json(rows2);
+      }
+      const rows = db.prepare("SELECT * FROM entities ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+      return json(rows);
+    }
+    return json({ error: "Not found" }, 404);
+  } catch (e) {
+    log5.error("API error", { path, error: String(e) });
+    return json({ error: String(e) }, 500);
   }
-  return json({ error: "Not found" }, 404);
 }
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -791,10 +794,25 @@ function startViewer() {
   const server = Bun.serve({
     port: PORT,
     fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname.startsWith("/api/"))
-        return handleApi(url);
-      return new Response(HTML, { headers: { "Content-Type": "text/html" } });
+      try {
+        const url = new URL(req.url);
+        if (url.pathname.startsWith("/api/"))
+          return handleApi(url);
+        return new Response(HTML, { headers: { "Content-Type": "text/html" } });
+      } catch (e) {
+        log5.error("Server fetch error", { error: String(e) });
+        return new Response(JSON.stringify({ error: String(e) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    },
+    error(err) {
+      log5.error("Server error", { error: String(err) });
+      return new Response(JSON.stringify({ error: String(err) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
     }
   });
   console.log(`claude-memory-hub viewer running at http://localhost:${server.port}`);
@@ -805,95 +823,171 @@ var log5, PORT = 37888, HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-memory-hub viewer</title>
+<title>claude-memory-hub</title>
 <style>
-  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
-  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-  header { display: flex; align-items: center; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
-  header h1 { font-size: 20px; font-weight: 600; }
-  .stats { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
-  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 140px; }
-  .stat .value { font-size: 28px; font-weight: 700; color: var(--accent); }
-  .stat .label { font-size: 12px; color: var(--muted); text-transform: uppercase; }
-  .search-bar { display: flex; gap: 8px; margin-bottom: 24px; }
-  .search-bar input { flex: 1; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; color: var(--text); font-size: 14px; outline: none; }
-  .search-bar input:focus { border-color: var(--accent); }
-  .search-bar button { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 10px 20px; cursor: pointer; font-weight: 600; }
-  .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
-  .tabs button { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
-  .tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 8px; }
-  .card .meta { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .card .type { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-  .type-summary { background: rgba(88,166,255,0.15); color: var(--accent); }
-  .type-entity { background: rgba(63,185,80,0.15); color: var(--green); }
-  .type-session { background: rgba(210,153,34,0.15); color: var(--yellow); }
-  .card .content { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
-  .health { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
-  .health .check { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-  .check-ok { background: rgba(63,185,80,0.15); color: var(--green); }
-  .check-degraded { background: rgba(210,153,34,0.15); color: var(--yellow); }
-  .check-error { background: rgba(248,81,73,0.15); color: var(--red); }
-  .pagination { display: flex; justify-content: center; gap: 8px; margin-top: 16px; }
-  .pagination button { background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 14px; cursor: pointer; }
-  .pagination button:disabled { opacity: 0.4; cursor: default; }
-  .empty { text-align: center; color: var(--muted); padding: 40px; }
-  #results { min-height: 200px; }
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121a;
+  --card: #1a1a26;
+  --card-hover: #22222f;
+  --border: #2a2a3a;
+  --border-light: #3a3a4f;
+  --text: #e4e4ef;
+  --text-secondary: #9494a8;
+  --text-muted: #6a6a80;
+  --accent: #7c6bf5;
+  --accent-light: #9d8fff;
+  --accent-bg: rgba(124,107,245,0.1);
+  --green: #4ade80;
+  --green-bg: rgba(74,222,128,0.08);
+  --yellow: #facc15;
+  --yellow-bg: rgba(250,204,21,0.08);
+  --red: #f87171;
+  --red-bg: rgba(248,113,113,0.08);
+  --blue: #60a5fa;
+  --blue-bg: rgba(96,165,250,0.08);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; min-height: 100vh; }
+
+/* Layout */
+.app { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+
+/* Header */
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 32px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+.header-left { display: flex; align-items: center; gap: 14px; }
+.logo { width: 36px; height: 36px; background: linear-gradient(135deg, var(--accent), #a78bfa); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+.header h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+.header h1 span { color: var(--text-muted); font-weight: 400; }
+.health-badges { display: flex; gap: 6px; }
+.badge { padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; letter-spacing: 0.02em; }
+.badge-ok { background: var(--green-bg); color: var(--green); }
+.badge-degraded { background: var(--yellow-bg); color: var(--yellow); }
+.badge-error { background: var(--red-bg); color: var(--red); }
+
+/* Stats */
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; transition: border-color var(--transition); }
+.stat-card:hover { border-color: var(--border-light); }
+.stat-value { font-size: 32px; font-weight: 700; background: linear-gradient(135deg, var(--accent-light), var(--blue)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; line-height: 1.2; }
+.stat-label { font-size: 11px; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px; }
+
+/* Search */
+.search-wrap { position: relative; margin-bottom: 24px; }
+.search-wrap input { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 18px 14px 44px; color: var(--text); font-size: 14px; outline: none; transition: all var(--transition); }
+.search-wrap input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+.search-wrap input::placeholder { color: var(--text-muted); }
+.search-icon { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
+
+/* Tabs */
+.tabs { display: flex; gap: 4px; margin-bottom: 20px; background: var(--surface); border-radius: var(--radius); padding: 4px; border: 1px solid var(--border); }
+.tab { flex: 1; background: transparent; border: none; color: var(--text-muted); border-radius: var(--radius-sm); padding: 10px 16px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all var(--transition); }
+.tab:hover { color: var(--text-secondary); background: var(--card); }
+.tab.active { background: var(--accent); color: #fff; }
+.tab .count { font-size: 11px; opacity: 0.7; margin-left: 4px; }
+
+/* Cards */
+#results { display: flex; flex-direction: column; gap: 8px; min-height: 200px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; transition: all var(--transition); cursor: default; }
+.card:hover { background: var(--card-hover); border-color: var(--border-light); }
+.card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.card-type { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap; }
+.type-summary { background: var(--accent-bg); color: var(--accent-light); }
+.type-entity, .type-file_read { background: var(--green-bg); color: var(--green); }
+.type-file_modified, .type-file_created { background: var(--blue-bg); color: var(--blue); }
+.type-error { background: var(--red-bg); color: var(--red); }
+.type-decision { background: var(--yellow-bg); color: var(--yellow); }
+.type-session { background: var(--yellow-bg); color: var(--yellow); }
+.card-meta { font-size: 12px; color: var(--text-muted); display: flex; gap: 12px; flex-wrap: wrap; }
+.card-content { font-size: 13.5px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; line-height: 1.65; max-height: 200px; overflow: hidden; position: relative; }
+.card-content.expanded { max-height: none; }
+.card-expand { background: none; border: none; color: var(--accent); font-size: 12px; cursor: pointer; margin-top: 6px; padding: 0; }
+
+/* Pagination */
+.pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 24px; }
+.pg-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm); padding: 8px 18px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all var(--transition); }
+.pg-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pg-btn:disabled { opacity: 0.3; cursor: default; }
+.pg-info { color: var(--text-muted); font-size: 13px; min-width: 80px; text-align: center; }
+
+/* Empty state */
+.empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; color: var(--text-muted); }
+.empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.3; }
+.empty-text { font-size: 14px; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .app { padding: 16px; }
+  .header { flex-direction: column; align-items: flex-start; gap: 12px; }
+}
 </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <h1>claude-memory-hub</h1>
-    <div id="health"></div>
-  </header>
+<div class="app">
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">M</div>
+      <h1>memory-hub <span>viewer</span></h1>
+    </div>
+    <div class="health-badges" id="health"></div>
+  </div>
 
   <div class="stats" id="stats"></div>
 
-  <div class="search-bar">
-    <input id="searchInput" type="text" placeholder="Search memories..." />
-    <button onclick="doSearch()">Search</button>
+  <div class="search-wrap">
+    <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input id="searchInput" type="text" placeholder="Search memories, files, decisions..." />
   </div>
 
-  <div class="tabs">
-    <button class="active" onclick="switchTab('summaries',this)">Summaries</button>
-    <button onclick="switchTab('sessions',this)">Sessions</button>
-    <button onclick="switchTab('entities',this)">Entities</button>
+  <div class="tabs" id="tabsContainer">
+    <button class="tab active" onclick="switchTab('summaries',this)">Summaries <span class="count" id="cnt-summaries"></span></button>
+    <button class="tab" onclick="switchTab('sessions',this)">Sessions <span class="count" id="cnt-sessions"></span></button>
+    <button class="tab" onclick="switchTab('entities',this)">Entities <span class="count" id="cnt-entities"></span></button>
   </div>
 
   <div id="results"></div>
 
   <div class="pagination">
-    <button id="prevBtn" onclick="paginate(-1)" disabled>&larr; Previous</button>
-    <span id="pageInfo" style="color:var(--muted);font-size:13px;padding:6px;"></span>
-    <button id="nextBtn" onclick="paginate(1)">Next &rarr;</button>
+    <button class="pg-btn" id="prevBtn" onclick="paginate(-1)" disabled>Previous</button>
+    <span class="pg-info" id="pageInfo"></span>
+    <button class="pg-btn" id="nextBtn" onclick="paginate(1)">Next</button>
   </div>
 </div>
 
 <script>
-let currentTab = 'summaries';
-let currentOffset = 0;
-const PAGE_SIZE = 20;
+let currentTab = 'summaries', currentOffset = 0;
+const PAGE_SIZE = 15;
 
 async function api(path) {
-  const res = await fetch(path);
-  return res.json();
+  try {
+    const res = await fetch(path);
+    if (!res.ok) return [];
+    return res.json();
+  } catch { return []; }
 }
 
 async function init() {
   const [stats, health] = await Promise.all([api('/api/stats'), api('/api/health')]);
 
-  document.getElementById('stats').innerHTML =
-    ['sessions','entities','summaries','notes'].map(k =>
-      '<div class="stat"><div class="value">'+stats[k]+'</div><div class="label">'+k+'</div></div>'
-    ).join('');
+  document.getElementById('stats').innerHTML = [
+    {k:'sessions',icon:'S'}, {k:'entities',icon:'E'}, {k:'summaries',icon:'M'}, {k:'notes',icon:'N'}
+  ].map(({k}) =>
+    '<div class="stat-card"><div class="stat-value">'+(stats[k]||0)+'</div><div class="stat-label">'+k+'</div></div>'
+  ).join('');
 
-  document.getElementById('health').innerHTML = health.checks.map(c => {
-    const cls = 'check-' + c.status;
-    return '<span class="check '+cls+'">'+c.component+': '+c.status+'</span>';
-  }).join('');
+  document.getElementById('cnt-summaries').textContent = stats.summaries || '';
+  document.getElementById('cnt-sessions').textContent = stats.sessions || '';
+  document.getElementById('cnt-entities').textContent = stats.entities || '';
+
+  if (health.checks) {
+    document.getElementById('health').innerHTML = health.checks.map(function(c) {
+      return '<span class="badge badge-'+c.status+'">'+c.component+'</span>';
+    }).join('');
+  }
 
   loadTab();
 }
@@ -901,62 +995,57 @@ async function init() {
 function switchTab(tab, btn) {
   currentTab = tab;
   currentOffset = 0;
-  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active')});
   btn.classList.add('active');
   loadTab();
 }
 
 async function loadTab() {
-  const results = document.getElementById('results');
-  results.innerHTML = '<div class="empty">Loading...</div>';
+  var results = document.getElementById('results');
+  results.innerHTML = '<div class="empty"><div class="empty-icon">...</div><div class="empty-text">Loading</div></div>';
 
-  const data = await api('/api/' + currentTab + '?limit=' + PAGE_SIZE + '&offset=' + currentOffset);
+  var data = await api('/api/' + currentTab + '?limit=' + PAGE_SIZE + '&offset=' + currentOffset);
 
-  if (data.length === 0) {
-    results.innerHTML = '<div class="empty">No data yet.</div>';
+  if (!data || data.length === 0 || data.error) {
+    results.innerHTML = '<div class="empty"><div class="empty-icon">O</div><div class="empty-text">'+(data&&data.error ? esc(data.error) : 'No data yet')+'</div></div>';
     updatePagination(0);
     return;
   }
 
   if (currentTab === 'summaries') {
-    results.innerHTML = data.map(s =>
-      '<div class="card"><div class="meta"><span class="type type-summary">summary</span> ' +
-      fmtDate(s.created_at) + ' | ' + esc(s.project) + ' | session: ' + esc(s.session_id).slice(0,8) + '...</div>' +
-      '<div class="content">' + esc(s.summary) + '</div></div>'
-    ).join('');
+    results.innerHTML = data.map(function(s) {
+      var preview = (s.summary||'').slice(0, 300);
+      return '<div class="card"><div class="card-header"><span class="card-type type-summary">summary</span><div class="card-meta"><span>'+fmtDate(s.created_at)+'</span><span>'+esc(s.project)+'</span><span>'+esc(s.session_id||'').slice(0,8)+'</span></div></div><div class="card-content" onclick="this.classList.toggle('expanded')">'+esc(preview)+'</div>'+(s.summary&&s.summary.length>300?'<button class="card-expand" onclick="this.previousElementSibling.classList.toggle('expanded')">Show more</button>':'')+'</div>';
+    }).join('');
   } else if (currentTab === 'sessions') {
-    results.innerHTML = data.map(s =>
-      '<div class="card"><div class="meta"><span class="type type-session">session</span> ' +
-      fmtDate(s.started_at) + ' | ' + esc(s.project) + ' | ' + esc(s.status) + '</div>' +
-      '<div class="content">' + esc(s.user_prompt || '(no prompt)') + '</div></div>'
-    ).join('');
+    results.innerHTML = data.map(function(s) {
+      var statusCls = s.status==='completed'?'type-summary':s.status==='failed'?'type-error':'type-session';
+      return '<div class="card"><div class="card-header"><span class="card-type '+statusCls+'">'+esc(s.status)+'</span><div class="card-meta"><span>'+fmtDate(s.started_at)+'</span><span>'+esc(s.project)+'</span><span>'+esc(s.id||'').slice(0,12)+'</span></div></div><div class="card-content">'+esc(s.user_prompt||'(no prompt recorded)')+'</div></div>';
+    }).join('');
   } else {
-    results.innerHTML = data.map(e =>
-      '<div class="card"><div class="meta"><span class="type type-entity">' + esc(e.entity_type) + '</span> ' +
-      fmtDate(e.created_at) + ' | ' + esc(e.tool_name) + ' | importance: ' + e.importance + '</div>' +
-      '<div class="content">' + esc(e.entity_value) + (e.context ? '\\n' + esc(e.context) : '') + '</div></div>'
-    ).join('');
+    results.innerHTML = data.map(function(e) {
+      var typeCls = 'type-'+(e.entity_type||'entity');
+      return '<div class="card"><div class="card-header"><span class="card-type '+typeCls+'">'+esc(e.entity_type)+'</span><div class="card-meta"><span>'+fmtDate(e.created_at)+'</span><span>'+esc(e.tool_name)+'</span><span>imp: '+e.importance+'</span></div></div><div class="card-content">'+esc(e.entity_value)+(e.context?'\\n'+esc(e.context):'')+'</div></div>';
+    }).join('');
   }
   updatePagination(data.length);
 }
 
 async function doSearch() {
-  const q = document.getElementById('searchInput').value.trim();
-  if (!q) { loadTab(); return; }
+  var q = document.getElementById('searchInput').value.trim();
+  if (!q) { currentOffset=0; loadTab(); return; }
 
-  const results = document.getElementById('results');
-  results.innerHTML = '<div class="empty">Searching...</div>';
+  var results = document.getElementById('results');
+  results.innerHTML = '<div class="empty"><div class="empty-icon">...</div><div class="empty-text">Searching</div></div>';
 
-  const data = await api('/api/search?q=' + encodeURIComponent(q) + '&limit=' + PAGE_SIZE);
-  if (data.length === 0) {
-    results.innerHTML = '<div class="empty">No results for "' + esc(q) + '"</div>';
+  var data = await api('/api/search?q=' + encodeURIComponent(q) + '&limit=' + PAGE_SIZE);
+  if (!data || data.length === 0) {
+    results.innerHTML = '<div class="empty"><div class="empty-icon">?</div><div class="empty-text">No results for "'+esc(q)+'"</div></div>';
     return;
   }
-  results.innerHTML = data.map(r =>
-    '<div class="card"><div class="meta"><span class="type type-' + r.type + '">' + esc(r.type) + '#' + r.id + '</span> ' +
-    fmtDate(r.created_at) + ' | ' + esc(r.project) + ' | score: ' + (r.score||0).toFixed(2) + '</div>' +
-    '<div class="content">' + esc(r.title) + '</div></div>'
-  ).join('');
+  results.innerHTML = data.map(function(r) {
+    return '<div class="card"><div class="card-header"><span class="card-type type-'+r.type+'">'+esc(r.type)+'#'+r.id+'</span><div class="card-meta"><span>'+fmtDate(r.created_at)+'</span><span>'+esc(r.project)+'</span><span>score: '+(r.score||0).toFixed(2)+'</span></div></div><div class="card-content">'+esc(r.title)+'</div></div>';
+  }).join('');
 }
 
 function paginate(dir) {
@@ -967,14 +1056,17 @@ function paginate(dir) {
 function updatePagination(count) {
   document.getElementById('prevBtn').disabled = currentOffset === 0;
   document.getElementById('nextBtn').disabled = count < PAGE_SIZE;
-  const page = Math.floor(currentOffset / PAGE_SIZE) + 1;
-  document.getElementById('pageInfo').textContent = 'Page ' + page;
+  document.getElementById('pageInfo').textContent = 'Page ' + (Math.floor(currentOffset / PAGE_SIZE) + 1);
 }
 
-function fmtDate(epoch) { return epoch ? new Date(epoch).toLocaleString() : 'N/A'; }
-function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function fmtDate(epoch) {
+  if (!epoch) return 'N/A';
+  var d = new Date(epoch);
+  return d.toLocaleDateString('en-US', {month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit'});
+}
+function esc(s) { var d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 
-document.getElementById('searchInput').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+document.getElementById('searchInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') doSearch(); });
 init();
 </script>
 </body>
@@ -1489,8 +1581,8 @@ switch (command) {
     Promise.resolve().then(() => (init_viewer(), exports_viewer)).then((m) => m.startViewer());
     break;
   case "health": {
-    const { runHealthCheck: runHealthCheck2, formatHealthReport: formatHealthReport3 } = (init_monitor(), __toCommonJS(exports_monitor));
-    console.log(formatHealthReport3(runHealthCheck2()));
+    const { runHealthCheck: runHealthCheck2, formatHealthReport: formatHealthReport2 } = (init_monitor(), __toCommonJS(exports_monitor));
+    console.log(formatHealthReport2(runHealthCheck2()));
     break;
   }
   case "reindex": {

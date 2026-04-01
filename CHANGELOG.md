@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.5.1] - 2026-04-01
+
+### Fixed
+- **Viewer API crash** — all `db.query()` calls in viewer replaced with `db.prepare().all()` to fix bun:sqlite parameter binding (`SQLITE_MISMATCH` errors on sessions, summaries, entities endpoints)
+- **Error handling** — viewer server now catches errors at fetch level with `error()` handler, preventing Bun's default error page from leaking
+
+### Changed
+- **UI redesign** — dark gradient theme, stat cards with gradient text, pill-shaped type badges, expandable card content, SVG search icon, improved typography and spacing, responsive grid layout
+
+---
+
 ## [0.5.0] - 2026-04-01
 
 Major release: production hardening, hybrid search, browser UI, claude-mem migration.
