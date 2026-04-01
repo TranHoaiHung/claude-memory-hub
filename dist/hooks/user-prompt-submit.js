@@ -1,5 +1,21 @@
 #!/usr/bin/env bun
 // @bun
+var __create = Object.create;
+var __getProtoOf = Object.getPrototypeOf;
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __toESM = (mod, isNodeMode, target) => {
+  target = mod != null ? __create(__getProtoOf(mod)) : {};
+  const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
+  for (let key of __getOwnPropNames(mod))
+    if (!__hasOwnProp.call(to, key))
+      __defProp(to, key, {
+        get: () => mod[key],
+        enumerable: true
+      });
+  return to;
+};
 var __require = import.meta.require;
 
 // src/db/schema.ts
@@ -303,6 +319,23 @@ function applyMigrations(db) {
     })();
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
     log.info("Migration v3 complete");
+  }
+  if (currentVersion < 4) {
+    log.info("Applying migration v4: embeddings table for semantic search");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
+    log.info("Migration v4 complete");
   }
 }
 var _db = null;

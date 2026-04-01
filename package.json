@@ -15,9 +15,9 @@
   ],
   "scripts": {
     "start": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target bun --entry-naming [name].js",
-    "build:cli": "bun build src/cli/main.ts --outdir dist --target bun --entry-naming cli.js",
-    "build:hooks": "bun build src/hooks-entry/post-tool-use.ts src/hooks-entry/session-end.ts src/hooks-entry/user-prompt-submit.ts src/hooks-entry/pre-compact.ts src/hooks-entry/post-compact.ts --outdir dist/hooks --target bun --entry-naming [name].js",
+    "build": "bun build src/index.ts --outdir dist --target bun --entry-naming [name].js --external @huggingface/transformers",
+    "build:cli": "bun build src/cli/main.ts --outdir dist --target bun --entry-naming cli.js --external @huggingface/transformers",
+    "build:hooks": "bun build src/hooks-entry/post-tool-use.ts src/hooks-entry/session-end.ts src/hooks-entry/user-prompt-submit.ts src/hooks-entry/pre-compact.ts src/hooks-entry/post-compact.ts --outdir dist/hooks --target bun --entry-naming [name].js --external @huggingface/transformers",
     "build:all": "bun run build && bun run build:cli && bun run build:hooks",
     "dev": "bun run --watch src/index.ts",
     "prepublishOnly": "test -f dist/index.js || bun run build:all",
@@ -48,6 +48,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.0.0"
   },
   "devDependencies": {
     "@types/bun": "latest",

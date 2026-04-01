@@ -25,6 +25,7 @@ var __export = (target, all) => {
       set: (newValue) => all[name] = () => newValue
     });
 };
+var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
 var __require = import.meta.require;
 
 // node_modules/ajv/dist/compile/codegen/code.js
@@ -6497,6 +6498,448 @@ var require_dist = __commonJS((exports, module) => {
   module.exports = exports = formatsPlugin;
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.default = formatsPlugin;
+});
+
+// src/logger/index.ts
+import { appendFileSync, existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+function shouldLog(level) {
+  return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[_minLevel];
+}
+function formatEntry(entry) {
+  return JSON.stringify(entry);
+}
+function writeLog(entry) {
+  if (!shouldLog(entry.level))
+    return;
+  const line = formatEntry(entry) + `
+`;
+  try {
+    if (!existsSync(LOG_DIR))
+      mkdirSync(LOG_DIR, { recursive: true });
+    if (existsSync(LOG_FILE)) {
+      const { statSync } = __require("fs");
+      const stats = statSync(LOG_FILE);
+      if (stats.size > MAX_LOG_SIZE) {
+        const rotated = LOG_FILE + ".1";
+        const { renameSync } = __require("fs");
+        try {
+          renameSync(LOG_FILE, rotated);
+        } catch {}
+      }
+    }
+    appendFileSync(LOG_FILE, line);
+  } catch {
+    process.stderr.write(line);
+  }
+}
+function createLogger(module) {
+  const log = (level, msg, data) => {
+    writeLog({
+      ts: new Date().toISOString(),
+      level,
+      module,
+      msg,
+      ...data ? { data } : {}
+    });
+  };
+  return {
+    debug: (msg, data) => log("debug", msg, data),
+    info: (msg, data) => log("info", msg, data),
+    warn: (msg, data) => log("warn", msg, data),
+    error: (msg, data) => log("error", msg, data)
+  };
+}
+var LEVEL_PRIORITY, LOG_DIR, LOG_FILE, MAX_LOG_SIZE, _minLevel, logger;
+var init_logger = __esm(() => {
+  LEVEL_PRIORITY = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3
+  };
+  LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
+  LOG_FILE = join(LOG_DIR, "memory-hub.log");
+  MAX_LOG_SIZE = 5 * 1024 * 1024;
+  _minLevel = process.env.CMH_LOG_LEVEL || "info";
+  logger = createLogger("core");
+});
+
+// src/db/schema.ts
+import { Database } from "bun:sqlite";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
+function getDbPath() {
+  const dir = join2(homedir2(), ".claude-memory-hub");
+  if (!existsSync2(dir)) {
+    mkdirSync2(dir, { recursive: true, mode: 448 });
+  }
+  return join2(dir, "memory.db");
+}
+function initDatabase(db) {
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA synchronous = NORMAL");
+  db.run("PRAGMA foreign_keys = ON");
+  db.run("PRAGMA busy_timeout = 5000");
+  db.run("PRAGMA cache_size = -8000");
+  repairSchema(db);
+  db.run(CREATE_TABLES);
+  applyMigrations(db);
+}
+function repairSchema(db) {
+  try {
+    const result = db.query("PRAGMA integrity_check").get();
+    if (result && result.integrity_check !== "ok") {
+      log.error("Database integrity check failed", { result: result.integrity_check });
+      log.warn("Attempting WAL checkpoint recovery...");
+      db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+  } catch (e) {
+    log.error("Integrity check threw", { error: String(e) });
+  }
+  try {
+    const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%'").all();
+    for (const t of tables) {
+      if (t.name === "fts_memories" || t.name.startsWith("fts_memories_"))
+        continue;
+      log.warn("Orphaned FTS table detected, dropping", { table: t.name });
+      try {
+        db.run(`DROP TABLE IF EXISTS "${t.name}"`);
+      } catch {}
+    }
+  } catch {}
+}
+function applyMigrations(db) {
+  const currentVersion = db.query("SELECT MAX(version) as version FROM schema_versions").get()?.version ?? 0;
+  if (currentVersion < 1) {
+    log.info("Applying migration v1: base schema");
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", [Date.now()]);
+  }
+  if (currentVersion < 2) {
+    log.info("Applying migration v2: discovery_tokens, health, tfidf");
+    try {
+      db.run("ALTER TABLE entities ADD COLUMN discovery_tokens INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    try {
+      db.run("ALTER TABLE long_term_summaries ADD COLUMN discovery_tokens INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (2, ?)", [Date.now()]);
+    log.info("Migration v2 complete");
+  }
+  if (currentVersion < 3) {
+    log.info("Applying migration v3: observation entity type + claude_md_registry");
+    db.transaction(() => {
+      db.run(`
+        CREATE TABLE entities_v3 (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          project       TEXT NOT NULL,
+          tool_name     TEXT NOT NULL,
+          entity_type   TEXT NOT NULL
+            CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision','observation')),
+          entity_value  TEXT NOT NULL,
+          context       TEXT,
+          importance    INTEGER NOT NULL DEFAULT 1
+            CHECK(importance BETWEEN 1 AND 5),
+          created_at    INTEGER NOT NULL,
+          prompt_number INTEGER NOT NULL DEFAULT 0,
+          discovery_tokens INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.run(`INSERT INTO entities_v3 SELECT * FROM entities`);
+      db.run(`DROP TABLE entities`);
+      db.run(`ALTER TABLE entities_v3 RENAME TO entities`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_session ON entities(session_id)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_type    ON entities(entity_type)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_value   ON entities(entity_value)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC)`);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS claude_md_registry (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          path          TEXT NOT NULL UNIQUE,
+          project       TEXT NOT NULL,
+          content_hash  TEXT NOT NULL,
+          sections_json TEXT NOT NULL DEFAULT '[]',
+          last_seen     INTEGER NOT NULL,
+          token_cost    INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_project ON claude_md_registry(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_path    ON claude_md_registry(path)`);
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
+    log.info("Migration v3 complete");
+  }
+  if (currentVersion < 4) {
+    log.info("Applying migration v4: embeddings table for semantic search");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
+    log.info("Migration v4 complete");
+  }
+}
+function getDatabase() {
+  if (!_db) {
+    const path = getDbPath();
+    _db = new Database(path);
+    initDatabase(_db);
+  }
+  return _db;
+}
+var log, CREATE_TABLES = `
+-- Migration version tracking
+CREATE TABLE IF NOT EXISTS schema_versions (
+  version     INTEGER PRIMARY KEY,
+  applied_at  INTEGER NOT NULL
+);
+
+-- L2: Session lifecycle
+CREATE TABLE IF NOT EXISTS sessions (
+  id          TEXT PRIMARY KEY,
+  project     TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  user_prompt TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+    CHECK(status IN ('active', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
+CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
+
+-- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
+CREATE TABLE IF NOT EXISTS entities (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  project       TEXT NOT NULL,
+  tool_name     TEXT NOT NULL,
+  entity_type   TEXT NOT NULL
+    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
+  entity_value  TEXT NOT NULL,
+  context       TEXT,
+  importance    INTEGER NOT NULL DEFAULT 1
+    CHECK(importance BETWEEN 1 AND 5),
+  created_at    INTEGER NOT NULL,
+  prompt_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
+CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
+CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
+CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
+
+-- L2: Manual session notes (from MCP memory_store tool or summarizer)
+CREATE TABLE IF NOT EXISTS session_notes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
+
+-- L3: Cross-session persistent summaries
+CREATE TABLE IF NOT EXISTS long_term_summaries (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL UNIQUE,
+  project       TEXT NOT NULL,
+  summary       TEXT NOT NULL,
+  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  token_savings INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
+CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
+
+-- L3: FTS5 virtual table for semantic search across summaries
+-- porter stemming + unicode61 handles English technical content well
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
+  session_id    UNINDEXED,
+  project,
+  summary,
+  files_touched,
+  decisions,
+  content       = 'long_term_summaries',
+  content_rowid = 'id',
+  tokenize      = 'porter unicode61'
+);
+
+-- Keep FTS5 index in sync with content table via triggers
+CREATE TRIGGER IF NOT EXISTS fts_memories_insert
+  AFTER INSERT ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_update
+  AFTER UPDATE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_delete
+  AFTER DELETE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+  END;
+
+-- V2: Health monitoring
+CREATE TABLE IF NOT EXISTS health_checks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  component   TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
+  message     TEXT,
+  latency_ms  INTEGER,
+  checked_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
+
+-- V2: TF-IDF vector index for semantic search
+CREATE TABLE IF NOT EXISTS tfidf_index (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+  doc_id      INTEGER NOT NULL,
+  term        TEXT NOT NULL,
+  tf          REAL NOT NULL,
+  idf         REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
+CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
+`, _db = null;
+var init_schema = __esm(() => {
+  init_logger();
+  log = createLogger("schema");
+});
+
+// src/search/embedding-model.ts
+class EmbeddingModel {
+  pipeline = null;
+  loading = null;
+  available = true;
+  async embed(text) {
+    if (!this.available)
+      return null;
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return null;
+    try {
+      const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+      return new Float32Array(result.data);
+    } catch (err) {
+      log5.error("embed failed", { error: String(err) });
+      return null;
+    }
+  }
+  async embedBatch(texts) {
+    if (!this.available || texts.length === 0)
+      return texts.map(() => null);
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return texts.map(() => null);
+    const results = [];
+    for (const text of texts) {
+      try {
+        const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+        results.push(new Float32Array(result.data));
+      } catch {
+        results.push(null);
+      }
+    }
+    return results;
+  }
+  get isAvailable() {
+    return this.available && this.pipeline !== null;
+  }
+  get isLoadAttempted() {
+    return this.loading !== null;
+  }
+  async ensureLoaded() {
+    if (this.pipeline || !this.available)
+      return;
+    if (!this.loading)
+      this.loading = this.loadModel();
+    await this.loading;
+  }
+  async loadModel() {
+    if (process.env["CLAUDE_MEMORY_HUB_EMBEDDINGS"] === "disabled") {
+      this.available = false;
+      return;
+    }
+    try {
+      const { pipeline: pipeline2, env } = await import("@huggingface/transformers");
+      env.allowLocalModels = true;
+      env.allowRemoteModels = true;
+      const t0 = Date.now();
+      this.pipeline = await pipeline2("feature-extraction", MODEL_NAME, { dtype: "fp32" });
+      log5.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+    } catch (err) {
+      log5.warn("Embedding model unavailable", { error: String(err) });
+      this.available = false;
+    }
+  }
+}
+var log5, MODEL_NAME = "Xenova/all-MiniLM-L6-v2", EMBEDDING_DIM = 384, embeddingModel;
+var init_embedding_model = __esm(() => {
+  init_logger();
+  log5 = createLogger("embedding-model");
+  embeddingModel = new EmbeddingModel;
+});
+
+// src/search/semantic-search.ts
+async function semanticSearch(query, limit = 10, db) {
+  const queryVec = await embeddingModel.embed(query);
+  if (!queryVec)
+    return [];
+  const d = db ?? getDatabase();
+  const rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings").all();
+  if (rows.length === 0)
+    return [];
+  const scored = [];
+  for (const row of rows) {
+    const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
+    const score = cosineSimilarity(queryVec, docVec);
+    if (score > 0.2) {
+      scored.push({ doc_type: row.doc_type, doc_id: row.doc_id, score });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+function cosineSimilarity(a, b) {
+  let dot = 0;
+  for (let i = 0;i < a.length; i++) {
+    dot += a[i] * b[i];
+  }
+  return dot;
+}
+var log6;
+var init_semantic_search = __esm(() => {
+  init_schema();
+  init_embedding_model();
+  init_logger();
+  log6 = createLogger("semantic-search");
 });
 
 // node_modules/zod/v4/core/core.js
@@ -13647,320 +14090,9 @@ class StdioServerTransport {
   }
 }
 
-// src/db/schema.ts
-import { Database } from "bun:sqlite";
-import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
-import { homedir as homedir2 } from "os";
-import { join as join2 } from "path";
-
-// src/logger/index.ts
-import { appendFileSync, existsSync, mkdirSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
-var LEVEL_PRIORITY = {
-  debug: 0,
-  info: 1,
-  warn: 2,
-  error: 3
-};
-var LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
-var LOG_FILE = join(LOG_DIR, "memory-hub.log");
-var MAX_LOG_SIZE = 5 * 1024 * 1024;
-var _minLevel = process.env.CMH_LOG_LEVEL || "info";
-function shouldLog(level) {
-  return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[_minLevel];
-}
-function formatEntry(entry) {
-  return JSON.stringify(entry);
-}
-function writeLog(entry) {
-  if (!shouldLog(entry.level))
-    return;
-  const line = formatEntry(entry) + `
-`;
-  try {
-    if (!existsSync(LOG_DIR))
-      mkdirSync(LOG_DIR, { recursive: true });
-    if (existsSync(LOG_FILE)) {
-      const { statSync } = __require("fs");
-      const stats = statSync(LOG_FILE);
-      if (stats.size > MAX_LOG_SIZE) {
-        const rotated = LOG_FILE + ".1";
-        const { renameSync } = __require("fs");
-        try {
-          renameSync(LOG_FILE, rotated);
-        } catch {}
-      }
-    }
-    appendFileSync(LOG_FILE, line);
-  } catch {
-    process.stderr.write(line);
-  }
-}
-function createLogger(module) {
-  const log = (level, msg, data) => {
-    writeLog({
-      ts: new Date().toISOString(),
-      level,
-      module,
-      msg,
-      ...data ? { data } : {}
-    });
-  };
-  return {
-    debug: (msg, data) => log("debug", msg, data),
-    info: (msg, data) => log("info", msg, data),
-    warn: (msg, data) => log("warn", msg, data),
-    error: (msg, data) => log("error", msg, data)
-  };
-}
-var logger = createLogger("core");
-
-// src/db/schema.ts
-var log = createLogger("schema");
-function getDbPath() {
-  const dir = join2(homedir2(), ".claude-memory-hub");
-  if (!existsSync2(dir)) {
-    mkdirSync2(dir, { recursive: true, mode: 448 });
-  }
-  return join2(dir, "memory.db");
-}
-var CREATE_TABLES = `
--- Migration version tracking
-CREATE TABLE IF NOT EXISTS schema_versions (
-  version     INTEGER PRIMARY KEY,
-  applied_at  INTEGER NOT NULL
-);
-
--- L2: Session lifecycle
-CREATE TABLE IF NOT EXISTS sessions (
-  id          TEXT PRIMARY KEY,
-  project     TEXT NOT NULL,
-  started_at  INTEGER NOT NULL,
-  ended_at    INTEGER,
-  user_prompt TEXT,
-  status      TEXT NOT NULL DEFAULT 'active'
-    CHECK(status IN ('active', 'completed', 'failed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
-CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
-
--- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
-CREATE TABLE IF NOT EXISTS entities (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  project       TEXT NOT NULL,
-  tool_name     TEXT NOT NULL,
-  entity_type   TEXT NOT NULL
-    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
-  entity_value  TEXT NOT NULL,
-  context       TEXT,
-  importance    INTEGER NOT NULL DEFAULT 1
-    CHECK(importance BETWEEN 1 AND 5),
-  created_at    INTEGER NOT NULL,
-  prompt_number INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
-CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
-CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
-CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
-CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
-
--- L2: Manual session notes (from MCP memory_store tool or summarizer)
-CREATE TABLE IF NOT EXISTS session_notes (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  content     TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
-
--- L3: Cross-session persistent summaries
-CREATE TABLE IF NOT EXISTS long_term_summaries (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id    TEXT NOT NULL UNIQUE,
-  project       TEXT NOT NULL,
-  summary       TEXT NOT NULL,
-  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  token_savings INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
-CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
-
--- L3: FTS5 virtual table for semantic search across summaries
--- porter stemming + unicode61 handles English technical content well
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
-  session_id    UNINDEXED,
-  project,
-  summary,
-  files_touched,
-  decisions,
-  content       = 'long_term_summaries',
-  content_rowid = 'id',
-  tokenize      = 'porter unicode61'
-);
-
--- Keep FTS5 index in sync with content table via triggers
-CREATE TRIGGER IF NOT EXISTS fts_memories_insert
-  AFTER INSERT ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
-    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
-  END;
-
-CREATE TRIGGER IF NOT EXISTS fts_memories_update
-  AFTER UPDATE ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
-    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
-    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
-    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
-  END;
-
-CREATE TRIGGER IF NOT EXISTS fts_memories_delete
-  AFTER DELETE ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
-    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
-  END;
-
--- V2: Health monitoring
-CREATE TABLE IF NOT EXISTS health_checks (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  component   TEXT NOT NULL,
-  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
-  message     TEXT,
-  latency_ms  INTEGER,
-  checked_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
-
--- V2: TF-IDF vector index for semantic search
-CREATE TABLE IF NOT EXISTS tfidf_index (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
-  doc_id      INTEGER NOT NULL,
-  term        TEXT NOT NULL,
-  tf          REAL NOT NULL,
-  idf         REAL NOT NULL DEFAULT 0.0
-);
-
-CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
-CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
-`;
-function initDatabase(db) {
-  db.run("PRAGMA journal_mode = WAL");
-  db.run("PRAGMA synchronous = NORMAL");
-  db.run("PRAGMA foreign_keys = ON");
-  db.run("PRAGMA busy_timeout = 5000");
-  db.run("PRAGMA cache_size = -8000");
-  repairSchema(db);
-  db.run(CREATE_TABLES);
-  applyMigrations(db);
-}
-function repairSchema(db) {
-  try {
-    const result = db.query("PRAGMA integrity_check").get();
-    if (result && result.integrity_check !== "ok") {
-      log.error("Database integrity check failed", { result: result.integrity_check });
-      log.warn("Attempting WAL checkpoint recovery...");
-      db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-    }
-  } catch (e) {
-    log.error("Integrity check threw", { error: String(e) });
-  }
-  try {
-    const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%'").all();
-    for (const t of tables) {
-      if (t.name === "fts_memories" || t.name.startsWith("fts_memories_"))
-        continue;
-      log.warn("Orphaned FTS table detected, dropping", { table: t.name });
-      try {
-        db.run(`DROP TABLE IF EXISTS "${t.name}"`);
-      } catch {}
-    }
-  } catch {}
-}
-function applyMigrations(db) {
-  const currentVersion = db.query("SELECT MAX(version) as version FROM schema_versions").get()?.version ?? 0;
-  if (currentVersion < 1) {
-    log.info("Applying migration v1: base schema");
-    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", [Date.now()]);
-  }
-  if (currentVersion < 2) {
-    log.info("Applying migration v2: discovery_tokens, health, tfidf");
-    try {
-      db.run("ALTER TABLE entities ADD COLUMN discovery_tokens INTEGER NOT NULL DEFAULT 0");
-    } catch {}
-    try {
-      db.run("ALTER TABLE long_term_summaries ADD COLUMN discovery_tokens INTEGER NOT NULL DEFAULT 0");
-    } catch {}
-    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (2, ?)", [Date.now()]);
-    log.info("Migration v2 complete");
-  }
-  if (currentVersion < 3) {
-    log.info("Applying migration v3: observation entity type + claude_md_registry");
-    db.transaction(() => {
-      db.run(`
-        CREATE TABLE entities_v3 (
-          id            INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-          project       TEXT NOT NULL,
-          tool_name     TEXT NOT NULL,
-          entity_type   TEXT NOT NULL
-            CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision','observation')),
-          entity_value  TEXT NOT NULL,
-          context       TEXT,
-          importance    INTEGER NOT NULL DEFAULT 1
-            CHECK(importance BETWEEN 1 AND 5),
-          created_at    INTEGER NOT NULL,
-          prompt_number INTEGER NOT NULL DEFAULT 0,
-          discovery_tokens INTEGER NOT NULL DEFAULT 0
-        )
-      `);
-      db.run(`INSERT INTO entities_v3 SELECT * FROM entities`);
-      db.run(`DROP TABLE entities`);
-      db.run(`ALTER TABLE entities_v3 RENAME TO entities`);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_session ON entities(session_id)`);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project)`);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_type    ON entities(entity_type)`);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_value   ON entities(entity_value)`);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC)`);
-      db.run(`
-        CREATE TABLE IF NOT EXISTS claude_md_registry (
-          id            INTEGER PRIMARY KEY AUTOINCREMENT,
-          path          TEXT NOT NULL UNIQUE,
-          project       TEXT NOT NULL,
-          content_hash  TEXT NOT NULL,
-          sections_json TEXT NOT NULL DEFAULT '[]',
-          last_seen     INTEGER NOT NULL,
-          token_cost    INTEGER NOT NULL DEFAULT 0
-        )
-      `);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_project ON claude_md_registry(project)`);
-      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_path    ON claude_md_registry(path)`);
-    })();
-    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
-    log.info("Migration v3 complete");
-  }
-}
-var _db = null;
-function getDatabase() {
-  if (!_db) {
-    const path = getDbPath();
-    _db = new Database(path);
-    initDatabase(_db);
-  }
-  return _db;
-}
-
 // src/db/session-store.ts
+init_schema();
+
 class SessionStore {
   db;
   constructor(db) {
@@ -14028,6 +14160,8 @@ class SessionStore {
 }
 
 // src/db/long-term-store.ts
+init_schema();
+
 class LongTermStore {
   db;
   constructor(db) {
@@ -14205,6 +14339,7 @@ function estimateTokens(text) {
 }
 
 // src/context/resource-tracker.ts
+init_schema();
 var SCHEMA_ADDITIONS = `
 CREATE TABLE IF NOT EXISTS resource_usage (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -14290,6 +14425,7 @@ class ResourceTracker {
 }
 
 // src/context/resource-registry.ts
+init_logger();
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
@@ -14903,6 +15039,8 @@ class WorkingMemory {
 var workingMemory = new WorkingMemory;
 
 // src/health/monitor.ts
+init_schema();
+init_logger();
 import { existsSync as existsSync4, statSync as statSync2 } from "fs";
 import { homedir as homedir4 } from "os";
 import { join as join4 } from "path";
@@ -15044,7 +15182,12 @@ function formatHealthReport(report) {
 `);
 }
 
+// src/search/search-workflow.ts
+init_schema();
+
 // src/search/vector-search.ts
+init_schema();
+init_logger();
 var log4 = createLogger("vector-search");
 var STOP_WORDS = new Set([
   "the",
@@ -15197,8 +15340,10 @@ function vectorSearch(query, limit = 10, docTypeFilter, db) {
 }
 
 // src/search/search-workflow.ts
-var log5 = createLogger("search-workflow");
-function searchIndex(query, opts = {}, db) {
+init_semantic_search();
+init_logger();
+var log7 = createLogger("search-workflow");
+async function searchIndex(query, opts = {}, db) {
   const d = db ?? getDatabase();
   const limit = opts.limit ?? 20;
   const offset = opts.offset ?? 0;
@@ -15240,9 +15385,36 @@ function searchIndex(query, opts = {}, db) {
       }
     }
   }
+  try {
+    const semResults = await semanticSearch(query, limit, d);
+    for (const sr of semResults) {
+      const key = `${sr.doc_type}:${sr.doc_id}`;
+      if (results.some((r) => `${r.type}:${r.id}` === key))
+        continue;
+      if (sr.doc_type === "summary") {
+        const row = d.prepare("SELECT id, project, SUBSTR(summary, 1, 80) as summary, created_at FROM long_term_summaries WHERE id = ?").get(sr.doc_id);
+        if (row) {
+          results.push({ id: row.id, type: "summary", title: row.summary, project: row.project, created_at: row.created_at, score: sr.score });
+        }
+      } else if (sr.doc_type === "entity") {
+        const row = d.prepare("SELECT id, project, SUBSTR(entity_value, 1, 80) as entity_value, created_at FROM entities WHERE id = ?").get(sr.doc_id);
+        if (row) {
+          results.push({ id: row.id, type: "entity", title: row.entity_value, project: row.project, created_at: row.created_at, score: sr.score });
+        }
+      }
+    }
+  } catch {}
   const filtered = opts.project ? results.filter((r) => r.project === opts.project) : results;
-  filtered.sort((a, b) => b.score - a.score);
-  return filtered.slice(0, limit);
+  const deduped = new Map;
+  for (const r of filtered) {
+    const key = `${r.type}:${r.id}`;
+    const existing = deduped.get(key);
+    if (!existing || r.score > existing.score)
+      deduped.set(key, r);
+  }
+  const merged = [...deduped.values()];
+  merged.sort((a, b) => b.score - a.score);
+  return merged.slice(0, limit);
 }
 function getTimeline(anchorId, anchorType, depthBefore = 3, depthAfter = 3, db) {
   const d = db ?? getDatabase();
@@ -15413,7 +15585,7 @@ async function handleMemorySearch(args) {
   const { query, limit = 20, offset = 0, project } = args;
   if (!query?.trim())
     return "No query provided.";
-  const results = searchIndex(query, { limit: Math.min(limit, 50), offset, ...project ? { project } : {} });
+  const results = await searchIndex(query, { limit: Math.min(limit, 50), offset, ...project ? { project } : {} });
   return formatSearchIndex(results);
 }
 async function handleMemoryTimeline(args) {

@@ -1,9 +1,22 @@
 #!/usr/bin/env bun
 // @bun
+var __create = Object.create;
+var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __toESM = (mod, isNodeMode, target) => {
+  target = mod != null ? __create(__getProtoOf(mod)) : {};
+  const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
+  for (let key of __getOwnPropNames(mod))
+    if (!__hasOwnProp.call(to, key))
+      __defProp(to, key, {
+        get: () => mod[key],
+        enumerable: true
+      });
+  return to;
+};
 var __moduleCache = /* @__PURE__ */ new WeakMap;
 var __toCommonJS = (from) => {
   var entry = __moduleCache.get(from), desc;
@@ -202,6 +215,23 @@ function applyMigrations(db) {
     })();
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
     log.info("Migration v3 complete");
+  }
+  if (currentVersion < 4) {
+    log.info("Applying migration v4: embeddings table for semantic search");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
+    log.info("Migration v4 complete");
   }
 }
 function getDatabase() {
@@ -498,6 +528,155 @@ var init_monitor = __esm(() => {
   log2 = createLogger("health");
 });
 
+// src/search/embedding-model.ts
+class EmbeddingModel {
+  pipeline = null;
+  loading = null;
+  available = true;
+  async embed(text) {
+    if (!this.available)
+      return null;
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return null;
+    try {
+      const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+      return new Float32Array(result.data);
+    } catch (err) {
+      log3.error("embed failed", { error: String(err) });
+      return null;
+    }
+  }
+  async embedBatch(texts) {
+    if (!this.available || texts.length === 0)
+      return texts.map(() => null);
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return texts.map(() => null);
+    const results = [];
+    for (const text of texts) {
+      try {
+        const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+        results.push(new Float32Array(result.data));
+      } catch {
+        results.push(null);
+      }
+    }
+    return results;
+  }
+  get isAvailable() {
+    return this.available && this.pipeline !== null;
+  }
+  get isLoadAttempted() {
+    return this.loading !== null;
+  }
+  async ensureLoaded() {
+    if (this.pipeline || !this.available)
+      return;
+    if (!this.loading)
+      this.loading = this.loadModel();
+    await this.loading;
+  }
+  async loadModel() {
+    if (process.env["CLAUDE_MEMORY_HUB_EMBEDDINGS"] === "disabled") {
+      this.available = false;
+      return;
+    }
+    try {
+      const { pipeline, env } = await import("@huggingface/transformers");
+      env.allowLocalModels = true;
+      env.allowRemoteModels = true;
+      const t0 = Date.now();
+      this.pipeline = await pipeline("feature-extraction", MODEL_NAME, { dtype: "fp32" });
+      log3.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+    } catch (err) {
+      log3.warn("Embedding model unavailable", { error: String(err) });
+      this.available = false;
+    }
+  }
+}
+var log3, MODEL_NAME = "Xenova/all-MiniLM-L6-v2", EMBEDDING_DIM = 384, embeddingModel;
+var init_embedding_model = __esm(() => {
+  init_logger();
+  log3 = createLogger("embedding-model");
+  embeddingModel = new EmbeddingModel;
+});
+
+// src/search/semantic-search.ts
+var exports_semantic_search = {};
+__export(exports_semantic_search, {
+  semanticSearch: () => semanticSearch,
+  reindexAllEmbeddings: () => reindexAllEmbeddings,
+  indexEmbedding: () => indexEmbedding
+});
+async function indexEmbedding(docType, docId, text, db) {
+  const vector = await embeddingModel.embed(text);
+  if (!vector)
+    return;
+  const d = db ?? getDatabase();
+  const blob = Buffer.from(vector.buffer);
+  d.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+     VALUES (?, ?, 'all-MiniLM-L6-v2', ?, ?)
+     ON CONFLICT(doc_type, doc_id) DO UPDATE SET
+       vector = excluded.vector,
+       created_at = excluded.created_at`, [docType, docId, blob, Date.now()]);
+}
+async function semanticSearch(query, limit = 10, db) {
+  const queryVec = await embeddingModel.embed(query);
+  if (!queryVec)
+    return [];
+  const d = db ?? getDatabase();
+  const rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings").all();
+  if (rows.length === 0)
+    return [];
+  const scored = [];
+  for (const row of rows) {
+    const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
+    const score = cosineSimilarity(queryVec, docVec);
+    if (score > 0.2) {
+      scored.push({ doc_type: row.doc_type, doc_id: row.doc_id, score });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+async function reindexAllEmbeddings(db) {
+  if (!embeddingModel.isAvailable && embeddingModel.isLoadAttempted)
+    return;
+  const d = db ?? getDatabase();
+  log4.info("Starting embedding reindex...");
+  const summaries = d.query("SELECT id, summary, files_touched, decisions FROM long_term_summaries").all();
+  let indexed = 0;
+  for (const s of summaries) {
+    const text = [s.summary, s.files_touched, s.decisions].join(" ");
+    await indexEmbedding("summary", s.id, text, d);
+    indexed++;
+    if (indexed % 50 === 0)
+      log4.info("Embedding reindex progress", { indexed, total: summaries.length });
+  }
+  const entities = d.query("SELECT id, entity_value, context FROM entities WHERE entity_type IN ('decision', 'error', 'observation')").all();
+  for (const e of entities) {
+    const text = [e.entity_value, e.context || ""].join(" ");
+    await indexEmbedding("entity", e.id, text, d);
+    indexed++;
+  }
+  log4.info("Embedding reindex complete", { summaries: summaries.length, entities: entities.length });
+}
+function cosineSimilarity(a, b) {
+  let dot = 0;
+  for (let i = 0;i < a.length; i++) {
+    dot += a[i] * b[i];
+  }
+  return dot;
+}
+var log4;
+var init_semantic_search = __esm(() => {
+  init_schema();
+  init_embedding_model();
+  init_logger();
+  log4 = createLogger("semantic-search");
+});
+
 // src/search/vector-search.ts
 var exports_vector_search = {};
 __export(exports_vector_search, {
@@ -546,9 +725,9 @@ function rebuildIDF(db) {
         WHERE t2.term = tfidf_index.term
       )
     `, [totalDocs]);
-    log3.info("IDF rebuilt", { totalDocs });
+    log5.info("IDF rebuilt", { totalDocs });
   } catch (e) {
-    log3.error("IDF rebuild failed", { error: String(e) });
+    log5.error("IDF rebuild failed", { error: String(e) });
   }
 }
 function vectorSearch(query, limit = 10, docTypeFilter, db) {
@@ -571,13 +750,13 @@ function vectorSearch(query, limit = 10, docTypeFilter, db) {
     `).all(...queryTokens, limit);
     return results;
   } catch (e) {
-    log3.error("Vector search failed", { error: String(e) });
+    log5.error("Vector search failed", { error: String(e) });
     return [];
   }
 }
 function reindexAll(db) {
   const d = db ?? getDatabase();
-  log3.info("Starting full reindex...");
+  log5.info("Starting full reindex...");
   const summaries = d.query("SELECT id, summary, files_touched, decisions FROM long_term_summaries").all();
   for (const s of summaries) {
     const text = [s.summary, s.files_touched, s.decisions].join(" ");
@@ -589,13 +768,14 @@ function reindexAll(db) {
     indexDocument("entity", e.id, text, d);
   }
   rebuildIDF(d);
-  log3.info("Full reindex complete", { summaries: summaries.length, entities: entities.length });
+  Promise.resolve().then(() => (init_semantic_search(), exports_semantic_search)).then(({ reindexAllEmbeddings: reindexAllEmbeddings2 }) => reindexAllEmbeddings2(d)).catch(() => {});
+  log5.info("Full reindex complete", { summaries: summaries.length, entities: entities.length });
 }
-var log3, STOP_WORDS;
+var log5, STOP_WORDS;
 var init_vector_search = __esm(() => {
   init_schema();
   init_logger();
-  log3 = createLogger("vector-search");
+  log5 = createLogger("vector-search");
   STOP_WORDS = new Set([
     "the",
     "a",
@@ -710,7 +890,7 @@ var init_vector_search = __esm(() => {
 });
 
 // src/search/search-workflow.ts
-function searchIndex(query, opts = {}, db) {
+async function searchIndex(query, opts = {}, db) {
   const d = db ?? getDatabase();
   const limit = opts.limit ?? 20;
   const offset = opts.offset ?? 0;
@@ -752,9 +932,36 @@ function searchIndex(query, opts = {}, db) {
       }
     }
   }
+  try {
+    const semResults = await semanticSearch(query, limit, d);
+    for (const sr of semResults) {
+      const key = `${sr.doc_type}:${sr.doc_id}`;
+      if (results.some((r) => `${r.type}:${r.id}` === key))
+        continue;
+      if (sr.doc_type === "summary") {
+        const row = d.prepare("SELECT id, project, SUBSTR(summary, 1, 80) as summary, created_at FROM long_term_summaries WHERE id = ?").get(sr.doc_id);
+        if (row) {
+          results.push({ id: row.id, type: "summary", title: row.summary, project: row.project, created_at: row.created_at, score: sr.score });
+        }
+      } else if (sr.doc_type === "entity") {
+        const row = d.prepare("SELECT id, project, SUBSTR(entity_value, 1, 80) as entity_value, created_at FROM entities WHERE id = ?").get(sr.doc_id);
+        if (row) {
+          results.push({ id: row.id, type: "entity", title: row.entity_value, project: row.project, created_at: row.created_at, score: sr.score });
+        }
+      }
+    }
+  } catch {}
   const filtered = opts.project ? results.filter((r) => r.project === opts.project) : results;
-  filtered.sort((a, b) => b.score - a.score);
-  return filtered.slice(0, limit);
+  const deduped = new Map;
+  for (const r of filtered) {
+    const key = `${r.type}:${r.id}`;
+    const existing = deduped.get(key);
+    if (!existing || r.score > existing.score)
+      deduped.set(key, r);
+  }
+  const merged = [...deduped.values()];
+  merged.sort((a, b) => b.score - a.score);
+  return merged.slice(0, limit);
 }
 function sanitizeFtsQuery(query) {
   const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^():{}[\]]/g, "").trim()).filter((w) => w.length > 1);
@@ -766,12 +973,13 @@ function sanitizeFtsQuery(query) {
   const last = words[words.length - 1];
   return [...head, `"${last}"*`].join(" ");
 }
-var log4;
+var log6;
 var init_search_workflow = __esm(() => {
   init_schema();
   init_vector_search();
+  init_semantic_search();
   init_logger();
-  log4 = createLogger("search-workflow");
+  log6 = createLogger("search-workflow");
 });
 
 // src/ui/viewer.ts
@@ -779,7 +987,7 @@ var exports_viewer = {};
 __export(exports_viewer, {
   startViewer: () => startViewer
 });
-function handleApi(url) {
+async function handleApi(url) {
   const db = getDatabase();
   const path = url.pathname;
   try {
@@ -798,7 +1006,7 @@ function handleApi(url) {
       const limit = parseInt(url.searchParams.get("limit") || "20");
       const offset = parseInt(url.searchParams.get("offset") || "0");
       const project = url.searchParams.get("project");
-      return json(searchIndex(query, { limit, offset, ...project ? { project } : {} }, db));
+      return json(await searchIndex(query, { limit, offset, ...project ? { project } : {} }, db));
     }
     if (path === "/api/sessions") {
       const limit = parseInt(url.searchParams.get("limit") || "50");
@@ -825,7 +1033,7 @@ function handleApi(url) {
     }
     return json({ error: "Not found" }, 404);
   } catch (e) {
-    log5.error("API error", { path, error: String(e) });
+    log7.error("API error", { path, error: String(e) });
     return json({ error: String(e) }, 500);
   }
 }
@@ -845,7 +1053,7 @@ function startViewer() {
           return handleApi(url);
         return new Response(HTML, { headers: { "Content-Type": "text/html" } });
       } catch (e) {
-        log5.error("Server fetch error", { error: String(e) });
+        log7.error("Server fetch error", { error: String(e) });
         return new Response(JSON.stringify({ error: String(e) }), {
           status: 500,
           headers: { "Content-Type": "application/json" }
@@ -853,7 +1061,7 @@ function startViewer() {
       }
     },
     error(err) {
-      log5.error("Server error", { error: String(err) });
+      log7.error("Server error", { error: String(err) });
       return new Response(JSON.stringify({ error: String(err) }), {
         status: 500,
         headers: { "Content-Type": "application/json" }
@@ -861,9 +1069,9 @@ function startViewer() {
     }
   });
   console.log(`claude-memory-hub viewer running at http://localhost:${server.port}`);
-  log5.info("Viewer started", { port: server.port });
+  log7.info("Viewer started", { port: server.port });
 }
-var log5, PORT = 37888, HTML = `<!DOCTYPE html>
+var log7, PORT = 37888, HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1123,7 +1331,7 @@ var init_viewer = __esm(() => {
   init_logger();
   init_monitor();
   init_search_workflow();
-  log5 = createLogger("viewer");
+  log7 = createLogger("viewer");
 });
 
 // src/cli/main.ts

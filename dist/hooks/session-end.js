@@ -1,5 +1,21 @@
 #!/usr/bin/env bun
 // @bun
+var __create = Object.create;
+var __getProtoOf = Object.getPrototypeOf;
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __toESM = (mod, isNodeMode, target) => {
+  target = mod != null ? __create(__getProtoOf(mod)) : {};
+  const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
+  for (let key of __getOwnPropNames(mod))
+    if (!__hasOwnProp.call(to, key))
+      __defProp(to, key, {
+        get: () => mod[key],
+        enumerable: true
+      });
+  return to;
+};
 var __require = import.meta.require;
 
 // src/db/schema.ts
@@ -303,6 +319,23 @@ function applyMigrations(db) {
     })();
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
     log.info("Migration v3 complete");
+  }
+  if (currentVersion < 4) {
+    log.info("Applying migration v4: embeddings table for semantic search");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
+    log.info("Migration v4 complete");
   }
 }
 var _db = null;
@@ -1864,6 +1897,92 @@ function estimateTokenSavings(fileCount, errorCount, noteCount) {
   return fileCount * 500 + errorCount * 100 + noteCount * 50;
 }
 
+// src/search/embedding-model.ts
+var log7 = createLogger("embedding-model");
+var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
+class EmbeddingModel {
+  pipeline = null;
+  loading = null;
+  available = true;
+  async embed(text) {
+    if (!this.available)
+      return null;
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return null;
+    try {
+      const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+      return new Float32Array(result.data);
+    } catch (err) {
+      log7.error("embed failed", { error: String(err) });
+      return null;
+    }
+  }
+  async embedBatch(texts) {
+    if (!this.available || texts.length === 0)
+      return texts.map(() => null);
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return texts.map(() => null);
+    const results = [];
+    for (const text of texts) {
+      try {
+        const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+        results.push(new Float32Array(result.data));
+      } catch {
+        results.push(null);
+      }
+    }
+    return results;
+  }
+  get isAvailable() {
+    return this.available && this.pipeline !== null;
+  }
+  get isLoadAttempted() {
+    return this.loading !== null;
+  }
+  async ensureLoaded() {
+    if (this.pipeline || !this.available)
+      return;
+    if (!this.loading)
+      this.loading = this.loadModel();
+    await this.loading;
+  }
+  async loadModel() {
+    if (process.env["CLAUDE_MEMORY_HUB_EMBEDDINGS"] === "disabled") {
+      this.available = false;
+      return;
+    }
+    try {
+      const { pipeline, env } = await import("@huggingface/transformers");
+      env.allowLocalModels = true;
+      env.allowRemoteModels = true;
+      const t0 = Date.now();
+      this.pipeline = await pipeline("feature-extraction", MODEL_NAME, { dtype: "fp32" });
+      log7.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+    } catch (err) {
+      log7.warn("Embedding model unavailable", { error: String(err) });
+      this.available = false;
+    }
+  }
+}
+var embeddingModel = new EmbeddingModel;
+
+// src/search/semantic-search.ts
+var log8 = createLogger("semantic-search");
+async function indexEmbedding(docType, docId, text, db) {
+  const vector = await embeddingModel.embed(text);
+  if (!vector)
+    return;
+  const d = db ?? getDatabase();
+  const blob = Buffer.from(vector.buffer);
+  d.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+     VALUES (?, ?, 'all-MiniLM-L6-v2', ?, ?)
+     ON CONFLICT(doc_type, doc_id) DO UPDATE SET
+       vector = excluded.vector,
+       created_at = excluded.created_at`, [docType, docId, blob, Date.now()]);
+}
+
 // src/hooks-entry/session-end.ts
 async function main() {
   if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
@@ -1881,7 +2000,13 @@ async function main() {
   await handleSessionEnd(hook, project);
   const store = new SessionStore;
   if (store.getSession(hook.session_id)) {
-    new SessionSummarizer().summarize(hook.session_id, project).catch(() => {});
+    await new SessionSummarizer().summarize(hook.session_id, project).catch(() => {});
+    const ltStore = new LongTermStore;
+    const summary = ltStore.getSummary(hook.session_id);
+    if (summary?.id) {
+      const text = [summary.summary, summary.files_touched, summary.decisions].join(" ");
+      indexEmbedding("summary", summary.id, text).catch(() => {});
+    }
   }
 }
 main().catch(() => {}).finally(() => process.exit(0));
