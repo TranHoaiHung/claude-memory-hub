@@ -484,7 +484,109 @@ function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   return parts.join(" ") || `Session in project ${session.project}.`;
 }
 
+// src/summarizer/cli-summarizer.ts
+var log2 = createLogger("cli-summarizer");
+var MAX_PROMPT_CHARS = 4000;
+var MAX_OUTPUT_CHARS = 1000;
+var DEFAULT_TIMEOUT_MS = 30000;
+var _cliAvailable;
+function isClaudeCliAvailable() {
+  if (_cliAvailable !== undefined)
+    return _cliAvailable;
+  try {
+    const proc = Bun.spawnSync(["which", "claude"]);
+    _cliAvailable = proc.exitCode === 0;
+  } catch {
+    _cliAvailable = false;
+  }
+  return _cliAvailable;
+}
+function buildCliPrompt(ctx) {
+  const sections = [
+    "Summarize this coding session in 2-3 plain sentences. No markdown, no headers, no code blocks.",
+    "Focus on: what was accomplished, key decisions, important findings.",
+    "",
+    `Project: ${ctx.project}`
+  ];
+  if (ctx.files.length > 0) {
+    sections.push(`Files modified: ${ctx.files.slice(0, 10).join(", ")}`);
+  }
+  if (ctx.errors.length > 0) {
+    sections.push(`Errors resolved: ${ctx.errors.slice(0, 5).join("; ")}`);
+  }
+  if (ctx.decisions.length > 0) {
+    sections.push(`Decisions: ${ctx.decisions.slice(0, 5).join("; ")}`);
+  }
+  if (ctx.notes.length > 0) {
+    sections.push(`Notes: ${ctx.notes.slice(0, 3).join("; ")}`);
+  }
+  if (ctx.observations.length > 0) {
+    sections.push(`Key observations: ${ctx.observations.slice(0, 3).join("; ")}`);
+  }
+  let prompt = sections.join(`
+`);
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    prompt = prompt.slice(0, MAX_PROMPT_CHARS - 3) + "...";
+  }
+  return prompt;
+}
+async function tryCliSummary(ctx, timeoutMs) {
+  const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
+  const timeout = timeoutMs ?? envTimeout;
+  if (!isClaudeCliAvailable()) {
+    log2.info("claude CLI not found, skipping Tier 2");
+    return;
+  }
+  const prompt = buildCliPrompt(ctx);
+  try {
+    const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      env: {
+        ...process.env,
+        CLAUDE_MEMORY_HUB_SKIP_HOOKS: "1"
+      }
+    });
+    const timeoutPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+        resolve(undefined);
+      }, timeout);
+    });
+    const outputPromise = (async () => {
+      const output = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        log2.warn("claude CLI exited with non-zero", { exitCode });
+        return;
+      }
+      const text = output.trim();
+      if (!text || text.length < 10) {
+        log2.warn("claude CLI returned empty or too short output");
+        return;
+      }
+      const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
+      return cleaned.slice(0, MAX_OUTPUT_CHARS);
+    })();
+    const result = await Promise.race([outputPromise, timeoutPromise]);
+    if (result) {
+      log2.info("Tier 2 CLI summary generated", { length: result.length });
+    } else {
+      log2.warn("Tier 2 CLI summary failed or timed out");
+    }
+    return result;
+  } catch (err) {
+    log2.error("Tier 2 CLI summary error", { error: String(err) });
+    return;
+  }
+}
+
 // src/summarizer/session-summarizer.ts
+var log3 = createLogger("session-summarizer");
+
 class SessionSummarizer {
   sessionStore;
   ltStore;
@@ -505,9 +607,29 @@ class SessionSummarizer {
     const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
     if (files.length === 0 && errors.length === 0 && notes.length === 0)
       return;
-    const obsNotes = observations.slice(0, 5).map((o) => o.entity_value);
-    const allNotes = [...notes, ...obsNotes];
-    const summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
+    const obsValues = observations.slice(0, 5).map((o) => o.entity_value);
+    let summaryText;
+    let tier = "rule-based";
+    const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
+    if (llmMode !== "rule-based") {
+      const ctx = {
+        sessionId: session_id,
+        project,
+        files,
+        errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 100)),
+        decisions: decisions.slice(0, 5).map((d) => d.entity_value.slice(0, 100)),
+        notes: notes.slice(0, 3),
+        observations: obsValues.slice(0, 3)
+      };
+      summaryText = await tryCliSummary(ctx);
+      if (summaryText)
+        tier = "cli";
+    }
+    if (!summaryText) {
+      const allNotes = [...notes, ...obsValues];
+      summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
+    }
+    log3.info("Summary generated", { session_id, tier, length: summaryText.length });
     const ltSummary = {
       session_id,
       project,
@@ -966,7 +1088,7 @@ class ResourceTracker {
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
-var log2 = createLogger("resource-registry");
+var log4 = createLogger("resource-registry");
 var CHARS_PER_TOKEN = 3.75;
 var SCAN_TTL_MS = 5 * 60 * 1000;
 var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
@@ -993,7 +1115,7 @@ class ResourceRegistry {
       this.scanClaudeMd(cwd);
       this.lastScanAt = Date.now();
     } catch (err) {
-      log2.error("scan failed", { error: String(err) });
+      log4.error("scan failed", { error: String(err) });
     }
   }
   resolve(kind, name) {
@@ -1095,7 +1217,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log2.error(`scanSkillDir ${dir}`, { error: String(err) });
+      log4.error(`scanSkillDir ${dir}`, { error: String(err) });
     }
   }
   scanFlatAgents(dir) {
@@ -1127,7 +1249,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log2.error(`scanFlatAgents ${dir}`, { error: String(err) });
+      log4.error(`scanFlatAgents ${dir}`, { error: String(err) });
     }
   }
   scanAgentPackages(claudeDir) {
@@ -1141,7 +1263,7 @@ class ResourceRegistry {
         this.scanAgentPackageDir(packageDir);
       }
     } catch (err) {
-      log2.error("scanAgentPackages", { error: String(err) });
+      log4.error("scanAgentPackages", { error: String(err) });
     }
   }
   scanAgentPackageDir(packageDir) {
@@ -1195,7 +1317,7 @@ class ResourceRegistry {
         }
       }
     } catch (err) {
-      log2.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+      log4.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
     }
   }
   scanCommands(globalDir, cwd) {
@@ -1233,7 +1355,7 @@ class ResourceRegistry {
         }
       }
     } catch (err) {
-      log2.error(`scanCommandDir ${dir}`, { error: String(err) });
+      log4.error(`scanCommandDir ${dir}`, { error: String(err) });
     }
   }
   scanWorkflows(dir) {
@@ -1261,7 +1383,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log2.error(`scanWorkflows ${dir}`, { error: String(err) });
+      log4.error(`scanWorkflows ${dir}`, { error: String(err) });
     }
   }
   scanClaudeMd(cwd) {
@@ -1534,7 +1656,7 @@ function safeJson(text, fallback) {
 }
 
 // src/context/injection-validator.ts
-var log3 = createLogger("injection-validator");
+var log5 = createLogger("injection-validator");
 var MAX_CHARS = 4500;
 
 class InjectionValidator {
@@ -1555,7 +1677,7 @@ class InjectionValidator {
       }
       return text;
     } catch (err) {
-      log3.error("validation failed, returning empty", { error: String(err) });
+      log5.error("validation failed, returning empty", { error: String(err) });
       return "";
     }
   }
@@ -1566,7 +1688,7 @@ class InjectionValidator {
         return true;
       const alive = this.registry.exists(kind, r.resource_name);
       if (!alive) {
-        log3.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
+        log5.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
       }
       return alive;
     });
@@ -1589,7 +1711,7 @@ function mapResourceTypeToKind(type) {
 // src/context/claude-md-tracker.ts
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
 import { join as join4, dirname, basename as basename2 } from "path";
-var log4 = createLogger("claude-md-tracker");
+var log6 = createLogger("claude-md-tracker");
 var MAX_WALK_DEPTH = 20;
 var CHARS_PER_TOKEN2 = 3.75;
 var STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
@@ -1631,7 +1753,7 @@ class ClaudeMdTracker {
           entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
         }
       } catch (err) {
-        log4.error(`Failed to process ${filePath}`, { error: String(err) });
+        log6.error(`Failed to process ${filePath}`, { error: String(err) });
       }
     }
     return entries;
@@ -1828,6 +1950,8 @@ function projectFromCwd(cwd) {
 
 // src/hooks-entry/pre-compact.ts
 async function main() {
+  if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
+    return;
   const raw = await Bun.stdin.text();
   if (!raw.trim())
     return;

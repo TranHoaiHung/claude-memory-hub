@@ -1675,6 +1675,8 @@ function projectFromCwd(cwd) {
 
 // src/hooks-entry/user-prompt-submit.ts
 async function main() {
+  if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
+    return;
   const raw = await Bun.stdin.text();
   if (!raw.trim())
     return;

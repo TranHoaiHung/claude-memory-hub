@@ -1701,7 +1701,109 @@ function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   return parts.join(" ") || `Session in project ${session.project}.`;
 }
 
+// src/summarizer/cli-summarizer.ts
+var log5 = createLogger("cli-summarizer");
+var MAX_PROMPT_CHARS = 4000;
+var MAX_OUTPUT_CHARS = 1000;
+var DEFAULT_TIMEOUT_MS = 30000;
+var _cliAvailable;
+function isClaudeCliAvailable() {
+  if (_cliAvailable !== undefined)
+    return _cliAvailable;
+  try {
+    const proc = Bun.spawnSync(["which", "claude"]);
+    _cliAvailable = proc.exitCode === 0;
+  } catch {
+    _cliAvailable = false;
+  }
+  return _cliAvailable;
+}
+function buildCliPrompt(ctx) {
+  const sections = [
+    "Summarize this coding session in 2-3 plain sentences. No markdown, no headers, no code blocks.",
+    "Focus on: what was accomplished, key decisions, important findings.",
+    "",
+    `Project: ${ctx.project}`
+  ];
+  if (ctx.files.length > 0) {
+    sections.push(`Files modified: ${ctx.files.slice(0, 10).join(", ")}`);
+  }
+  if (ctx.errors.length > 0) {
+    sections.push(`Errors resolved: ${ctx.errors.slice(0, 5).join("; ")}`);
+  }
+  if (ctx.decisions.length > 0) {
+    sections.push(`Decisions: ${ctx.decisions.slice(0, 5).join("; ")}`);
+  }
+  if (ctx.notes.length > 0) {
+    sections.push(`Notes: ${ctx.notes.slice(0, 3).join("; ")}`);
+  }
+  if (ctx.observations.length > 0) {
+    sections.push(`Key observations: ${ctx.observations.slice(0, 3).join("; ")}`);
+  }
+  let prompt = sections.join(`
+`);
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    prompt = prompt.slice(0, MAX_PROMPT_CHARS - 3) + "...";
+  }
+  return prompt;
+}
+async function tryCliSummary(ctx, timeoutMs) {
+  const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
+  const timeout = timeoutMs ?? envTimeout;
+  if (!isClaudeCliAvailable()) {
+    log5.info("claude CLI not found, skipping Tier 2");
+    return;
+  }
+  const prompt = buildCliPrompt(ctx);
+  try {
+    const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      env: {
+        ...process.env,
+        CLAUDE_MEMORY_HUB_SKIP_HOOKS: "1"
+      }
+    });
+    const timeoutPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+        resolve(undefined);
+      }, timeout);
+    });
+    const outputPromise = (async () => {
+      const output = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        log5.warn("claude CLI exited with non-zero", { exitCode });
+        return;
+      }
+      const text = output.trim();
+      if (!text || text.length < 10) {
+        log5.warn("claude CLI returned empty or too short output");
+        return;
+      }
+      const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
+      return cleaned.slice(0, MAX_OUTPUT_CHARS);
+    })();
+    const result = await Promise.race([outputPromise, timeoutPromise]);
+    if (result) {
+      log5.info("Tier 2 CLI summary generated", { length: result.length });
+    } else {
+      log5.warn("Tier 2 CLI summary failed or timed out");
+    }
+    return result;
+  } catch (err) {
+    log5.error("Tier 2 CLI summary error", { error: String(err) });
+    return;
+  }
+}
+
 // src/summarizer/session-summarizer.ts
+var log6 = createLogger("session-summarizer");
+
 class SessionSummarizer {
   sessionStore;
   ltStore;
@@ -1722,9 +1824,29 @@ class SessionSummarizer {
     const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
     if (files.length === 0 && errors.length === 0 && notes.length === 0)
       return;
-    const obsNotes = observations.slice(0, 5).map((o) => o.entity_value);
-    const allNotes = [...notes, ...obsNotes];
-    const summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
+    const obsValues = observations.slice(0, 5).map((o) => o.entity_value);
+    let summaryText;
+    let tier = "rule-based";
+    const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
+    if (llmMode !== "rule-based") {
+      const ctx = {
+        sessionId: session_id,
+        project,
+        files,
+        errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 100)),
+        decisions: decisions.slice(0, 5).map((d) => d.entity_value.slice(0, 100)),
+        notes: notes.slice(0, 3),
+        observations: obsValues.slice(0, 3)
+      };
+      summaryText = await tryCliSummary(ctx);
+      if (summaryText)
+        tier = "cli";
+    }
+    if (!summaryText) {
+      const allNotes = [...notes, ...obsValues];
+      summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
+    }
+    log6.info("Summary generated", { session_id, tier, length: summaryText.length });
     const ltSummary = {
       session_id,
       project,
@@ -1744,6 +1866,8 @@ function estimateTokenSavings(fileCount, errorCount, noteCount) {
 
 // src/hooks-entry/session-end.ts
 async function main() {
+  if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
+    return;
   const raw = await Bun.stdin.text();
   if (!raw.trim())
     return;
