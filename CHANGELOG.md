@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.5.2] - 2026-04-01
+
+### Fixed
+- **Viewer JS broken after bundle** — inline `onclick` handlers lost reference when Bun bundled template literal into `cli.js`. Rewrote all JS to IIFE + `addEventListener` pattern
+- **Escaped quotes in template literal** — `this.classList.toggle('expanded')` caused `SyntaxError: Unexpected identifier` after bundle. Switched to double quotes and event delegation
+- **push-private.sh deletes source** — `git checkout main` removed untracked `src/` directory. Added backup/restore of source dirs around branch switch
+
+### Changed
+- **push-public.sh** — fixed version extraction in commit message (`node -p` with proper quoting)
+
+---
+
 ## [0.5.1] - 2026-04-01
 
 ### Fixed
