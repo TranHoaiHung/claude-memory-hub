@@ -19,7 +19,7 @@ Zero API key. Zero Python. Zero config. One install command.
 
 ## The Problem
 
-Claude Code forgets everything between sessions. Within long sessions, auto-compact destroys 90% of context. Every session wastes tokens loading resources that aren't needed.
+Claude Code forgets everything between sessions. Within long sessions, auto-compact destroys 90% of context. Every session wastes tokens loading resources that aren't needed. Search is keyword-only with no ranking.
 
 ```
 Session 1: You spend 2 hours building auth system
@@ -32,9 +32,12 @@ Long session: Claude auto-compacts at 200K tokens
 Every session: ALL skills + agents + rules loaded
                → 23-51K tokens consumed before you type anything
                → Most of them never used
+
+Search:        Keyword-only, no semantic ranking
+               → Irrelevant results, wasted tokens on full records
 ```
 
-**Three problems. No existing tool solves all of them.**
+**Four problems. No existing tool solves all of them.**
 
 | Problem | Claude Code built-in | claude-mem | memory-hub |
 |---------|:-------------------:|:----------:|:----------:|
@@ -42,6 +45,11 @@ Every session: ALL skills + agents + rules loaded
 | Influence what compact preserves | -- | -- | **Yes** |
 | Save compact output | -- | -- | **Yes** |
 | Token budget optimization | -- | -- | **Yes** |
+| Hybrid search (FTS5 + TF-IDF) | -- | Partial | **Yes** |
+| 3-layer progressive search | -- | Yes | **Yes** |
+| Browser UI | -- | Yes | **Yes** |
+| Health monitoring | -- | -- | **Yes** |
+| Migrate from claude-mem | N/A | N/A | **Yes** |
 | No API key needed | N/A | Yes | **Yes** |
 | No Python/Chroma needed | N/A | -- | **Yes** |
 | No XML format required | N/A | -- | **Yes** |
@@ -94,7 +102,7 @@ Session N ends  → rule-based summary from entities → SQLite L3
                   OR PostCompact summary (richer) → SQLite L3
 
 Session N+1     → UserPromptSubmit hook fires
-                → FTS5 search: match user prompt against past summaries
+                → FTS5 + TF-IDF hybrid search: match user prompt
                 → inject relevant context automatically
                 → Claude starts with history, not from zero
 ```
@@ -119,51 +127,76 @@ Session N+1     → UserPromptSubmit hook fires
 
 memory-hub tracks which skills/agents/tools you **actually use**, then recommends only those for future sessions. Rare resources load on demand via SkillTool.
 
+### Layer 5 — 3-Layer Progressive Search (new in v0.5)
+
+```
+Traditional search: query → ALL full records → 5000+ tokens wasted
+
+memory-hub search:  query → Layer 1 (index)    → ~50 tokens/result
+                          → Layer 2 (timeline)  → ~200 tokens context
+                          → Layer 3 (full)      → ~500 tokens/result
+                                                  only for filtered IDs
+
+                    Token savings: ~80-90% vs. full context
+```
+
+Hybrid ranking: FTS5 BM25 for keyword matches + TF-IDF cosine similarity for semantic ranking. Zero external dependencies — pure TypeScript implementation.
+
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                    Claude Code                            │
-│                                                           │
-│  5 Lifecycle Hooks                                        │
-│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐    │
-│  │ PostToolUse   │  │ PreCompact   │  │ PostCompact  │    │
-│  │ entity capture│  │ inject       │  │ save summary │    │
-│  └──────┬────────┘  │ priorities   │  └──────┬───────┘    │
-│         │           └──────┬───────┘         │            │
-│  ┌──────┴───────┐          │          ┌──────┴───────┐    │
-│  │UserPrompt    │          │          │ Stop         │    │
-│  │Submit: inject│          │          │ session end  │    │
-│  │past context  │          │          │ summarize    │    │
-│  └──────────────┘          │          └──────────────┘    │
-│                            │                              │
-│  MCP Server (stdio)        │                              │
-│  ┌─────────────────────┐   │                              │
-│  │ memory_recall       │   │                              │
-│  │ memory_entities     │   │  ┌────────────────────────┐  │
-│  │ memory_session_notes│   │  │ Smart Resource Loader  │  │
-│  │ memory_store        │   │  │ track usage → predict  │  │
-│  │ memory_context_budget│  │  │ → budget → recommend   │  │
-│  └─────────────────────┘   │  └────────────────────────┘  │
-│                            │                              │
-└────────────────────────────┼──────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      Claude Code                             │
+│                                                              │
+│  5 Lifecycle Hooks                                           │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ PostToolUse   │  │ PreCompact   │  │ PostCompact  │      │
+│  │ entity capture│  │ inject       │  │ save summary │      │
+│  └──────┬────────┘  │ priorities   │  └──────┬───────┘      │
+│         │           └──────┬───────┘         │              │
+│  ┌──────┴───────┐          │          ┌──────┴───────┐      │
+│  │UserPrompt    │          │          │ Stop         │      │
+│  │Submit: inject│          │          │ session end  │      │
+│  │past context  │          │          │ summarize    │      │
+│  └──────────────┘          │          └──────────────┘      │
+│                            │                                │
+│  MCP Server (stdio)        │   Health Monitor               │
+│  ┌─────────────────────┐   │   ┌────────────────────────┐   │
+│  │ memory_recall       │   │   │ sqlite, fts5, disk,    │   │
+│  │ memory_entities     │   │   │ integrity checks       │   │
+│  │ memory_session_notes│   │   └────────────────────────┘   │
+│  │ memory_store        │   │                                │
+│  │ memory_context_budget│  │   Smart Resource Loader        │
+│  │ memory_search  ←L1  │   │   ┌────────────────────────┐   │
+│  │ memory_timeline ←L2 │   │   │ track usage → predict  │   │
+│  │ memory_fetch   ←L3  │   │   │ → budget → recommend   │   │
+│  │ memory_health       │   │   └────────────────────────┘   │
+│  └─────────────────────┘   │                                │
+│                            │   Browser UI (:37888)          │
+│                            │   ┌────────────────────────┐   │
+│                            │   │ search, browse, stats  │   │
+│                            │   └────────────────────────┘   │
+│                            │                                │
+└────────────────────────────┼────────────────────────────────┘
                              │
-                   ┌─────────┴────────┐
-                   │  SQLite + FTS5   │
-                   │  ~/.claude-      │
-                   │  memory-hub/     │
-                   │  memory.db       │
-                   │                  │
-                   │  sessions        │
-                   │  entities        │
-                   │  session_notes   │
-                   │  long_term_      │
-                   │   summaries      │
-                   │  resource_usage  │
-                   │  fts_memories    │
-                   └──────────────────┘
+                   ┌─────────┴──────────┐
+                   │   SQLite + FTS5    │
+                   │   ~/.claude-       │
+                   │   memory-hub/      │
+                   │   memory.db        │
+                   │                    │
+                   │   sessions         │
+                   │   entities         │
+                   │   session_notes    │
+                   │   long_term_       │
+                   │    summaries       │
+                   │   resource_usage   │
+                   │   fts_memories     │
+                   │   tfidf_index      │
+                   │   health_checks    │
+                   └────────────────────┘
 ```
 
 ---
@@ -181,10 +214,10 @@ memory-hub tracks which skills/agents/tools you **actually use**, then recommend
 │  files_read, file_modified  Per-session scope       │
 │  errors, decisions          Importance scored       │
 ├─────────────────────────────────────────────────────┤
-│  L3: LongTermStore          SQLite + FTS5           │
+│  L3: LongTermStore          SQLite + FTS5 + TF-IDF │
 │  Cross-session summaries    <100ms access           │
-│  BM25 ranked search         Persistent forever      │
-│  Auto-injected on start     LIKE fallback           │
+│  Hybrid ranked search       Persistent forever      │
+│  Auto-injected on start     3-layer progressive     │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -200,6 +233,8 @@ bunx claude-memory-hub install
 
 One command. Registers MCP server + 5 hooks globally. Works on CLI, VS Code, JetBrains.
 
+**Coming from claude-mem?** The installer auto-detects `~/.claude-mem/claude-mem.db` and migrates your data automatically. No manual steps needed.
+
 ### From source
 
 ```bash
@@ -209,11 +244,16 @@ bun install && bun run build:all
 bunx . install
 ```
 
-### Other commands
+### All CLI commands
 
 ```bash
-bunx claude-memory-hub status      # Check installation
+bunx claude-memory-hub install     # Register MCP + hooks (auto-migrates claude-mem)
 bunx claude-memory-hub uninstall   # Clean removal
+bunx claude-memory-hub status      # Check installation
+bunx claude-memory-hub migrate     # Import data from claude-mem
+bunx claude-memory-hub viewer      # Open browser UI at localhost:37888
+bunx claude-memory-hub health      # Run health diagnostics
+bunx claude-memory-hub reindex     # Rebuild TF-IDF search index
 ```
 
 ### Requirements
@@ -228,6 +268,8 @@ bunx claude-memory-hub uninstall   # Clean removal
 
 Claude can call these tools directly during conversation:
 
+### Core Tools
+
 | Tool | What it does | When to use |
 |------|-------------|-------------|
 | `memory_recall` | FTS5 search past session summaries | Starting a task, looking for prior work |
@@ -235,6 +277,63 @@ Claude can call these tools directly during conversation:
 | `memory_session_notes` | Current session activity summary | Mid-session, checking what's been done |
 | `memory_store` | Manually save a note or decision | Preserving important context |
 | `memory_context_budget` | Analyze token costs + recommendations | Optimizing which resources to load |
+
+### 3-Layer Search (new in v0.5)
+
+| Tool | Layer | Tokens/result | When to use |
+|------|-------|---------------|-------------|
+| `memory_search` | 1 (index) | ~50 | First: find relevant memories by query |
+| `memory_timeline` | 2 (context) | ~200 | Then: see what happened before/after a result |
+| `memory_fetch` | 3 (full) | ~500 | Finally: get complete records for specific IDs |
+
+### Diagnostics
+
+| Tool | What it does |
+|------|-------------|
+| `memory_health` | Check database, FTS5, disk, integrity status |
+
+---
+
+## Browser UI
+
+```bash
+bunx claude-memory-hub viewer
+```
+
+Opens a dark-themed dashboard at `http://localhost:37888` with:
+
+- **Stats** — session count, entity count, summary count
+- **Search** — hybrid FTS5 + TF-IDF search with ranking scores
+- **Browse** — paginated views of sessions, entities, summaries
+- **Health** — real-time component health indicators
+
+---
+
+## Migrating from claude-mem
+
+If you're already using [claude-mem](https://github.com/nicobailey-llc/claude-mem), migration is seamless:
+
+```bash
+# Automatic (during install)
+bunx claude-memory-hub install
+# → Detects ~/.claude-mem/claude-mem.db automatically
+# → Migrates sessions, observations, summaries
+
+# Manual
+bunx claude-memory-hub migrate
+```
+
+### What gets migrated
+
+| claude-mem | → | memory-hub |
+|------------|---|------------|
+| `sdk_sessions` | → | `sessions` |
+| `observations` (files_read) | → | `entities` (type=file_read) |
+| `observations` (files_modified) | → | `entities` (type=file_modified) |
+| `observations` (title/narrative) | → | `entities` (type=decision) + `session_notes` |
+| `session_summaries` | → | `long_term_summaries` (FTS5 indexed) |
+
+Migration is idempotent — safe to run multiple times with zero duplicates.
 
 ---
 
@@ -246,6 +345,7 @@ Claude can call these tools directly during conversation:
 | **v0.2.0** | Compact interceptor (PreCompact/PostCompact hooks), context enrichment, importance scoring |
 | **v0.3.0** | Removed API key requirement, 1-command install |
 | **v0.4.0** | Smart resource loading, token budget optimization |
+| **v0.5.0** | Production hardening, hybrid search, 3-layer progressive search, browser UI, health monitoring, claude-mem migration |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
@@ -266,7 +366,14 @@ No Python. No Chroma. No HTTP server. No API key. No Docker.
 
 ## Data & Privacy
 
-All data stored locally at `~/.claude-memory-hub/memory.db`.
+All data stored locally at `~/.claude-memory-hub/`.
+
+```
+~/.claude-memory-hub/
+  ├── memory.db         # SQLite database (sessions, entities, summaries)
+  └── logs/
+      └── memory-hub.log  # Structured JSON logs (auto-rotated at 5MB)
+```
 
 No cloud. No telemetry. No network calls. Your memory stays on your machine.
 
@@ -275,7 +382,7 @@ No cloud. No telemetry. No network calls. Your memory stays on your machine.
 ## Uninstall
 
 ```bash
-claude mcp remove claude-memory-hub -s user
-# Remove hook entries containing "claude-memory-hub" from ~/.claude/settings.json
+bunx claude-memory-hub uninstall
+# Data at ~/.claude-memory-hub/ preserved. Delete manually if desired:
 rm -rf ~/.claude-memory-hub
 ```

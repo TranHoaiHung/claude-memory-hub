@@ -1,0 +1,870 @@
+#!/usr/bin/env bun
+// @bun
+var __require = import.meta.require;
+
+// src/db/schema.ts
+import { Database } from "bun:sqlite";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
+
+// src/logger/index.ts
+import { appendFileSync, existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+var LEVEL_PRIORITY = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3
+};
+var LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
+var LOG_FILE = join(LOG_DIR, "memory-hub.log");
+var MAX_LOG_SIZE = 5 * 1024 * 1024;
+var _minLevel = process.env.CMH_LOG_LEVEL || "info";
+function shouldLog(level) {
+  return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[_minLevel];
+}
+function formatEntry(entry) {
+  return JSON.stringify(entry);
+}
+function writeLog(entry) {
+  if (!shouldLog(entry.level))
+    return;
+  const line = formatEntry(entry) + `
+`;
+  try {
+    if (!existsSync(LOG_DIR))
+      mkdirSync(LOG_DIR, { recursive: true });
+    if (existsSync(LOG_FILE)) {
+      const { statSync } = __require("fs");
+      const stats = statSync(LOG_FILE);
+      if (stats.size > MAX_LOG_SIZE) {
+        const rotated = LOG_FILE + ".1";
+        const { renameSync } = __require("fs");
+        try {
+          renameSync(LOG_FILE, rotated);
+        } catch {}
+      }
+    }
+    appendFileSync(LOG_FILE, line);
+  } catch {
+    process.stderr.write(line);
+  }
+}
+function createLogger(module) {
+  const log = (level, msg, data) => {
+    writeLog({
+      ts: new Date().toISOString(),
+      level,
+      module,
+      msg,
+      ...data ? { data } : {}
+    });
+  };
+  return {
+    debug: (msg, data) => log("debug", msg, data),
+    info: (msg, data) => log("info", msg, data),
+    warn: (msg, data) => log("warn", msg, data),
+    error: (msg, data) => log("error", msg, data)
+  };
+}
+var logger = createLogger("core");
+
+// src/db/schema.ts
+var log = createLogger("schema");
+function getDbPath() {
+  const dir = join2(homedir2(), ".claude-memory-hub");
+  if (!existsSync2(dir)) {
+    mkdirSync2(dir, { recursive: true, mode: 448 });
+  }
+  return join2(dir, "memory.db");
+}
+var CREATE_TABLES = `
+-- Migration version tracking
+CREATE TABLE IF NOT EXISTS schema_versions (
+  version     INTEGER PRIMARY KEY,
+  applied_at  INTEGER NOT NULL
+);
+
+-- L2: Session lifecycle
+CREATE TABLE IF NOT EXISTS sessions (
+  id          TEXT PRIMARY KEY,
+  project     TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  user_prompt TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+    CHECK(status IN ('active', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
+CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
+
+-- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
+CREATE TABLE IF NOT EXISTS entities (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  project       TEXT NOT NULL,
+  tool_name     TEXT NOT NULL,
+  entity_type   TEXT NOT NULL
+    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
+  entity_value  TEXT NOT NULL,
+  context       TEXT,
+  importance    INTEGER NOT NULL DEFAULT 1
+    CHECK(importance BETWEEN 1 AND 5),
+  created_at    INTEGER NOT NULL,
+  prompt_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
+CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
+CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
+CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
+
+-- L2: Manual session notes (from MCP memory_store tool or summarizer)
+CREATE TABLE IF NOT EXISTS session_notes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
+
+-- L3: Cross-session persistent summaries
+CREATE TABLE IF NOT EXISTS long_term_summaries (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL UNIQUE,
+  project       TEXT NOT NULL,
+  summary       TEXT NOT NULL,
+  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  token_savings INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
+CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
+
+-- L3: FTS5 virtual table for semantic search across summaries
+-- porter stemming + unicode61 handles English technical content well
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
+  session_id    UNINDEXED,
+  project,
+  summary,
+  files_touched,
+  decisions,
+  content       = 'long_term_summaries',
+  content_rowid = 'id',
+  tokenize      = 'porter unicode61'
+);
+
+-- Keep FTS5 index in sync with content table via triggers
+CREATE TRIGGER IF NOT EXISTS fts_memories_insert
+  AFTER INSERT ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_update
+  AFTER UPDATE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_delete
+  AFTER DELETE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+  END;
+
+-- V2: Health monitoring
+CREATE TABLE IF NOT EXISTS health_checks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  component   TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
+  message     TEXT,
+  latency_ms  INTEGER,
+  checked_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
+
+-- V2: TF-IDF vector index for semantic search
+CREATE TABLE IF NOT EXISTS tfidf_index (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+  doc_id      INTEGER NOT NULL,
+  term        TEXT NOT NULL,
+  tf          REAL NOT NULL,
+  idf         REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
+CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
+`;
+function initDatabase(db) {
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA synchronous = NORMAL");
+  db.run("PRAGMA foreign_keys = ON");
+  db.run("PRAGMA busy_timeout = 5000");
+  db.run("PRAGMA cache_size = -8000");
+  repairSchema(db);
+  db.run(CREATE_TABLES);
+  applyMigrations(db);
+}
+function repairSchema(db) {
+  try {
+    const result = db.query("PRAGMA integrity_check").get();
+    if (result && result.integrity_check !== "ok") {
+      log.error("Database integrity check failed", { result: result.integrity_check });
+      log.warn("Attempting WAL checkpoint recovery...");
+      db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+  } catch (e) {
+    log.error("Integrity check threw", { error: String(e) });
+  }
+  try {
+    const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%'").all();
+    for (const t of tables) {
+      if (t.name === "fts_memories" || t.name.startsWith("fts_memories_"))
+        continue;
+      log.warn("Orphaned FTS table detected, dropping", { table: t.name });
+      try {
+        db.run(`DROP TABLE IF EXISTS "${t.name}"`);
+      } catch {}
+    }
+  } catch {}
+}
+function applyMigrations(db) {
+  const currentVersion = db.query("SELECT MAX(version) as version FROM schema_versions").get()?.version ?? 0;
+  if (currentVersion < 1) {
+    log.info("Applying migration v1: base schema");
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (1, ?)", [Date.now()]);
+  }
+  if (currentVersion < 2) {
+    log.info("Applying migration v2: discovery_tokens, health, tfidf");
+    try {
+      db.run("ALTER TABLE entities ADD COLUMN discovery_tokens INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    try {
+      db.run("ALTER TABLE long_term_summaries ADD COLUMN discovery_tokens INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (2, ?)", [Date.now()]);
+    log.info("Migration v2 complete");
+  }
+}
+var _db = null;
+function getDatabase() {
+  if (!_db) {
+    const path = getDbPath();
+    _db = new Database(path);
+    initDatabase(_db);
+  }
+  return _db;
+}
+
+// src/db/session-store.ts
+class SessionStore {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  upsertSession(session) {
+    this.db.run(`INSERT INTO sessions(id, project, started_at, ended_at, user_prompt, status)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         ended_at    = excluded.ended_at,
+         user_prompt = COALESCE(excluded.user_prompt, user_prompt),
+         status      = excluded.status`, [
+      session.id,
+      session.project,
+      session.started_at,
+      session.ended_at ?? null,
+      session.user_prompt ?? null,
+      session.status
+    ]);
+  }
+  getSession(id) {
+    return this.db.query("SELECT * FROM sessions WHERE id = ?").get(id) ?? null;
+  }
+  completeSession(id) {
+    this.db.run("UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ?", [Date.now(), id]);
+  }
+  insertEntity(entity) {
+    const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+      entity.session_id,
+      entity.project,
+      entity.tool_name,
+      entity.entity_type,
+      entity.entity_value,
+      entity.context ?? null,
+      entity.importance,
+      entity.created_at,
+      entity.prompt_number
+    ]);
+    return Number(result.lastInsertRowid);
+  }
+  getSessionEntities(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
+  }
+  getSessionErrors(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'error' ORDER BY importance DESC").all(session_id);
+  }
+  getSessionDecisions(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'decision' ORDER BY importance DESC").all(session_id);
+  }
+  getSessionFiles(session_id) {
+    return this.db.query(`SELECT DISTINCT entity_value FROM entities
+         WHERE session_id = ? AND entity_type IN ('file_read','file_modified','file_created')
+         ORDER BY importance DESC, created_at DESC`).all(session_id).map((r) => r.entity_value);
+  }
+  insertNote(note) {
+    this.db.run("INSERT INTO session_notes(session_id, content, created_at) VALUES (?, ?, ?)", [note.session_id, note.content, note.created_at]);
+  }
+  getSessionNotes(session_id) {
+    return this.db.query("SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
+  }
+}
+
+// src/db/long-term-store.ts
+class LongTermStore {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  upsertSummary(summary) {
+    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         summary       = excluded.summary,
+         files_touched = excluded.files_touched,
+         decisions     = excluded.decisions,
+         errors_fixed  = excluded.errors_fixed,
+         token_savings = excluded.token_savings`, [
+      summary.session_id,
+      summary.project,
+      summary.summary,
+      summary.files_touched,
+      summary.decisions,
+      summary.errors_fixed,
+      summary.token_savings,
+      summary.created_at
+    ]);
+  }
+  getSummary(session_id) {
+    return this.db.query("SELECT * FROM long_term_summaries WHERE session_id = ?").get(session_id) ?? null;
+  }
+  getRecentSummaries(project, limit = 5) {
+    return this.db.query("SELECT * FROM long_term_summaries WHERE project = ? ORDER BY created_at DESC LIMIT ?").all(project, limit);
+  }
+  search(query, limit = 5) {
+    if (!query.trim())
+      return [];
+    const safeQuery = sanitizeFtsQuery(query);
+    if (!safeQuery)
+      return [];
+    try {
+      return this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
+                  lts.files_touched, lts.decisions, lts.errors_fixed,
+                  lts.created_at, rank
+           FROM fts_memories
+           JOIN long_term_summaries lts ON lts.id = fts_memories.rowid
+           WHERE fts_memories MATCH ?
+           ORDER BY rank
+           LIMIT ?`).all(safeQuery, limit);
+    } catch {
+      return this.fallbackSearch(query, limit);
+    }
+  }
+  fallbackSearch(query, limit) {
+    const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
+    return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+         FROM long_term_summaries
+         WHERE summary LIKE ? OR files_touched LIKE ? OR decisions LIKE ?
+         ORDER BY created_at DESC LIMIT ?`).all(pattern, pattern, pattern, limit);
+  }
+  findByFile(filePath, limit = 10) {
+    const escaped = filePath.replace(/[%_]/g, "\\$&");
+    return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+         FROM long_term_summaries
+         WHERE files_touched LIKE ?
+         ORDER BY created_at DESC LIMIT ?`).all(`%${escaped}%`, limit);
+  }
+}
+function sanitizeFtsQuery(query) {
+  const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^()]/g, "")).filter((w) => w.length > 1);
+  if (words.length === 0)
+    return "";
+  const head = words.slice(0, -1).map((w) => `"${w}"`);
+  const last = words[words.length - 1];
+  return [...head, `"${last}"*`].join(" ");
+}
+
+// src/capture/context-enricher.ts
+var CONTEXT_MAX_LENGTH = 500;
+function enrichEntityContext(entity, hook) {
+  const response = hook.tool_response;
+  if (!response)
+    return entity;
+  switch (entity.entity_type) {
+    case "file_read":
+      return enrichFileReadContext(entity, hook);
+    case "file_modified":
+    case "file_created":
+      return enrichFileWriteContext(entity, hook);
+    case "error":
+      return enrichErrorContext(entity, hook);
+    default:
+      return entity;
+  }
+}
+function enrichFileReadContext(entity, hook) {
+  const output = getResponseText(hook);
+  if (!output)
+    return entity;
+  const firstLines = output.split(`
+`).slice(0, 5).join(`
+`);
+  const patterns = extractCodePatterns(output);
+  const contextParts = [];
+  if (firstLines.trim()) {
+    contextParts.push(`Head: ${firstLines.slice(0, 200)}`);
+  }
+  if (patterns.length > 0) {
+    contextParts.push(`Contains: ${patterns.slice(0, 5).join(", ")}`);
+  }
+  return contextParts.length > 0 ? { ...entity, context: contextParts.join(" | ").slice(0, CONTEXT_MAX_LENGTH) } : entity;
+}
+function enrichFileWriteContext(entity, hook) {
+  const input = hook.tool_input;
+  const contextParts = [];
+  if (hook.tool_name === "Edit" || hook.tool_name === "MultiEdit") {
+    const oldStr = stringField(input, "old_string");
+    const newStr = stringField(input, "new_string");
+    if (oldStr && newStr) {
+      contextParts.push(`Changed: "${oldStr.slice(0, 80)}" \u2192 "${newStr.slice(0, 80)}"`);
+    }
+  }
+  if (hook.tool_name === "Write") {
+    const content = stringField(input, "content");
+    if (content) {
+      const lines = content.split(`
+`).length;
+      const first = content.split(`
+`).slice(0, 3).join(`
+`);
+      contextParts.push(`Wrote ${lines} lines: ${first.slice(0, 150)}`);
+    }
+  }
+  return contextParts.length > 0 ? { ...entity, context: contextParts.join(" | ").slice(0, CONTEXT_MAX_LENGTH) } : entity;
+}
+function enrichErrorContext(entity, hook) {
+  const stderr = stringField(hook.tool_response, "stderr");
+  const stdout = stringField(hook.tool_response, "stdout");
+  const cmd = stringField(hook.tool_input, "command");
+  const contextParts = [];
+  if (cmd)
+    contextParts.push(`Cmd: ${cmd.slice(0, 120)}`);
+  if (stderr)
+    contextParts.push(`Stderr: ${stderr.slice(0, 200)}`);
+  else if (stdout)
+    contextParts.push(`Output: ${stdout.slice(0, 200)}`);
+  return contextParts.length > 0 ? { ...entity, context: contextParts.join(" | ").slice(0, CONTEXT_MAX_LENGTH) } : entity;
+}
+function getResponseText(hook) {
+  const r = hook.tool_response;
+  return stringField(r, "output") ?? stringField(r, "stdout") ?? undefined;
+}
+function stringField(obj, key) {
+  if (!obj)
+    return;
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function extractCodePatterns(content) {
+  const patterns = [];
+  const lines = content.split(`
+`).slice(0, 50);
+  for (const line of lines) {
+    const defMatch = line.match(/(?:export\s+)?(?:function|class|interface|type|const|enum)\s+(\w+)/);
+    if (defMatch?.[1]) {
+      patterns.push(defMatch[1]);
+      continue;
+    }
+    const importMatch = line.match(/(?:import|from)\s+['"]([^'"]+)['"]/);
+    if (importMatch?.[1]) {
+      patterns.push(`import:${importMatch[1]}`);
+    }
+  }
+  return [...new Set(patterns)];
+}
+
+// src/capture/entity-extractor.ts
+function extractEntities(hook, promptNumber = 0) {
+  const { tool_name, tool_input, tool_response, session_id } = hook;
+  const project = deriveProject(hook);
+  const now = Date.now();
+  const raw = [];
+  switch (tool_name) {
+    case "Read": {
+      const path = stringField2(tool_input, "file_path");
+      if (path) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_read", path, 1, now, promptNumber));
+      }
+      break;
+    }
+    case "Write": {
+      const path = stringField2(tool_input, "file_path");
+      if (path) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_created", path, 4, now, promptNumber));
+      }
+      break;
+    }
+    case "Edit":
+    case "MultiEdit": {
+      const path = stringField2(tool_input, "file_path");
+      if (path) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_modified", path, 4, now, promptNumber));
+      }
+      break;
+    }
+    case "Bash": {
+      const cmd = stringField2(tool_input, "command") ?? "";
+      const exitCode = tool_response?.exit_code;
+      const stdout = stringField2(tool_response, "stdout") ?? "";
+      const stderr = stringField2(tool_response, "stderr") ?? "";
+      if (typeof exitCode === "number" && exitCode !== 0) {
+        const errorCtx = [stderr, stdout].filter(Boolean).join(`
+`).slice(0, 300);
+        raw.push(makeEntity(session_id, project, tool_name, "error", `[exit ${exitCode}] ${cmd.slice(0, 120)}`, exitCode > 0 ? 3 : 5, now, promptNumber, errorCtx || undefined));
+      }
+      const writtenFile = extractFileFromBashCmd(cmd);
+      if (writtenFile && (exitCode === 0 || exitCode === undefined)) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_modified", writtenFile, 2, now, promptNumber));
+      }
+      break;
+    }
+    case "TodoWrite": {
+      const todos = tool_input["todos"];
+      if (Array.isArray(todos) && todos.length > 0) {
+        const summary = todos.slice(0, 3).map((t) => typeof t === "object" && t !== null ? String(t["content"] ?? "") : "").filter(Boolean).join("; ");
+        if (summary) {
+          raw.push(makeEntity(session_id, project, tool_name, "decision", summary, 3, now, promptNumber));
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return raw.map((e) => enrichEntityContext(e, hook));
+}
+function makeEntity(session_id, project, tool_name, entity_type, entity_value, importance, created_at, prompt_number, context) {
+  const base = { session_id, project, tool_name, entity_type, entity_value, importance, created_at, prompt_number };
+  return context !== undefined ? { ...base, context } : base;
+}
+function stringField2(obj, key) {
+  if (!obj)
+    return;
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function deriveProject(hook) {
+  return "unknown";
+}
+function extractFileFromBashCmd(cmd) {
+  const patterns = [
+    /(?:cp|mv)\s+\S+\s+(\S+\.[\w]+)/,
+    /(?:touch|truncate)\s+(\S+\.[\w]+)/,
+    />\s*(\S+\.[\w]+)/
+  ];
+  for (const re of patterns) {
+    const m = cmd.match(re);
+    if (m?.[1] && !m[1].startsWith("-"))
+      return m[1] ?? undefined;
+  }
+  return;
+}
+
+// src/context/resource-tracker.ts
+var SCHEMA_ADDITIONS = `
+CREATE TABLE IF NOT EXISTS resource_usage (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  resource_type TEXT NOT NULL
+    CHECK(resource_type IN ('skill','agent','claude_md','memory','mcp_tool')),
+  resource_name TEXT NOT NULL,
+  use_count   INTEGER NOT NULL DEFAULT 1,
+  token_cost  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
+CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
+CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
+`;
+
+class ResourceTracker {
+  db;
+  initialized = false;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  ensureSchema() {
+    if (this.initialized)
+      return;
+    this.db.run(SCHEMA_ADDITIONS);
+    this.initialized = true;
+  }
+  trackUsage(session_id, project, resource_type, resource_name, token_cost = 0) {
+    this.ensureSchema();
+    const existing = this.db.query("SELECT id, use_count FROM resource_usage WHERE session_id = ? AND resource_name = ?").get(session_id, resource_name);
+    if (existing) {
+      this.db.run("UPDATE resource_usage SET use_count = use_count + 1 WHERE id = ?", [existing.id]);
+    } else {
+      this.db.run(`INSERT INTO resource_usage(session_id, project, resource_type, resource_name, use_count, token_cost, created_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)`, [session_id, project, resource_type, resource_name, token_cost, Date.now()]);
+    }
+  }
+  getMostUsedResources(project, resource_type, limit = 10) {
+    this.ensureSchema();
+    if (resource_type) {
+      return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+           FROM resource_usage WHERE project = ? AND resource_type = ?
+           GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, resource_type, limit);
+    }
+    return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+         FROM resource_usage WHERE project = ?
+         GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, limit);
+  }
+  getRecentlyUsedResources(project, lastNSessions = 5) {
+    this.ensureSchema();
+    return this.db.query(`SELECT resource_type, resource_name, COUNT(DISTINCT session_id) as frequency
+         FROM resource_usage
+         WHERE project = ?
+           AND session_id IN (
+             SELECT DISTINCT session_id FROM resource_usage
+             WHERE project = ?
+             ORDER BY created_at DESC
+             LIMIT ?
+           )
+         GROUP BY resource_type, resource_name
+         ORDER BY frequency DESC, resource_type`).all(project, project, lastNSessions);
+  }
+  estimateTokenBudget(project) {
+    this.ensureSchema();
+    const rows = this.db.query(`SELECT resource_type, SUM(token_cost) as total_tokens, COUNT(DISTINCT resource_name) as count
+         FROM resource_usage
+         WHERE project = ?
+         GROUP BY resource_type`).all(project);
+    const by_type = {};
+    let total = 0;
+    let count = 0;
+    for (const row of rows) {
+      by_type[row.resource_type] = row.total_tokens;
+      total += row.total_tokens;
+      count += row.count;
+    }
+    return { total_token_cost: total, resource_count: count, by_type };
+  }
+}
+
+// src/context/smart-resource-loader.ts
+var DEFAULT_TOKEN_BUDGET = 30000;
+
+class SmartResourceLoader {
+  tracker;
+  ltStore;
+  constructor() {
+    this.tracker = new ResourceTracker;
+    this.ltStore = new LongTermStore;
+  }
+  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET) {
+    const recommendations = [];
+    const recent = this.tracker.getRecentlyUsedResources(project, 5);
+    for (const r of recent) {
+      const avgTokens = this.getAvgTokenCost(project, r.resource_name);
+      recommendations.push({
+        resource_type: r.resource_type,
+        resource_name: r.resource_name,
+        score: Math.min(100, r.frequency * 20),
+        token_cost: avgTokens,
+        reason: `used in ${r.frequency}/5 recent sessions`
+      });
+    }
+    if (userPrompt.trim()) {
+      const searchResults = this.ltStore.search(userPrompt, 3);
+      for (const result of searchResults) {
+        const files = safeJson(result.files_touched, []);
+        for (const file of files.slice(0, 5)) {
+          const existing = recommendations.find((r) => r.resource_name === file && r.resource_type === "claude_md");
+          if (!existing) {
+            recommendations.push({
+              resource_type: "claude_md",
+              resource_name: file,
+              score: 40,
+              token_cost: 500,
+              reason: `touched in similar past session`
+            });
+          }
+        }
+      }
+    }
+    recommendations.sort((a, b) => b.score - a.score);
+    let usedTokens = 0;
+    const included = [];
+    const skipped = [];
+    for (const r of recommendations) {
+      if (usedTokens + r.token_cost <= tokenBudget) {
+        included.push(r);
+        usedTokens += r.token_cost;
+      } else {
+        skipped.push(r);
+      }
+    }
+    return {
+      recommendations: included,
+      total_tokens: usedTokens,
+      budget_remaining: tokenBudget - usedTokens,
+      skipped
+    };
+  }
+  formatContextAdvice(plan) {
+    if (plan.skipped.length === 0)
+      return "";
+    const lines = [
+      "<!-- memory-hub: context budget advice -->",
+      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used by recommended resources.`
+    ];
+    if (plan.skipped.length > 0) {
+      lines.push(`${plan.skipped.length} resource(s) deferred for token efficiency:`);
+      for (const s of plan.skipped.slice(0, 5)) {
+        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tokens, ${s.reason})`);
+      }
+      lines.push("Use SkillTool or ToolSearch to load these on demand if needed.");
+    }
+    lines.push("<!-- end memory-hub advice -->");
+    return lines.join(`
+`);
+  }
+  getAvgTokenCost(project, resourceName) {
+    const results = this.tracker.getMostUsedResources(project);
+    const match = results.find((r) => r.resource_name === resourceName);
+    return match?.avg_tokens ?? 500;
+  }
+}
+function safeJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+// src/capture/hook-handler.ts
+import { basename } from "path";
+async function handlePostToolUse(hook, project) {
+  const store = new SessionStore;
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    status: "active"
+  });
+  const entities = extractEntities(hook);
+  for (const entity of entities) {
+    store.insertEntity({ ...entity, project });
+  }
+  const tracker = new ResourceTracker;
+  if (hook.tool_name === "Skill") {
+    const skillName = stringField3(hook.tool_input, "skill");
+    if (skillName)
+      tracker.trackUsage(hook.session_id, project, "skill", skillName);
+  }
+  if (hook.tool_name === "Agent") {
+    const agentType = stringField3(hook.tool_input, "subagent_type");
+    if (agentType)
+      tracker.trackUsage(hook.session_id, project, "agent", agentType);
+  }
+  if (hook.tool_name.startsWith("mcp__")) {
+    tracker.trackUsage(hook.session_id, project, "mcp_tool", hook.tool_name);
+  }
+}
+async function handleUserPromptSubmit(hook, project) {
+  const store = new SessionStore;
+  const ltStore = new LongTermStore;
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    user_prompt: hook.prompt.slice(0, 500),
+    status: "active"
+  });
+  const results = ltStore.search(hook.prompt, 3);
+  const loader = new SmartResourceLoader;
+  const plan = loader.buildContextPlan(project, hook.prompt);
+  const advice = loader.formatContextAdvice(plan);
+  const lines = [];
+  if (results.length > 0) {
+    lines.push("<!-- memory-hub: past session context -->");
+    for (const r of results) {
+      const date = new Date(r.created_at).toLocaleDateString();
+      const files = safeJson2(r.files_touched, []);
+      lines.push(`**Past session (${date}, ${r.project}):** ${r.summary.slice(0, 300)}`);
+      if (files.length > 0)
+        lines.push(`Files: ${files.slice(0, 5).join(", ")}`);
+    }
+    lines.push("<!-- end past sessions -->");
+  }
+  if (advice)
+    lines.push(advice);
+  return { additionalContext: lines.join(`
+`) };
+}
+async function handleSessionEnd(hook, project) {
+  const store = new SessionStore;
+  store.completeSession(hook.session_id);
+}
+function stringField3(obj, key) {
+  if (!obj)
+    return;
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function safeJson2(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+function projectFromCwd(cwd) {
+  if (!cwd)
+    return "unknown";
+  return basename(cwd);
+}
+
+// src/hooks-entry/post-tool-use.ts
+async function main() {
+  const raw = await Bun.stdin.text();
+  if (!raw.trim())
+    return;
+  let hook;
+  try {
+    hook = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  await handlePostToolUse(hook, projectFromCwd(process.env["CLAUDE_CWD"] ?? process.cwd()));
+}
+main().catch(() => {}).finally(() => process.exit(0));
