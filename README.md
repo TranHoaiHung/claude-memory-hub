@@ -235,6 +235,21 @@ One command. Registers MCP server + 5 hooks globally. Works on CLI, VS Code, Jet
 
 **Coming from claude-mem?** The installer auto-detects `~/.claude-mem/claude-mem.db` and migrates your data automatically. No manual steps needed.
 
+### Update
+
+```bash
+bunx claude-memory-hub@latest install
+```
+
+Or if installed globally:
+
+```bash
+bun install -g claude-memory-hub@latest
+claude-memory-hub install
+```
+
+Your data at `~/.claude-memory-hub/` is preserved across updates. Schema migrations run automatically.
+
 ### From source
 
 ```bash

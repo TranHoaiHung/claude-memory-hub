@@ -944,130 +944,132 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
   </div>
 
   <div class="tabs" id="tabsContainer">
-    <button class="tab active" onclick="switchTab('summaries',this)">Summaries <span class="count" id="cnt-summaries"></span></button>
-    <button class="tab" onclick="switchTab('sessions',this)">Sessions <span class="count" id="cnt-sessions"></span></button>
-    <button class="tab" onclick="switchTab('entities',this)">Entities <span class="count" id="cnt-entities"></span></button>
+    <button class="tab active" data-tab="summaries">Summaries <span class="count" id="cnt-summaries"></span></button>
+    <button class="tab" data-tab="sessions">Sessions <span class="count" id="cnt-sessions"></span></button>
+    <button class="tab" data-tab="entities">Entities <span class="count" id="cnt-entities"></span></button>
   </div>
 
   <div id="results"></div>
 
   <div class="pagination">
-    <button class="pg-btn" id="prevBtn" onclick="paginate(-1)" disabled>Previous</button>
+    <button class="pg-btn" id="prevBtn" disabled>Previous</button>
     <span class="pg-info" id="pageInfo"></span>
-    <button class="pg-btn" id="nextBtn" onclick="paginate(1)">Next</button>
+    <button class="pg-btn" id="nextBtn">Next</button>
   </div>
 </div>
 
 <script>
-let currentTab = 'summaries', currentOffset = 0;
-const PAGE_SIZE = 15;
+(function(){
+  var currentTab = "summaries";
+  var currentOffset = 0;
+  var PAGE_SIZE = 15;
 
-async function api(path) {
-  try {
-    const res = await fetch(path);
-    if (!res.ok) return [];
-    return res.json();
-  } catch { return []; }
-}
-
-async function init() {
-  const [stats, health] = await Promise.all([api('/api/stats'), api('/api/health')]);
-
-  document.getElementById('stats').innerHTML = [
-    {k:'sessions',icon:'S'}, {k:'entities',icon:'E'}, {k:'summaries',icon:'M'}, {k:'notes',icon:'N'}
-  ].map(({k}) =>
-    '<div class="stat-card"><div class="stat-value">'+(stats[k]||0)+'</div><div class="stat-label">'+k+'</div></div>'
-  ).join('');
-
-  document.getElementById('cnt-summaries').textContent = stats.summaries || '';
-  document.getElementById('cnt-sessions').textContent = stats.sessions || '';
-  document.getElementById('cnt-entities').textContent = stats.entities || '';
-
-  if (health.checks) {
-    document.getElementById('health').innerHTML = health.checks.map(function(c) {
-      return '<span class="badge badge-'+c.status+'">'+c.component+'</span>';
-    }).join('');
+  function api(path) {
+    return fetch(path).then(function(r){ return r.ok ? r.json() : []; }).catch(function(){ return []; });
   }
 
-  loadTab();
-}
-
-function switchTab(tab, btn) {
-  currentTab = tab;
-  currentOffset = 0;
-  document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active')});
-  btn.classList.add('active');
-  loadTab();
-}
-
-async function loadTab() {
-  var results = document.getElementById('results');
-  results.innerHTML = '<div class="empty"><div class="empty-icon">...</div><div class="empty-text">Loading</div></div>';
-
-  var data = await api('/api/' + currentTab + '?limit=' + PAGE_SIZE + '&offset=' + currentOffset);
-
-  if (!data || data.length === 0 || data.error) {
-    results.innerHTML = '<div class="empty"><div class="empty-icon">O</div><div class="empty-text">'+(data&&data.error ? esc(data.error) : 'No data yet')+'</div></div>';
-    updatePagination(0);
-    return;
+  function fmtDate(epoch) {
+    if (!epoch) return "N/A";
+    var d = new Date(epoch);
+    return d.toLocaleDateString("en-US", {month:"short",day:"numeric"}) + " " + d.toLocaleTimeString("en-US", {hour:"2-digit",minute:"2-digit"});
   }
 
-  if (currentTab === 'summaries') {
-    results.innerHTML = data.map(function(s) {
-      var preview = (s.summary||'').slice(0, 300);
-      return '<div class="card"><div class="card-header"><span class="card-type type-summary">summary</span><div class="card-meta"><span>'+fmtDate(s.created_at)+'</span><span>'+esc(s.project)+'</span><span>'+esc(s.session_id||'').slice(0,8)+'</span></div></div><div class="card-content" onclick="this.classList.toggle('expanded')">'+esc(preview)+'</div>'+(s.summary&&s.summary.length>300?'<button class="card-expand" onclick="this.previousElementSibling.classList.toggle('expanded')">Show more</button>':'')+'</div>';
-    }).join('');
-  } else if (currentTab === 'sessions') {
-    results.innerHTML = data.map(function(s) {
-      var statusCls = s.status==='completed'?'type-summary':s.status==='failed'?'type-error':'type-session';
-      return '<div class="card"><div class="card-header"><span class="card-type '+statusCls+'">'+esc(s.status)+'</span><div class="card-meta"><span>'+fmtDate(s.started_at)+'</span><span>'+esc(s.project)+'</span><span>'+esc(s.id||'').slice(0,12)+'</span></div></div><div class="card-content">'+esc(s.user_prompt||'(no prompt recorded)')+'</div></div>';
-    }).join('');
-  } else {
-    results.innerHTML = data.map(function(e) {
-      var typeCls = 'type-'+(e.entity_type||'entity');
-      return '<div class="card"><div class="card-header"><span class="card-type '+typeCls+'">'+esc(e.entity_type)+'</span><div class="card-meta"><span>'+fmtDate(e.created_at)+'</span><span>'+esc(e.tool_name)+'</span><span>imp: '+e.importance+'</span></div></div><div class="card-content">'+esc(e.entity_value)+(e.context?'\\n'+esc(e.context):'')+'</div></div>';
-    }).join('');
+  function esc(s) { var d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
+
+  function updatePagination(count) {
+    document.getElementById("prevBtn").disabled = currentOffset === 0;
+    document.getElementById("nextBtn").disabled = count < PAGE_SIZE;
+    document.getElementById("pageInfo").textContent = "Page " + (Math.floor(currentOffset / PAGE_SIZE) + 1);
   }
-  updatePagination(data.length);
-}
 
-async function doSearch() {
-  var q = document.getElementById('searchInput').value.trim();
-  if (!q) { currentOffset=0; loadTab(); return; }
-
-  var results = document.getElementById('results');
-  results.innerHTML = '<div class="empty"><div class="empty-icon">...</div><div class="empty-text">Searching</div></div>';
-
-  var data = await api('/api/search?q=' + encodeURIComponent(q) + '&limit=' + PAGE_SIZE);
-  if (!data || data.length === 0) {
-    results.innerHTML = '<div class="empty"><div class="empty-icon">?</div><div class="empty-text">No results for "'+esc(q)+'"</div></div>';
-    return;
+  function renderCards(data) {
+    if (currentTab === "summaries") {
+      return data.map(function(s) {
+        var preview = (s.summary || "").slice(0, 400);
+        return '<div class="card"><div class="card-header"><span class="card-type type-summary">summary</span><div class="card-meta"><span>' + fmtDate(s.created_at) + '</span><span>' + esc(s.project) + '</span><span>' + esc(s.session_id || "").slice(0,8) + '</span></div></div><div class="card-content">' + esc(preview) + '</div></div>';
+      }).join("");
+    }
+    if (currentTab === "sessions") {
+      return data.map(function(s) {
+        var cls = s.status === "completed" ? "type-summary" : s.status === "failed" ? "type-error" : "type-session";
+        return '<div class="card"><div class="card-header"><span class="card-type ' + cls + '">' + esc(s.status) + '</span><div class="card-meta"><span>' + fmtDate(s.started_at) + '</span><span>' + esc(s.project) + '</span><span>' + esc(s.id || "").slice(0,12) + '</span></div></div><div class="card-content">' + esc(s.user_prompt || "(no prompt)") + '</div></div>';
+      }).join("");
+    }
+    return data.map(function(e) {
+      return '<div class="card"><div class="card-header"><span class="card-type type-' + (e.entity_type || "entity") + '">' + esc(e.entity_type) + '</span><div class="card-meta"><span>' + fmtDate(e.created_at) + '</span><span>' + esc(e.tool_name) + '</span><span>imp: ' + e.importance + '</span></div></div><div class="card-content">' + esc(e.entity_value) + (e.context ? "\\n" + esc(e.context) : "") + '</div></div>';
+    }).join("");
   }
-  results.innerHTML = data.map(function(r) {
-    return '<div class="card"><div class="card-header"><span class="card-type type-'+r.type+'">'+esc(r.type)+'#'+r.id+'</span><div class="card-meta"><span>'+fmtDate(r.created_at)+'</span><span>'+esc(r.project)+'</span><span>score: '+(r.score||0).toFixed(2)+'</span></div></div><div class="card-content">'+esc(r.title)+'</div></div>';
-  }).join('');
-}
 
-function paginate(dir) {
-  currentOffset = Math.max(0, currentOffset + dir * PAGE_SIZE);
-  loadTab();
-}
+  function loadTab() {
+    var el = document.getElementById("results");
+    el.innerHTML = '<div class="empty"><div class="empty-text">Loading...</div></div>';
+    api("/api/" + currentTab + "?limit=" + PAGE_SIZE + "&offset=" + currentOffset).then(function(data) {
+      if (!data || data.length === 0 || data.error) {
+        el.innerHTML = '<div class="empty"><div class="empty-text">' + (data && data.error ? esc(data.error) : "No data yet.") + '</div></div>';
+        updatePagination(0);
+        return;
+      }
+      el.innerHTML = renderCards(data);
+      updatePagination(data.length);
+      el.querySelectorAll(".card-content").forEach(function(c){ c.addEventListener("click", function(){ this.classList.toggle("expanded"); }); });
+    });
+  }
 
-function updatePagination(count) {
-  document.getElementById('prevBtn').disabled = currentOffset === 0;
-  document.getElementById('nextBtn').disabled = count < PAGE_SIZE;
-  document.getElementById('pageInfo').textContent = 'Page ' + (Math.floor(currentOffset / PAGE_SIZE) + 1);
-}
+  function doSearch() {
+    var q = document.getElementById("searchInput").value.trim();
+    if (!q) { currentOffset = 0; loadTab(); return; }
+    var el = document.getElementById("results");
+    el.innerHTML = '<div class="empty"><div class="empty-text">Searching...</div></div>';
+    api("/api/search?q=" + encodeURIComponent(q) + "&limit=" + PAGE_SIZE).then(function(data) {
+      if (!data || data.length === 0) {
+        el.innerHTML = '<div class="empty"><div class="empty-text">No results for "' + esc(q) + '"</div></div>';
+        return;
+      }
+      el.innerHTML = data.map(function(r) {
+        return '<div class="card"><div class="card-header"><span class="card-type type-' + r.type + '">' + esc(r.type) + "#" + r.id + '</span><div class="card-meta"><span>' + fmtDate(r.created_at) + '</span><span>' + esc(r.project) + '</span><span>score: ' + (r.score || 0).toFixed(2) + '</span></div></div><div class="card-content">' + esc(r.title) + '</div></div>';
+      }).join("");
+    });
+  }
 
-function fmtDate(epoch) {
-  if (!epoch) return 'N/A';
-  var d = new Date(epoch);
-  return d.toLocaleDateString('en-US', {month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit'});
-}
-function esc(s) { var d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+  // Tab click handlers
+  document.querySelectorAll("[data-tab]").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      currentTab = this.getAttribute("data-tab");
+      currentOffset = 0;
+      document.querySelectorAll(".tab").forEach(function(b){ b.classList.remove("active"); });
+      this.classList.add("active");
+      loadTab();
+    });
+  });
 
-document.getElementById('searchInput').addEventListener('keydown', function(e) { if (e.key === 'Enter') doSearch(); });
-init();
+  // Pagination
+  document.getElementById("prevBtn").addEventListener("click", function(){ currentOffset = Math.max(0, currentOffset - PAGE_SIZE); loadTab(); });
+  document.getElementById("nextBtn").addEventListener("click", function(){ currentOffset += PAGE_SIZE; loadTab(); });
+
+  // Search
+  document.getElementById("searchInput").addEventListener("keydown", function(e){ if (e.key === "Enter") doSearch(); });
+
+  // Init
+  Promise.all([api("/api/stats"), api("/api/health")]).then(function(res) {
+    var stats = res[0], health = res[1];
+
+    document.getElementById("stats").innerHTML = ["sessions","entities","summaries","notes"].map(function(k) {
+      return '<div class="stat-card"><div class="stat-value">' + (stats[k] || 0) + '</div><div class="stat-label">' + k + '</div></div>';
+    }).join("");
+
+    var cntS = document.getElementById("cnt-summaries"); if(cntS) cntS.textContent = stats.summaries || "";
+    var cntSe = document.getElementById("cnt-sessions"); if(cntSe) cntSe.textContent = stats.sessions || "";
+    var cntE = document.getElementById("cnt-entities"); if(cntE) cntE.textContent = stats.entities || "";
+
+    if (health && health.checks) {
+      document.getElementById("health").innerHTML = health.checks.map(function(c) {
+        return '<span class="badge badge-' + c.status + '">' + c.component + '</span>';
+      }).join("");
+    }
+
+    loadTab();
+  });
+})();
 </script>
 </body>
 </html>`;
