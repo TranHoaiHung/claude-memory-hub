@@ -14163,7 +14163,7 @@ CREATE TABLE IF NOT EXISTS resource_usage (
   session_id  TEXT NOT NULL,
   project     TEXT NOT NULL,
   resource_type TEXT NOT NULL
-    CHECK(resource_type IN ('skill','agent','claude_md','memory','mcp_tool')),
+    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
   resource_name TEXT NOT NULL,
   use_count   INTEGER NOT NULL DEFAULT 1,
   token_cost  INTEGER NOT NULL DEFAULT 0,
@@ -14241,26 +14241,492 @@ class ResourceTracker {
   }
 }
 
+// src/context/resource-registry.ts
+import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
+import { join as join3, basename, relative } from "path";
+import { homedir as homedir3 } from "os";
+var log2 = createLogger("resource-registry");
+var CHARS_PER_TOKEN = 3.75;
+var SCAN_TTL_MS = 5 * 60 * 1000;
+var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
+var SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
+var MAX_DIR_WALK_DEPTH = 5;
+
+class ResourceRegistry {
+  resources = new Map;
+  lastScanAt = 0;
+  claudeDir;
+  constructor() {
+    this.claudeDir = join3(homedir3(), ".claude");
+  }
+  scan(cwd) {
+    if (Date.now() - this.lastScanAt < SCAN_TTL_MS && this.resources.size > 0)
+      return;
+    this.resources.clear();
+    try {
+      this.scanSkills(join3(this.claudeDir, "skills"), cwd);
+      this.scanFlatAgents(join3(this.claudeDir, "agents"));
+      this.scanAgentPackages(this.claudeDir);
+      this.scanCommands(join3(this.claudeDir, "commands"), cwd);
+      this.scanWorkflows(join3(this.claudeDir, "workflows"));
+      this.scanClaudeMd(cwd);
+      this.lastScanAt = Date.now();
+    } catch (err) {
+      log2.error("scan failed", { error: String(err) });
+    }
+  }
+  resolve(kind, name) {
+    this.ensureScanned();
+    return this.resources.get(`${kind}:${name}`);
+  }
+  exists(kind, name) {
+    return this.resolve(kind, name) !== undefined;
+  }
+  getAll(kind) {
+    this.ensureScanned();
+    const all = [...this.resources.values()];
+    return kind ? all.filter((r) => r.kind === kind) : all;
+  }
+  async getOverheadReport(project, lastNSessions = 10) {
+    this.ensureScanned();
+    const tracker = new ResourceTracker;
+    const recentSkills = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "skill");
+    const recentAgents = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "agent");
+    const allSkills = this.getAll("skill");
+    const allAgents = this.getAll("agent");
+    const usedSkillNames = new Set(recentSkills.map((r) => r.resource_name));
+    const usedAgentNames = new Set(recentAgents.map((r) => r.resource_name));
+    const unusedSkills = allSkills.filter((s) => !usedSkillNames.has(s.name));
+    const unusedAgents = allAgents.filter((a) => !usedAgentNames.has(a.name));
+    const skillListingTokens = allSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const agentDescTokens = allAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const commandListingTokens = this.getAll("command").reduce((sum, c) => sum + c.listing_tokens, 0);
+    const claudeMdTokens = this.getAll("claude_md").reduce((sum, c) => sum + c.full_tokens, 0);
+    const unusedSkillListingTokens = unusedSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const unusedAgentListingTokens = unusedAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const recommendations = [];
+    if (unusedSkills.length > 0) {
+      recommendations.push(`${unusedSkills.length}/${allSkills.length} skills unused in last ${lastNSessions} sessions (~${unusedSkillListingTokens} listing tokens). Consider project-local or removal.`);
+    }
+    if (unusedAgents.length > 0) {
+      recommendations.push(`${unusedAgents.length}/${allAgents.length} agents unused in last ${lastNSessions} sessions (~${unusedAgentListingTokens} listing tokens).`);
+    }
+    if (claudeMdTokens > 5000) {
+      recommendations.push(`CLAUDE.md chain is ${claudeMdTokens} tokens. Consider consolidating if >5K.`);
+    }
+    return {
+      fixed_overhead: {
+        total_tokens: skillListingTokens + agentDescTokens + commandListingTokens + claudeMdTokens,
+        skill_listings: skillListingTokens,
+        agent_descriptions: agentDescTokens,
+        command_listings: commandListingTokens,
+        claude_md: claudeMdTokens
+      },
+      usage_analysis: {
+        skills_installed: allSkills.length,
+        skills_used_recently: usedSkillNames.size,
+        skills_never_used: unusedSkills.map((s) => s.name),
+        agents_installed: allAgents.length,
+        agents_used_recently: usedAgentNames.size,
+        agents_never_used: unusedAgents.map((a) => a.name)
+      },
+      recommendations,
+      potential_savings: {
+        if_remove_unused_skills: unusedSkillListingTokens,
+        if_remove_unused_agents: unusedAgentListingTokens
+      }
+    };
+  }
+  scanSkills(globalDir, cwd) {
+    this.scanSkillDir(globalDir, "global");
+    if (cwd) {
+      const projectDir = join3(cwd, ".claude", "skills");
+      if (existsSync3(projectDir)) {
+        this.scanSkillDir(projectDir, "project");
+      }
+    }
+  }
+  scanSkillDir(dir, source) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory())
+          continue;
+        const name = entry.name;
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const skillDir = join3(dir, name);
+        const skillFile = this.findPrimaryFile(skillDir, ["SKILL.md", "README.md"]);
+        const listing = this.estimateListingFromSkillDir(skillDir);
+        const fullTokens = skillFile ? this.charsToTokens(this.readFileSize(skillFile)) : 0;
+        const totalTokens = this.estimateDirTokens(skillDir);
+        this.register({
+          kind: "skill",
+          name,
+          path: skillFile ?? skillDir,
+          allPaths: this.listMdFiles(skillDir),
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: fullTokens,
+          total_tokens: totalTokens,
+          source
+        });
+      }
+    } catch (err) {
+      log2.error(`scanSkillDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanFlatAgents(dir) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        if (entry.name === "README.md")
+          continue;
+        const filePath = join3(dir, entry.name);
+        const content = this.readFileHead(filePath, 20);
+        const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        const listing = this.estimateAgentListingTokens(content);
+        this.register({
+          kind: "agent",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log2.error(`scanFlatAgents ${dir}`, { error: String(err) });
+    }
+  }
+  scanAgentPackages(claudeDir) {
+    if (!existsSync3(claudeDir))
+      return;
+    try {
+      for (const entry of readdirSync(claudeDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith("agent_"))
+          continue;
+        const packageDir = join3(claudeDir, entry.name);
+        this.scanAgentPackageDir(packageDir);
+      }
+    } catch (err) {
+      log2.error("scanAgentPackages", { error: String(err) });
+    }
+  }
+  scanAgentPackageDir(packageDir) {
+    try {
+      for (const entry of readdirSync(packageDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const subDir = join3(packageDir, entry.name);
+          const agentFile = join3(subDir, "AGENT.md");
+          if (existsSync3(agentFile)) {
+            const content = this.readFileHead(agentFile, 20);
+            const name = this.parseFrontmatterName(content) ?? entry.name;
+            if (!SAFE_NAME_RE.test(name))
+              continue;
+            const listing = this.estimateAgentListingTokens(content);
+            const fullTokens = this.charsToTokens(this.readFileSize(agentFile));
+            const totalTokens = this.estimateDirTokens(subDir);
+            this.register({
+              kind: "agent",
+              name,
+              path: agentFile,
+              allPaths: this.listMdFiles(subDir),
+              category: "variable",
+              listing_tokens: listing,
+              full_tokens: fullTokens,
+              total_tokens: totalTokens,
+              source: "global"
+            });
+          }
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (entry.name === "README.md" || entry.name === "SKILL.md")
+            continue;
+          const filePath = join3(packageDir, entry.name);
+          const content = this.readFileHead(filePath, 20);
+          const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+          if (!SAFE_NAME_RE.test(name))
+            continue;
+          if (this.resources.has(`agent:${name}`))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          this.register({
+            kind: "agent",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateAgentListingTokens(content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source: "global"
+          });
+        }
+      }
+    } catch (err) {
+      log2.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+    }
+  }
+  scanCommands(globalDir, cwd) {
+    if (existsSync3(globalDir))
+      this.scanCommandDir(globalDir, globalDir, "global");
+    if (cwd) {
+      const projectDir = join3(cwd, ".claude", "commands");
+      if (existsSync3(projectDir))
+        this.scanCommandDir(projectDir, projectDir, "project");
+    }
+  }
+  scanCommandDir(dir, baseDir, source) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          this.scanCommandDir(join3(dir, entry.name), baseDir, source);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          const filePath = join3(dir, entry.name);
+          const name = relative(baseDir, filePath).replace(/\.md$/, "");
+          if (!SAFE_COMMAND_NAME_RE.test(name))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          const content = this.readFileHead(filePath, 3);
+          this.register({
+            kind: "command",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateCommandListingTokens(name, content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source
+          });
+        }
+      }
+    } catch (err) {
+      log2.error(`scanCommandDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanWorkflows(dir) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        const filePath = join3(dir, entry.name);
+        const name = basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        this.register({
+          kind: "workflow",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: 0,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log2.error(`scanWorkflows ${dir}`, { error: String(err) });
+    }
+  }
+  scanClaudeMd(cwd) {
+    const globalFile = join3(this.claudeDir, "CLAUDE.md");
+    if (existsSync3(globalFile)) {
+      const fileSize = this.readFileSize(globalFile);
+      this.register({
+        kind: "claude_md",
+        name: "global",
+        path: globalFile,
+        allPaths: [globalFile],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "global"
+      });
+    }
+    if (!cwd)
+      return;
+    const projectFiles = [
+      join3(cwd, "CLAUDE.md"),
+      join3(cwd, ".claude", "CLAUDE.md")
+    ];
+    for (const file of projectFiles) {
+      if (!existsSync3(file))
+        continue;
+      const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      const name = `project:${relPath}`;
+      const fileSize = this.readFileSize(file);
+      this.register({
+        kind: "claude_md",
+        name,
+        path: file,
+        allPaths: [file],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "project"
+      });
+    }
+  }
+  ensureScanned() {
+    if (this.resources.size === 0 || Date.now() - this.lastScanAt >= SCAN_TTL_MS) {
+      this.scan();
+    }
+  }
+  register(resource) {
+    const key = `${resource.kind}:${resource.name}`;
+    const existing = this.resources.get(key);
+    if (existing && existing.source === "global" && resource.source === "project") {
+      this.resources.set(key, resource);
+    } else if (!existing) {
+      this.resources.set(key, resource);
+    }
+  }
+  parseFrontmatterName(content) {
+    const lines = content.split(`
+`);
+    let inFrontmatter = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed === "---") {
+        if (inFrontmatter)
+          return;
+        inFrontmatter = true;
+        continue;
+      }
+      if (!inFrontmatter)
+        continue;
+      const m = trimmed.match(/^name:\s*["']?([a-zA-Z0-9_\-]+)["']?/);
+      if (m?.[1])
+        return m[1];
+    }
+    return;
+  }
+  findPrimaryFile(dir, candidates) {
+    for (const c of candidates) {
+      const p = join3(dir, c);
+      if (existsSync3(p))
+        return p;
+    }
+    return;
+  }
+  readFileHead(filePath, lines) {
+    try {
+      const content = readFileSync(filePath, "utf-8");
+      return content.split(`
+`).slice(0, lines).join(`
+`);
+    } catch {
+      return "";
+    }
+  }
+  readFileSize(filePath) {
+    try {
+      return statSync(filePath).size;
+    } catch {
+      return 0;
+    }
+  }
+  charsToTokens(chars) {
+    return Math.ceil(chars / CHARS_PER_TOKEN);
+  }
+  estimateListingFromSkillDir(dir) {
+    const skillFile = this.findPrimaryFile(dir, ["SKILL.md", "README.md"]);
+    if (!skillFile)
+      return 30;
+    const head = this.readFileHead(skillFile, 5);
+    const descLine = head.split(`
+`).find((l) => l.startsWith("description:") || l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = descLine?.slice(0, 80).length ?? 20;
+    return Math.ceil((descLen + 30) / CHARS_PER_TOKEN);
+  }
+  estimateAgentListingTokens(headContent) {
+    const lines = headContent.split(`
+`);
+    for (const line of lines) {
+      if (line.startsWith("description:")) {
+        const desc = line.slice(12).trim().slice(0, 150);
+        return Math.ceil((desc.length + 30) / CHARS_PER_TOKEN);
+      }
+    }
+    return 30;
+  }
+  estimateCommandListingTokens(name, headContent) {
+    const firstLine = headContent.split(`
+`).find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = firstLine?.slice(0, 60).length ?? 10;
+    return Math.ceil((name.length + descLen + 10) / CHARS_PER_TOKEN);
+  }
+  listMdFiles(dir) {
+    const files = [];
+    try {
+      const walk = (d, depth) => {
+        if (depth > MAX_DIR_WALK_DEPTH)
+          return;
+        for (const entry of readdirSync(d, { withFileTypes: true })) {
+          const p = join3(d, entry.name);
+          if (entry.isDirectory())
+            walk(p, depth + 1);
+          else if (entry.isFile() && entry.name.endsWith(".md"))
+            files.push(p);
+        }
+      };
+      walk(dir, 0);
+    } catch {}
+    return files;
+  }
+  estimateDirTokens(dir) {
+    return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
+  }
+}
+var _instance;
+function getResourceRegistry() {
+  if (!_instance)
+    _instance = new ResourceRegistry;
+  return _instance;
+}
+
 // src/context/smart-resource-loader.ts
 var DEFAULT_TOKEN_BUDGET = 30000;
 
 class SmartResourceLoader {
   tracker;
   ltStore;
-  constructor() {
+  registry;
+  constructor(registry2) {
     this.tracker = new ResourceTracker;
     this.ltStore = new LongTermStore;
+    this.registry = registry2 ?? getResourceRegistry();
   }
-  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET) {
+  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET, cwd) {
+    this.registry.scan(cwd);
     const recommendations = [];
     const recent = this.tracker.getRecentlyUsedResources(project, 5);
     for (const r of recent) {
-      const avgTokens = this.getAvgTokenCost(project, r.resource_name);
+      const tokenCost = this.getTokenCost(r.resource_type, r.resource_name);
+      if (tokenCost === 0)
+        continue;
       recommendations.push({
         resource_type: r.resource_type,
         resource_name: r.resource_name,
         score: Math.min(100, r.frequency * 20),
-        token_cost: avgTokens,
+        token_cost: tokenCost,
         reason: `used in ${r.frequency}/5 recent sessions`
       });
     }
@@ -14275,8 +14741,8 @@ class SmartResourceLoader {
               resource_type: "claude_md",
               resource_name: file,
               score: 40,
-              token_cost: 500,
-              reason: `touched in similar past session`
+              token_cost: this.getTokenCost("claude_md", file),
+              reason: "touched in similar past session"
             });
           }
         }
@@ -14305,25 +14771,38 @@ class SmartResourceLoader {
     if (plan.skipped.length === 0)
       return "";
     const lines = [
-      "<!-- memory-hub: context budget advice -->",
-      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used by recommended resources.`
+      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used.`
     ];
     if (plan.skipped.length > 0) {
       lines.push(`${plan.skipped.length} resource(s) deferred for token efficiency:`);
       for (const s of plan.skipped.slice(0, 5)) {
-        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tokens, ${s.reason})`);
+        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tok, ${s.reason})`);
       }
       lines.push("Use SkillTool or ToolSearch to load these on demand if needed.");
     }
-    lines.push("<!-- end memory-hub advice -->");
     return lines.join(`
 `);
   }
-  getAvgTokenCost(project, resourceName) {
-    const results = this.tracker.getMostUsedResources(project);
-    const match = results.find((r) => r.resource_name === resourceName);
-    return match?.avg_tokens ?? 500;
+  getTokenCost(resourceType, resourceName) {
+    const kind = resourceTypeToKind(resourceType);
+    if (!kind)
+      return 500;
+    const resource = this.registry.resolve(kind, resourceName);
+    return resource?.full_tokens ?? 0;
   }
+}
+function resourceTypeToKind(type) {
+  const mapping = {
+    skill: "skill",
+    agent: "agent",
+    command: "command",
+    workflow: "workflow",
+    claude_md: "claude_md",
+    mcp_tool: "mcp_tool",
+    hook: "hook",
+    memory: "memory"
+  };
+  return mapping[type];
 }
 function safeJson2(text, fallback) {
   try {
@@ -14376,10 +14855,10 @@ class WorkingMemory {
 var workingMemory = new WorkingMemory;
 
 // src/health/monitor.ts
-import { existsSync as existsSync3, statSync } from "fs";
-import { homedir as homedir3 } from "os";
-import { join as join3 } from "path";
-var log2 = createLogger("health");
+import { existsSync as existsSync4, statSync as statSync2 } from "fs";
+import { homedir as homedir4 } from "os";
+import { join as join4 } from "path";
+var log3 = createLogger("health");
 function checkDatabase(db) {
   const start = performance.now();
   try {
@@ -14420,12 +14899,12 @@ function checkFTS5(db) {
 }
 function checkDiskSpace() {
   const start = performance.now();
-  const dbPath = join3(homedir3(), ".claude-memory-hub", "memory.db");
+  const dbPath = join4(homedir4(), ".claude-memory-hub", "memory.db");
   try {
-    if (!existsSync3(dbPath)) {
+    if (!existsSync4(dbPath)) {
       return { component: "disk", status: "ok", message: "DB not yet created", latency_ms: 0 };
     }
-    const stats = statSync(dbPath);
+    const stats = statSync2(dbPath);
     const sizeMB = stats.size / (1024 * 1024);
     const status = sizeMB > 500 ? "degraded" : "ok";
     return {
@@ -14499,11 +14978,11 @@ function runHealthCheck(db) {
         SELECT id FROM health_checks ORDER BY checked_at DESC LIMIT 400
       )`);
   } catch (e) {
-    log2.warn("Failed to persist health check", { error: String(e) });
+    log3.warn("Failed to persist health check", { error: String(e) });
   }
   const report = { overall, checks: checks3, checked_at: now };
   if (overall !== "ok") {
-    log2.warn("Health check degraded", { overall, checks: checks3.filter((c) => c.status !== "ok") });
+    log3.warn("Health check degraded", { overall, checks: checks3.filter((c) => c.status !== "ok") });
   }
   return report;
 }
@@ -14518,7 +14997,7 @@ function formatHealthReport(report) {
 }
 
 // src/search/vector-search.ts
-var log3 = createLogger("vector-search");
+var log4 = createLogger("vector-search");
 var STOP_WORDS = new Set([
   "the",
   "a",
@@ -14664,13 +15143,13 @@ function vectorSearch(query, limit = 10, docTypeFilter, db) {
     `).all(...queryTokens, limit);
     return results;
   } catch (e) {
-    log3.error("Vector search failed", { error: String(e) });
+    log4.error("Vector search failed", { error: String(e) });
     return [];
   }
 }
 
 // src/search/search-workflow.ts
-var log4 = createLogger("search-workflow");
+var log5 = createLogger("search-workflow");
 function searchIndex(query, opts = {}, db) {
   const d = db ?? getDatabase();
   const limit = opts.limit ?? 20;
@@ -14886,7 +15365,7 @@ async function handleMemorySearch(args) {
   const { query, limit = 20, offset = 0, project } = args;
   if (!query?.trim())
     return "No query provided.";
-  const results = searchIndex(query, { limit: Math.min(limit, 50), offset, project });
+  const results = searchIndex(query, { limit: Math.min(limit, 50), offset, ...project ? { project } : {} });
   return formatSearchIndex(results);
 }
 async function handleMemoryTimeline(args) {
@@ -14911,31 +15390,56 @@ async function handleMemoryContextBudget(args) {
   const { project } = args;
   if (!project?.trim())
     return "No project provided.";
-  const loader = new SmartResourceLoader;
+  const registry2 = getResourceRegistry();
+  registry2.scan();
+  const loader = new SmartResourceLoader(registry2);
   const tracker = new ResourceTracker;
   const plan = loader.buildContextPlan(project, "", 30000);
   const budget = tracker.estimateTokenBudget(project);
+  const overhead = await registry2.getOverheadReport(project);
   const lines = [
     `**Context Budget Analysis for "${project}"**`,
     "",
-    `Total tracked resources: ${budget.resource_count}`,
-    `Estimated token cost: ~${budget.total_token_cost} tokens`,
+    "## Fixed Overhead (loaded every session)",
+    `Total: ~${overhead.fixed_overhead.total_tokens} tokens`,
+    `  - Skill listings: ~${overhead.fixed_overhead.skill_listings} tok (${overhead.usage_analysis.skills_installed} skills)`,
+    `  - Agent descriptions: ~${overhead.fixed_overhead.agent_descriptions} tok (${overhead.usage_analysis.agents_installed} agents)`,
+    `  - Command listings: ~${overhead.fixed_overhead.command_listings} tok`,
+    `  - CLAUDE.md chain: ~${overhead.fixed_overhead.claude_md} tok`,
     "",
-    "**By type:**"
+    "## Usage Analysis",
+    `Skills: ${overhead.usage_analysis.skills_used_recently}/${overhead.usage_analysis.skills_installed} used recently`,
+    `Agents: ${overhead.usage_analysis.agents_used_recently}/${overhead.usage_analysis.agents_installed} used recently`
   ];
-  for (const [type, tokens] of Object.entries(budget.by_type)) {
-    lines.push(`  - ${type}: ~${tokens} tokens`);
+  if (overhead.usage_analysis.skills_never_used.length > 0) {
+    const unused = overhead.usage_analysis.skills_never_used.slice(0, 10);
+    lines.push(`Unused skills: ${unused.join(", ")}${overhead.usage_analysis.skills_never_used.length > 10 ? ` (+${overhead.usage_analysis.skills_never_used.length - 10} more)` : ""}`);
   }
-  if (plan.recommendations.length > 0) {
-    lines.push("", "**Recommended resources (sorted by relevance):**");
-    for (const r of plan.recommendations.slice(0, 10)) {
-      lines.push(`  - [${r.resource_type}] ${r.resource_name} (score: ${r.score}, ~${r.token_cost} tok) \u2014 ${r.reason}`);
+  if (overhead.usage_analysis.agents_never_used.length > 0) {
+    const unused = overhead.usage_analysis.agents_never_used.slice(0, 10);
+    lines.push(`Unused agents: ${unused.join(", ")}${overhead.usage_analysis.agents_never_used.length > 10 ? ` (+${overhead.usage_analysis.agents_never_used.length - 10} more)` : ""}`);
+  }
+  if (overhead.recommendations.length > 0) {
+    lines.push("", "## Recommendations");
+    for (const r of overhead.recommendations) {
+      lines.push(`\u26A1 ${r}`);
     }
   }
-  if (plan.skipped.length > 0) {
-    lines.push("", `**Deferred (${plan.skipped.length} resources over budget):**`);
-    for (const s of plan.skipped.slice(0, 5)) {
-      lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tok)`);
+  const totalSavings = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+  if (totalSavings > 0) {
+    lines.push("", `## Potential Savings: ~${totalSavings} listing tokens/session`);
+  }
+  if (budget.resource_count > 0) {
+    lines.push("", "## Tracked Resource Usage");
+    lines.push(`Total tracked: ${budget.resource_count} resources, ~${budget.total_token_cost} tokens`);
+    for (const [type, tokens] of Object.entries(budget.by_type)) {
+      lines.push(`  - ${type}: ~${tokens} tokens`);
+    }
+  }
+  if (plan.recommendations.length > 0) {
+    lines.push("", "## Top Recommendations (by usage frequency)");
+    for (const r of plan.recommendations.slice(0, 10)) {
+      lines.push(`  - [${r.resource_type}] ${r.resource_name} (score: ${r.score}, ~${r.token_cost} tok) \u2014 ${r.reason}`);
     }
   }
   return lines.join(`
@@ -14992,7 +15496,7 @@ var TOOL_DEFINITIONS = [
   },
   {
     name: "memory_context_budget",
-    description: "Analyze token budget usage and recommend which skills/agents/resources to load. " + "Shows most-used resources, estimated token costs, and deferred resources. " + "Use to optimize context token efficiency.",
+    description: "Analyze token overhead, resource usage, and recommendations. " + "Shows: fixed cost breakdown (skills/agents/commands/CLAUDE.md listings), " + "unused resources wasting tokens, potential savings, and usage-based recommendations. " + "Use to understand and optimize context token efficiency.",
     inputSchema: {
       type: "object",
       properties: {

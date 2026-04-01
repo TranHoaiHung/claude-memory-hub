@@ -15,7 +15,8 @@ git add .gitignore .npmignore .github/ README.md CHANGELOG.md LICENSE package.js
 
 echo ""
 echo "Commit..."
-git commit -m "chore: update build output v$(node -p 'require(\"./package.json\").version')" || echo "Nothing to commit"
+VERSION=$(node -p "require('./package.json').version")
+git commit -m "chore: update build output v${VERSION}" || echo "Nothing to commit"
 
 echo ""
 echo "Pushing to public (origin)..."
