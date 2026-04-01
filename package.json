@@ -1,7 +1,7 @@
 {
   "name": "claude-memory-hub",
-  "version": "0.5.2",
-  "description": "Persistent memory system for Claude Code. Zero API key. Zero Python. 5 hooks + MCP server + SQLite FTS5.",
+  "version": "0.6.0",
+  "description": "Persistent memory system for Claude Code. Zero API key. Zero Python. 5 hooks + MCP server + SQLite FTS5 + semantic search.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -31,7 +31,9 @@
     "context",
     "persistent-memory",
     "sqlite",
-    "fts5"
+    "fts5",
+    "semantic-search",
+    "embeddings"
   ],
   "author": "TranHoaiHung",
   "license": "MIT",

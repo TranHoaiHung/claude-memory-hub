@@ -45,8 +45,13 @@ Search:        Keyword-only, no semantic ranking
 | Influence what compact preserves | -- | -- | **Yes** |
 | Save compact output | -- | -- | **Yes** |
 | Token budget optimization | -- | -- | **Yes** |
-| Hybrid search (FTS5 + TF-IDF) | -- | Partial | **Yes** |
+| Semantic search (embeddings) | -- | Chroma (external) | **Yes (offline)** |
+| Hybrid search (FTS5 + TF-IDF + semantic) | -- | Partial | **Yes** |
 | 3-layer progressive search | -- | Yes | **Yes** |
+| Resource overhead analysis | -- | -- | **Yes** |
+| CLAUDE.md rule tracking | -- | -- | **Yes** |
+| Free-form observation capture | -- | Yes | **Yes** |
+| LLM summarization (3-tier) | -- | Yes (API) | **Yes (free)** |
 | Browser UI | -- | Yes | **Yes** |
 | Health monitoring | -- | -- | **Yes** |
 | Migrate from claude-mem | N/A | N/A | **Yes** |
@@ -127,7 +132,7 @@ Session N+1     → UserPromptSubmit hook fires
 
 memory-hub tracks which skills/agents/tools you **actually use**, then recommends only those for future sessions. Rare resources load on demand via SkillTool.
 
-### Layer 5 — 3-Layer Progressive Search (new in v0.5)
+### Layer 5 — 3-Layer Progressive Search + Semantic (new in v0.5/v0.6)
 
 ```
 Traditional search: query → ALL full records → 5000+ tokens wasted
@@ -140,7 +145,35 @@ memory-hub search:  query → Layer 1 (index)    → ~50 tokens/result
                     Token savings: ~80-90% vs. full context
 ```
 
-Hybrid ranking: FTS5 BM25 for keyword matches + TF-IDF cosine similarity for semantic ranking. Zero external dependencies — pure TypeScript implementation.
+Hybrid ranking: FTS5 BM25 (keyword) + TF-IDF (term frequency) + **semantic cosine similarity** (384-dim embeddings, v0.6). "debugging tips" now matches "error fixing" even without shared keywords.
+
+### Layer 6 — Resource Intelligence (new in v0.6)
+
+```
+ResourceRegistry scans ALL .claude locations:
+  ~/.claude/skills/          58 skills → listing + full + total tokens
+  ~/.claude/agents/          36 agents → frontmatter name: resolution
+  ~/.claude/agent_mobile/    ios-developer → agent_mobile/ios/AGENT.md
+  ~/.claude/commands/        65 commands → relative path naming
+  ~/.claude/workflows/       10 workflows
+  ~/.claude/CLAUDE.md        + project CLAUDE.md chain
+
+OverheadReport:
+  "56/64 skills unused in last 10 sessions → ~1033 listing tokens wasted"
+  "CLAUDE.md chain is 3222 tokens"
+```
+
+### Layer 7 — Observation Capture (new in v0.6)
+
+```
+Tool output contains "IMPORTANT: always pool DB connections"
+  → observation entity (importance=4) saved to L2
+  → included in session summary
+  → searchable across sessions
+
+User prompt contains "remember that we use TypeScript strict"
+  → observation entity (importance=3) saved to L2
+```
 
 ---
 
@@ -195,6 +228,9 @@ Hybrid ranking: FTS5 BM25 for keyword matches + TF-IDF cosine similarity for sem
                    │   resource_usage   │
                    │   fts_memories     │
                    │   tfidf_index      │
+                   │   embeddings       │
+                   │   claude_md_       │
+                   │    registry        │
                    │   health_checks    │
                    └────────────────────┘
 ```
@@ -361,6 +397,7 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | **v0.3.0** | Removed API key requirement, 1-command install |
 | **v0.4.0** | Smart resource loading, token budget optimization |
 | **v0.5.0** | Production hardening, hybrid search, 3-layer progressive search, browser UI, health monitoring, claude-mem migration |
+| **v0.6.0** | ResourceRegistry (170 resources), semantic search (384-dim embeddings), observation capture, CLAUDE.md tracking, 3-tier LLM summarization, overhead analysis |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
@@ -369,13 +406,21 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 ## Dependencies
 
 ```
-@modelcontextprotocol/sdk    MCP stdio server
-bun:sqlite                   Built-in, zero install
+@modelcontextprotocol/sdk          MCP stdio server (required)
+bun:sqlite                         Built-in, zero install
+@huggingface/transformers          Semantic search embeddings (optional)
 ```
 
-That's it. **One npm package.** The other is built into Bun.
+**Two npm packages + one optional.** No Python. No Chroma. No HTTP server. No API key. No Docker.
 
-No Python. No Chroma. No HTTP server. No API key. No Docker.
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_MEMORY_HUB_LLM` | `auto` | Summarization: auto, cli-only, rule-based |
+| `CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS` | `30000` | CLI summarizer timeout |
+| `CLAUDE_MEMORY_HUB_EMBEDDINGS` | `auto` | Embeddings: auto, disabled |
+| `CMH_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 
 ---
 

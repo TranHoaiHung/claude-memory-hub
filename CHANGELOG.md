@@ -5,6 +5,86 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.6.0] - 2026-04-01
+
+Major release: semantic search, resource intelligence, observation capture, CLAUDE.md tracking, LLM summarization.
+
+### Phase 1 — ResourceRegistry + Entity Coverage
+
+- **ResourceRegistry** — unified scanner for ALL `.claude` locations: skills (58), agents (36), commands (65), workflows (10), CLAUDE.md. Parses agent frontmatter `name:` for correct resolution (e.g., `ios-developer` → `~/.claude/agent_mobile/ios/AGENT.md`). 3-level token estimation: listing (~50-200), full (200-8000), total (all files on disk)
+- **OverheadReport** — `memory_context_budget` MCP tool now shows: fixed token overhead breakdown, unused skill/agent detection, potential savings recommendations
+- **InjectionValidator** — sanitizes context before `UserPromptSubmit` injection. Strips HTML comments, caps at 4500 chars, filters dead resource recommendations via `filterAliveRecommendations()`
+- **Agent/Skill entities** — `Agent` and `Skill` tool calls now produce `entity_type="decision"` entities (importance 3/2), visible in summarization and compact scoring
+- **Expanded resource types** — `resource_usage` table tracks 8 types: skill, agent, command, workflow, claude_md, memory, mcp_tool, hook (was 5)
+- **Real token costs** — `SmartResourceLoader` uses ResourceRegistry for actual file-size-based estimates instead of hardcoded 500 fallback
+
+### Phase 2 — Schema v3 + Observations + CLAUDE.md Tracking
+
+- **Schema migration v3** — entities table rebuilt with `observation` type in CHECK constraint + new `claude_md_registry` table
+- **Observation extractor** — heuristic-based free-form capture from tool output and user prompts. Keywords: IMPORTANT/CRITICAL (importance 4), decision:/NOTE: (3), TODO:/FIXME: (2). Max 1 observation per tool call, capped at 300 chars
+- **CLAUDE.md tracker** — walks from `cwd` to root, finds all CLAUDE.md files, extracts `## sections` + 200-char previews, content-hash change detection (only re-parses on change), injects rule summary into context
+- **Session summarizer** includes top 5 observations in L3 summaries
+- **Vector search** reindexes observation entities alongside decisions and errors
+
+### Phase 3 — LLM Summarization Pipeline
+
+- **3-tier fallback** — Tier 1: PostCompact summary (free, already existed). Tier 2: `claude -p ... --print` subprocess with 30s timeout. Tier 3: Rule-based (always available)
+- **Hook recursion guard** — `CLAUDE_MEMORY_HUB_SKIP_HOOKS=1` env var set on CLI subprocess, checked by all 5 hook entry scripts. Prevents infinite loop when CLI summarizer triggers hooks
+- **Configurable** — `CLAUDE_MEMORY_HUB_LLM=auto|cli-only|rule-based` env var. `CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS` for custom timeout
+
+### Phase 4 — Semantic Search
+
+- **Embedding model** — `@huggingface/transformers` with `all-MiniLM-L6-v2` (384-dim, 90MB cached, 9ms warm inference). Lazy-loaded: only imports when first embedding requested. Graceful degradation if package not installed
+- **Pure JS cosine similarity** — no native sqlite-vec binary needed. Fast enough for <1000 docs. Embeddings stored as BLOBs in new `embeddings` table (schema v4)
+- **Hybrid search** — `searchIndex()` now merges FTS5 BM25 + TF-IDF + semantic cosine similarity. Deduplicates by id+type, keeps highest score
+- **Auto-indexing** — session-end hook generates embedding for new summaries automatically
+- **Opt-in** — `CLAUDE_MEMORY_HUB_EMBEDDINGS=auto|disabled` env var. `@huggingface/transformers` is `optionalDependencies` — install failure doesn't break anything
+
+### New Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_MEMORY_HUB_LLM` | `auto` | Summarization mode: auto, cli-only, rule-based |
+| `CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS` | `30000` | CLI summarizer timeout in ms |
+| `CLAUDE_MEMORY_HUB_EMBEDDINGS` | `auto` | Embedding mode: auto, disabled |
+| `CLAUDE_MEMORY_HUB_SKIP_HOOKS` | — | Set to `1` to suppress hooks (internal use) |
+
+### New/Modified Files
+
+```
+NEW:
+  src/context/resource-registry.ts      — unified resource scanner
+  src/context/injection-validator.ts    — context sanitization
+  src/capture/observation-extractor.ts  — free-form observation capture
+  src/context/claude-md-tracker.ts      — CLAUDE.md scanning + tracking
+  src/summarizer/cli-summarizer.ts      — Tier 2 CLI summarization
+  src/search/embedding-model.ts         — lazy @huggingface/transformers
+  src/search/semantic-search.ts         — cosine similarity search
+
+MODIFIED:
+  src/db/schema.ts                      — migrations v3 + v4
+  src/types/index.ts                    — EntityType += observation
+  src/capture/entity-extractor.ts       — Agent/Skill + observation extraction
+  src/capture/hook-handler.ts           — registry + validator + CLAUDE.md + observations
+  src/context/smart-resource-loader.ts  — uses ResourceRegistry
+  src/context/resource-tracker.ts       — 8 resource types
+  src/mcp/tool-handlers.ts             — overhead report in context_budget
+  src/summarizer/session-summarizer.ts  — 3-tier pipeline
+  src/search/search-workflow.ts         — hybrid FTS5+TF-IDF+semantic
+  src/search/vector-search.ts           — reindex includes observations+embeddings
+  src/db/session-store.ts               — getSessionObservations()
+  src/hooks-entry/*.ts                  — SKIP_HOOKS recursion guard
+```
+
+### Dependencies
+
+```
+KEPT:     @modelcontextprotocol/sdk
+ADDED:    @huggingface/transformers (optional — semantic search)
+```
+
+---
+
 ## [0.5.2] - 2026-04-01
 
 ### Fixed
