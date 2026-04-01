@@ -158,6 +158,51 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (2, ?)", [Date.now()]);
     log.info("Migration v2 complete");
   }
+  if (currentVersion < 3) {
+    log.info("Applying migration v3: observation entity type + claude_md_registry");
+    db.transaction(() => {
+      db.run(`
+        CREATE TABLE entities_v3 (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          project       TEXT NOT NULL,
+          tool_name     TEXT NOT NULL,
+          entity_type   TEXT NOT NULL
+            CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision','observation')),
+          entity_value  TEXT NOT NULL,
+          context       TEXT,
+          importance    INTEGER NOT NULL DEFAULT 1
+            CHECK(importance BETWEEN 1 AND 5),
+          created_at    INTEGER NOT NULL,
+          prompt_number INTEGER NOT NULL DEFAULT 0,
+          discovery_tokens INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.run(`INSERT INTO entities_v3 SELECT * FROM entities`);
+      db.run(`DROP TABLE entities`);
+      db.run(`ALTER TABLE entities_v3 RENAME TO entities`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_session ON entities(session_id)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_type    ON entities(entity_type)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_value   ON entities(entity_value)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC)`);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS claude_md_registry (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          path          TEXT NOT NULL UNIQUE,
+          project       TEXT NOT NULL,
+          content_hash  TEXT NOT NULL,
+          sections_json TEXT NOT NULL DEFAULT '[]',
+          last_seen     INTEGER NOT NULL,
+          token_cost    INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_project ON claude_md_registry(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_path    ON claude_md_registry(path)`);
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
+    log.info("Migration v3 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -538,7 +583,7 @@ function reindexAll(db) {
     const text = [s.summary, s.files_touched, s.decisions].join(" ");
     indexDocument("summary", s.id, text, d);
   }
-  const entities = d.query("SELECT id, entity_value, context FROM entities WHERE entity_type IN ('decision', 'error')").all();
+  const entities = d.query("SELECT id, entity_value, context FROM entities WHERE entity_type IN ('decision', 'error', 'observation')").all();
   for (const e of entities) {
     const text = [e.entity_value, e.context || ""].join(" ");
     indexDocument("entity", e.id, text, d);

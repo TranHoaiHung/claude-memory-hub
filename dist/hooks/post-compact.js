@@ -259,6 +259,51 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (2, ?)", [Date.now()]);
     log.info("Migration v2 complete");
   }
+  if (currentVersion < 3) {
+    log.info("Applying migration v3: observation entity type + claude_md_registry");
+    db.transaction(() => {
+      db.run(`
+        CREATE TABLE entities_v3 (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          project       TEXT NOT NULL,
+          tool_name     TEXT NOT NULL,
+          entity_type   TEXT NOT NULL
+            CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision','observation')),
+          entity_value  TEXT NOT NULL,
+          context       TEXT,
+          importance    INTEGER NOT NULL DEFAULT 1
+            CHECK(importance BETWEEN 1 AND 5),
+          created_at    INTEGER NOT NULL,
+          prompt_number INTEGER NOT NULL DEFAULT 0,
+          discovery_tokens INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.run(`INSERT INTO entities_v3 SELECT * FROM entities`);
+      db.run(`DROP TABLE entities`);
+      db.run(`ALTER TABLE entities_v3 RENAME TO entities`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_session ON entities(session_id)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_project ON entities(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_type    ON entities(entity_type)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_value   ON entities(entity_value)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_entities_created ON entities(created_at DESC)`);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS claude_md_registry (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          path          TEXT NOT NULL UNIQUE,
+          project       TEXT NOT NULL,
+          content_hash  TEXT NOT NULL,
+          sections_json TEXT NOT NULL DEFAULT '[]',
+          last_seen     INTEGER NOT NULL,
+          token_cost    INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_project ON claude_md_registry(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_cmr_path    ON claude_md_registry(path)`);
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (3, ?)", [Date.now()]);
+    log.info("Migration v3 complete");
+  }
 }
 var _db = null;
 function getDatabase() {
@@ -320,6 +365,9 @@ class SessionStore {
   }
   getSessionDecisions(session_id) {
     return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'decision' ORDER BY importance DESC").all(session_id);
+  }
+  getSessionObservations(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'observation' ORDER BY importance DESC").all(session_id);
   }
   getSessionFiles(session_id) {
     return this.db.query(`SELECT DISTINCT entity_value FROM entities
@@ -453,10 +501,13 @@ class SessionSummarizer {
     const files = this.sessionStore.getSessionFiles(session_id);
     const errors = this.sessionStore.getSessionErrors(session_id);
     const decisions = this.sessionStore.getSessionDecisions(session_id);
+    const observations = this.sessionStore.getSessionObservations(session_id);
     const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
     if (files.length === 0 && errors.length === 0 && notes.length === 0)
       return;
-    const summaryText = buildRuleBasedSummary(session, files, errors, decisions, notes);
+    const obsNotes = observations.slice(0, 5).map((o) => o.entity_value);
+    const allNotes = [...notes, ...obsNotes];
+    const summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
     const ltSummary = {
       session_id,
       project,
@@ -657,6 +708,66 @@ function extractCodePatterns(content) {
   return [...new Set(patterns)];
 }
 
+// src/capture/observation-extractor.ts
+var TOOL_OUTPUT_HEURISTICS = [
+  { pattern: /\b(IMPORTANT|CRITICAL|WARNING)\b/i, importance: 4, label: "important" },
+  { pattern: /\b(decision:|decided to|NOTE:)\b/i, importance: 3, label: "decision-note" },
+  { pattern: /\b(TODO:|FIXME:)\b/i, importance: 2, label: "todo-note" },
+  { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
+];
+var PROMPT_HEURISTICS = [
+  { pattern: /\b(IMPORTANT|CRITICAL)\b/i, importance: 4, label: "user-important" },
+  { pattern: /\b(remember that|note that|I decided|we should)\b/i, importance: 3, label: "user-note" }
+];
+var MAX_VALUE_LENGTH = 300;
+var MIN_INPUT_LENGTH = 20;
+function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
+  if (!output || output.length < MIN_INPUT_LENGTH)
+    return;
+  return matchHeuristics(output, TOOL_OUTPUT_HEURISTICS, sessionId, project, toolName, promptNumber);
+}
+function extractObservationFromPrompt(prompt, sessionId, project, promptNumber) {
+  if (!prompt || prompt.length < MIN_INPUT_LENGTH)
+    return;
+  return matchHeuristics(prompt, PROMPT_HEURISTICS, sessionId, project, "UserPrompt", promptNumber);
+}
+function matchHeuristics(text, heuristics, sessionId, project, toolName, promptNumber) {
+  let bestMatch;
+  for (const h of heuristics) {
+    const m = h.pattern.exec(text);
+    if (!m)
+      continue;
+    if (bestMatch && h.importance <= bestMatch.importance)
+      continue;
+    const value = extractSurroundingText(text, m.index, m[0].length);
+    bestMatch = { importance: h.importance, value, label: h.label };
+  }
+  if (!bestMatch)
+    return;
+  return {
+    session_id: sessionId,
+    project,
+    tool_name: toolName,
+    entity_type: "observation",
+    entity_value: `[${bestMatch.label}] ${bestMatch.value}`,
+    importance: bestMatch.importance,
+    created_at: Date.now(),
+    prompt_number: promptNumber
+  };
+}
+function extractSurroundingText(text, matchIndex, matchLength) {
+  const before = 50;
+  const after = 100;
+  const start = Math.max(0, matchIndex - before);
+  const end = Math.min(text.length, matchIndex + matchLength + after);
+  let snippet = text.slice(start, end).trim();
+  snippet = snippet.replace(/\s+/g, " ");
+  if (snippet.length > MAX_VALUE_LENGTH) {
+    snippet = snippet.slice(0, MAX_VALUE_LENGTH - 3) + "...";
+  }
+  return snippet;
+}
+
 // src/capture/entity-extractor.ts
 function extractEntities(hook, promptNumber = 0) {
   const { tool_name, tool_input, tool_response, session_id } = hook;
@@ -727,11 +838,21 @@ function extractEntities(hook, promptNumber = 0) {
     default:
       break;
   }
-  return raw.map((e) => enrichEntityContext(e, hook));
+  const enriched = raw.map((e) => enrichEntityContext(e, hook));
+  const output = getResponseText2(tool_response);
+  if (output) {
+    const obs = extractObservationFromOutput(output, session_id, project, tool_name, promptNumber);
+    if (obs)
+      enriched.push(obs);
+  }
+  return enriched;
 }
 function makeEntity(session_id, project, tool_name, entity_type, entity_value, importance, created_at, prompt_number, context) {
   const base = { session_id, project, tool_name, entity_type, entity_value, importance, created_at, prompt_number };
   return context !== undefined ? { ...base, context } : base;
+}
+function getResponseText2(response) {
+  return stringField2(response, "output") ?? stringField2(response, "stdout") ?? undefined;
 }
 function stringField2(obj, key) {
   if (!obj)
@@ -1465,8 +1586,139 @@ function mapResourceTypeToKind(type) {
   return mapping[type];
 }
 
+// src/context/claude-md-tracker.ts
+import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
+import { join as join4, dirname, basename as basename2 } from "path";
+var log4 = createLogger("claude-md-tracker");
+var MAX_WALK_DEPTH = 20;
+var CHARS_PER_TOKEN2 = 3.75;
+var STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+
+class ClaudeMdTracker {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  scanAndUpdate(cwd, project) {
+    const paths = this.walkToRoot(cwd);
+    const entries = [];
+    for (const filePath of paths) {
+      try {
+        const content = readFileSync2(filePath, "utf-8");
+        const hash = this.computeHash(content);
+        const existing = this.db.query("SELECT content_hash, sections_json, token_cost FROM claude_md_registry WHERE path = ?").get(filePath);
+        if (existing && existing.content_hash === hash) {
+          this.db.run("UPDATE claude_md_registry SET last_seen = ? WHERE path = ?", [Date.now(), filePath]);
+          entries.push({
+            path: filePath,
+            project,
+            contentHash: hash,
+            sections: safeJson2(existing.sections_json, []),
+            tokenCost: existing.token_cost
+          });
+        } else {
+          const sections = this.extractSections(content);
+          const tokenCost = Math.ceil(content.length / CHARS_PER_TOKEN2);
+          const sectionsJson = JSON.stringify(sections);
+          this.db.run(`INSERT INTO claude_md_registry(path, project, content_hash, sections_json, last_seen, token_cost)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(path) DO UPDATE SET
+               project = excluded.project,
+               content_hash = excluded.content_hash,
+               sections_json = excluded.sections_json,
+               last_seen = excluded.last_seen,
+               token_cost = excluded.token_cost`, [filePath, project, hash, sectionsJson, Date.now(), tokenCost]);
+          entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
+        }
+      } catch (err) {
+        log4.error(`Failed to process ${filePath}`, { error: String(err) });
+      }
+    }
+    return entries;
+  }
+  getRegistryForProject(project) {
+    const cutoff = Date.now() - STALE_THRESHOLD_MS;
+    const rows = this.db.query("SELECT path, project, content_hash, sections_json, token_cost FROM claude_md_registry WHERE project = ? AND last_seen > ?").all(project, cutoff);
+    return rows.map((r) => ({
+      path: r.path,
+      project: r.project,
+      contentHash: r.content_hash,
+      sections: safeJson2(r.sections_json, []),
+      tokenCost: r.token_cost
+    }));
+  }
+  formatForInjection(entries) {
+    if (entries.length === 0)
+      return "";
+    const lines = ["**Active CLAUDE.md rules:**"];
+    for (const e of entries) {
+      const headings = e.sections.map((s) => s.heading).join(", ");
+      lines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok): ${headings || "no sections"}`);
+    }
+    return lines.join(`
+`);
+  }
+  computeHash(content) {
+    const hasher = new Bun.CryptoHasher("md5");
+    hasher.update(content);
+    return hasher.digest("hex");
+  }
+  extractSections(content) {
+    const sections = [];
+    const lines = content.split(`
+`);
+    let currentHeading;
+    let currentBody = [];
+    const flush = () => {
+      if (currentHeading) {
+        const body = currentBody.join(`
+`).trim().slice(0, 200);
+        sections.push({ heading: currentHeading, preview: body });
+      }
+    };
+    for (const line of lines) {
+      const m = line.match(/^## (.+)$/);
+      if (m) {
+        flush();
+        currentHeading = m[1].trim();
+        currentBody = [];
+      } else if (currentHeading) {
+        currentBody.push(line);
+      }
+    }
+    flush();
+    return sections;
+  }
+  walkToRoot(startDir) {
+    const paths = [];
+    let current = startDir;
+    let depth = 0;
+    while (depth < MAX_WALK_DEPTH) {
+      const file = join4(current, "CLAUDE.md");
+      if (existsSync4(file))
+        paths.push(file);
+      const dotClaudeFile = join4(current, ".claude", "CLAUDE.md");
+      if (existsSync4(dotClaudeFile))
+        paths.push(dotClaudeFile);
+      const parent = dirname(current);
+      if (parent === current)
+        break;
+      current = parent;
+      depth++;
+    }
+    return paths;
+  }
+}
+function safeJson2(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
 // src/capture/hook-handler.ts
-import { basename as basename2 } from "path";
+import { basename as basename3 } from "path";
 async function handlePostToolUse(hook, project) {
   const store = new SessionStore;
   store.upsertSession({
@@ -1509,6 +1761,9 @@ async function handleUserPromptSubmit(hook, project) {
     user_prompt: hook.prompt.slice(0, 500),
     status: "active"
   });
+  const promptObs = extractObservationFromPrompt(hook.prompt, hook.session_id, project, 0);
+  if (promptObs)
+    store.insertEntity({ ...promptObs, project });
   const results = ltStore.search(hook.prompt, 3);
   const registry = getResourceRegistry();
   registry.scan(hook.cwd);
@@ -1523,7 +1778,7 @@ async function handleUserPromptSubmit(hook, project) {
     lines.push("**Past session context:**");
     for (const r of results) {
       const date = new Date(r.created_at).toLocaleDateString();
-      const files = safeJson2(r.files_touched, []);
+      const files = safeJson3(r.files_touched, []);
       lines.push(`- [${date}, ${r.project}] ${r.summary.slice(0, 300)}`);
       if (files.length > 0)
         lines.push(`  Files: ${files.slice(0, 5).join(", ")}`);
@@ -1531,6 +1786,19 @@ async function handleUserPromptSubmit(hook, project) {
   }
   if (advice)
     lines.push("", advice);
+  if (hook.cwd) {
+    try {
+      const mdTracker = new ClaudeMdTracker;
+      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+      const mdSummary = mdTracker.formatForInjection(mdEntries);
+      if (mdSummary)
+        lines.push("", mdSummary);
+      const tracker = new ResourceTracker;
+      for (const entry of mdEntries) {
+        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      }
+    } catch {}
+  }
   const safeContext = validator.validate(lines.join(`
 `));
   return { additionalContext: safeContext };
@@ -1545,7 +1813,7 @@ function stringField3(obj, key) {
   const v = obj[key];
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
-function safeJson2(text, fallback) {
+function safeJson3(text, fallback) {
   try {
     return JSON.parse(text);
   } catch {
@@ -1555,7 +1823,7 @@ function safeJson2(text, fallback) {
 function projectFromCwd(cwd) {
   if (!cwd)
     return "unknown";
-  return basename2(cwd);
+  return basename3(cwd);
 }
 
 // src/hooks-entry/post-compact.ts
