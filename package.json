@@ -20,7 +20,7 @@
     "build:hooks": "bun build src/hooks-entry/post-tool-use.ts src/hooks-entry/session-end.ts src/hooks-entry/user-prompt-submit.ts src/hooks-entry/pre-compact.ts src/hooks-entry/post-compact.ts --outdir dist/hooks --target bun --entry-naming [name].js",
     "build:all": "bun run build && bun run build:cli && bun run build:hooks",
     "dev": "bun run --watch src/index.ts",
-    "prepublishOnly": "bun run build:all",
+    "prepublishOnly": "test -f dist/index.js || bun run build:all",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
