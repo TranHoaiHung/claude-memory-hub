@@ -1829,15 +1829,26 @@ class ClaudeMdTracker {
       tokenCost: r.token_cost
     }));
   }
-  formatForInjection(entries) {
+  formatForInjection(entries, maxChars) {
     if (entries.length === 0)
       return "";
-    const lines = ["**Active CLAUDE.md rules:**"];
+    const minimal = `CLAUDE.md: ${entries.map((e) => basename2(dirname(e.path)) + "/" + basename2(e.path)).join(", ")}`;
+    if (maxChars !== undefined && maxChars < 200)
+      return minimal;
+    const compactLines = ["**Active CLAUDE.md rules:**"];
+    for (const e of entries) {
+      compactLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok)`);
+    }
+    const compact = compactLines.join(`
+`);
+    if (maxChars !== undefined && maxChars < 500)
+      return compact;
+    const fullLines = ["**Active CLAUDE.md rules:**"];
     for (const e of entries) {
       const headings = e.sections.map((s) => s.heading).join(", ");
-      lines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok): ${headings || "no sections"}`);
+      fullLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok): ${headings || "no sections"}`);
     }
-    return lines.join(`
+    return fullLines.join(`
 `);
   }
   computeHash(content) {
@@ -1955,35 +1966,76 @@ async function handleUserPromptSubmit(hook, project) {
   plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
   plan.skipped = validator.filterAliveRecommendations(plan.skipped);
   const advice = loader.formatContextAdvice(plan);
-  const lines = [];
-  if (results.length > 0) {
-    lines.push("**Past session context:**");
-    for (const r of results) {
-      const date = new Date(r.created_at).toLocaleDateString();
-      const files = safeJson3(r.files_touched, []);
-      lines.push(`- [${date}, ${r.project}] ${r.summary.slice(0, 300)}`);
-      if (files.length > 0)
-        lines.push(`  Files: ${files.slice(0, 5).join(", ")}`);
-    }
-  }
-  if (advice)
-    lines.push("", advice);
+  let mdSummary = "";
   if (hook.cwd) {
     try {
       const mdTracker = new ClaudeMdTracker;
       const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      const mdSummary = mdTracker.formatForInjection(mdEntries);
-      if (mdSummary)
-        lines.push("", mdSummary);
+      mdSummary = mdTracker.formatForInjection(mdEntries);
       const tracker = new ResourceTracker;
       for (const entry of mdEntries) {
         tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
       }
     } catch {}
   }
-  const safeContext = validator.validate(lines.join(`
-`));
+  let overheadWarning = "";
+  try {
+    const overhead = await registry.getOverheadReport(project);
+    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+    if (unusedTokens > 1e4) {
+      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
+    }
+  } catch {}
+  const memorySection = buildMemorySection(results);
+  const safeContext = validator.validate(fitWithinBudget(memorySection, mdSummary, advice, overheadWarning));
   return { additionalContext: safeContext };
+}
+function fitWithinBudget(memoryText, mdText, adviceText, overheadText) {
+  const MAX_CHARS2 = 8000;
+  const sections = [
+    { text: memoryText, priority: 1, minChars: 500 },
+    { text: mdText, priority: 2, minChars: 200 },
+    { text: adviceText, priority: 3, minChars: 0 },
+    { text: overheadText, priority: 4, minChars: 0 }
+  ].filter((s) => s.text.length > 0);
+  const totalNeeded = sections.reduce((sum, s) => sum + s.text.length, 0);
+  if (totalNeeded <= MAX_CHARS2) {
+    return sections.map((s) => s.text).join(`
+
+`);
+  }
+  let remaining = MAX_CHARS2;
+  const allocated = [];
+  sections.sort((a, b) => a.priority - b.priority);
+  for (const section of sections) {
+    if (remaining <= 0)
+      break;
+    if (section.text.length <= remaining) {
+      allocated.push(section.text);
+      remaining -= section.text.length + 2;
+    } else if (remaining >= section.minChars) {
+      allocated.push(section.text.slice(0, remaining));
+      remaining = 0;
+    }
+  }
+  return allocated.join(`
+
+`);
+}
+function buildMemorySection(results) {
+  if (results.length === 0)
+    return "";
+  const lines = ["**Past session context:**"];
+  for (const r of results) {
+    const date = new Date(r.created_at).toLocaleDateString();
+    const files = safeJson3(r.files_touched, []);
+    lines.push(`- [${date}, ${r.project}] ${r.summary.slice(0, 400)}`);
+    if (files.length > 0)
+      lines.push(`  Files: ${files.slice(0, 5).join(", ")}`);
+  }
+  return lines.join(`
+`);
 }
 async function handleSessionEnd(hook, project) {
   const store = new SessionStore;

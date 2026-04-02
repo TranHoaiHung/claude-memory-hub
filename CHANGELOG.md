@@ -5,14 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [0.8.2] - 2026-04-02
+## [0.9.0] - 2026-04-02
 
-Increased context injection limits for richer cross-session memory.
+Smart context budget allocation — memory never gets pushed out by lower-priority content.
+
+### Smart Budget Allocation (breaking change in injection behavior)
+
+- **Priority-based `fitWithinBudget()`** — replaces naive sequential concatenation. Four content sections now compete for 8,000 chars with explicit priorities: P1 memory (min 500 chars) > P2 CLAUDE.md (min 200 chars) > P3 resource advice (droppable) > P4 overhead warning (droppable). When total fits, everything is kept. When over budget, lowest priority sections are shrunk or dropped first
+- **Memory context guaranteed** — past session context always gets first claim on budget. Previously could be truncated when CLAUDE.md + advice consumed too much space
+
+### CLAUDE.md Adaptive Compression
+
+- **3-level `formatForInjection()`** — CLAUDE.md summary now adapts to available budget: Level 3 (full: headings + token cost, >500 chars), Level 2 (compact: file + token cost, >200 chars), Level 1 (minimal: file names only, <200 chars). Previously always used full format regardless of remaining space
+
+### Overhead Warning Injection
+
+- **Auto-inject warning when unused resources > 10K tokens** — UserPromptSubmit hook now analyzes `OverheadReport` and injects a one-line note if unused skills/agents exceed 10,000 listing tokens. Points user to `memory_context_budget` tool for details. Zero-cost when overhead is acceptable
 
 ### Context Injection Limits
 
-- **UserPromptSubmit cap doubled** — `MAX_CHARS` increased from 4,500 (~1,125 tokens) to 8,000 (~2,000 tokens). Session-start context injection now carries significantly more past knowledge
-- **Proactive retrieval cap doubled** — `MAX_INJECTION_CHARS` increased from 1,500 (~375 tokens) to 3,000 (~750 tokens). Mid-session topic-shift injections now include fuller context from L3
+- **UserPromptSubmit cap doubled** — `MAX_CHARS` increased from 4,500 (~1,125 tokens) to 8,000 (~2,000 tokens)
+- **Proactive retrieval cap doubled** — `MAX_INJECTION_CHARS` increased from 1,500 (~375 tokens) to 3,000 (~750 tokens)
+- **Proactive summary slice increased** — per-result summary increased from 200 to 400 chars for richer mid-session context
+- **Memory result summary increased** — session-start per-result summary increased from 300 to 400 chars
 
 ---
 

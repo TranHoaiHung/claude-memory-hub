@@ -74,6 +74,8 @@ Search:        Keyword-only, no semantic ranking
 | Multi-agent memory sharing | -- | -- | **Yes (free)** |
 | Permission-aware (approved only) | -- | -- | **Yes** |
 | Data export/import (JSONL) | -- | -- | **Yes** |
+| Smart budget allocation (priority-based) | -- | -- | **Yes** |
+| Overhead warning (unused resources) | -- | -- | **Yes** |
 | Hook batching (3ms vs 75ms) | -- | -- | **Yes** |
 | Browser UI | -- | Yes | **Yes** |
 | Health monitoring + auto-cleanup | -- | -- | **Yes** |
@@ -412,6 +414,7 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | **v0.7.0** | Honest resource analysis, semantic search scaling, batch embeddings, 14 observation patterns, DB auto-cleanup, summarizer retry |
 | **v0.8.0** | 91 unit tests (was 0%), L1 read-through cache, PostToolUse batch queue (75ms→3ms), JSONL export/import, data cleanup CLI, CI/CD auto-publish |
 | **v0.8.1** | Token-budget-aware MCP tools (`max_tokens`), proactive mid-session memory retrieval (topic-shift detection), session-end batch flush |
+| **v0.9.0** | Smart budget allocation (priority-based, memory never pushed out), CLAUDE.md adaptive compression (3 levels), overhead warning auto-injection, doubled injection limits |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
