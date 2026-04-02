@@ -1954,6 +1954,24 @@ import { spawnSync } from "child_process";
 var CLAUDE_DIR = join5(homedir5(), ".claude");
 var SETTINGS_PATH = join5(CLAUDE_DIR, "settings.json");
 var PKG_DIR = resolve(dirname(import.meta.dir));
+function getBunPath() {
+  const result = spawnSync(process.platform === "win32" ? "where" : "which", ["bun"], {
+    encoding: "utf-8"
+  });
+  const resolved = result.stdout?.trim().split(`
+`)[0]?.trim();
+  if (resolved && existsSync5(resolved))
+    return resolved;
+  const candidates = [
+    join5(homedir5(), ".bun", "bin", "bun"),
+    join5(homedir5(), ".bun", "bin", "bun.exe")
+  ];
+  for (const c of candidates) {
+    if (existsSync5(c))
+      return c;
+  }
+  return "bun";
+}
 function getHookPath(hookName) {
   return join5(PKG_DIR, "dist", "hooks", `${hookName}.js`);
 }
@@ -1980,7 +1998,8 @@ function install() {
 `);
   console.log("1. Registering MCP server...");
   const mcpPath = getMcpServerPath();
-  const result = spawnSync("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", "bun", "run", mcpPath], {
+  const bunBin = getBunPath();
+  const result = spawnSync("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
     stdio: "inherit"
   });
   if (result.status !== 0) {
@@ -1988,7 +2007,7 @@ function install() {
     const settings2 = loadSettings();
     settings2.mcpServers ??= {};
     settings2.mcpServers["claude-memory-hub"] = {
-      command: "bun",
+      command: bunBin,
       args: ["run", mcpPath]
     };
     saveSettings(settings2);
@@ -2013,7 +2032,7 @@ function install() {
     if (!exists) {
       hooks[event].push({
         matcher: "",
-        hooks: [{ type: "command", command: `bun run ${scriptPath}` }]
+        hooks: [{ type: "command", command: `${bunBin} run ${scriptPath}` }]
       });
       registered++;
     }
