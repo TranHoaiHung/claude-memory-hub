@@ -590,16 +590,22 @@ function extractCodePatterns(content) {
 
 // src/capture/observation-extractor.ts
 var TOOL_OUTPUT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL|WARNING)\b/i, importance: 4, label: "important" },
-  { pattern: /\b(decision:|decided to|NOTE:)\b/i, importance: 3, label: "decision-note" },
-  { pattern: /\b(TODO:|FIXME:)\b/i, importance: 2, label: "todo-note" },
+  { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
+  { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+  { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
+  { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
+  { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+  { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
+  { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
   { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
 ];
 var PROMPT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL)\b/i, importance: 4, label: "user-important" },
-  { pattern: /\b(remember that|note that|I decided|we should)\b/i, importance: 3, label: "user-note" }
+  { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
+  { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
+  { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
+  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" }
 ];
-var MAX_VALUE_LENGTH = 300;
+var MAX_VALUE_LENGTH = 500;
 var MIN_INPUT_LENGTH = 20;
 function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
   if (!output || output.length < MIN_INPUT_LENGTH)
@@ -1170,6 +1176,8 @@ class ResourceRegistry {
       if (!existsSync3(file))
         continue;
       const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
       const name = `project:${relPath}`;
       const fileSize = this.readFileSize(file);
       this.register({
@@ -1369,17 +1377,18 @@ class SmartResourceLoader {
     };
   }
   formatContextAdvice(plan) {
-    if (plan.skipped.length === 0)
+    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
       return "";
-    const lines = [
-      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used.`
-    ];
-    if (plan.skipped.length > 0) {
-      lines.push(`${plan.skipped.length} resource(s) deferred for token efficiency:`);
-      for (const s of plan.skipped.slice(0, 5)) {
-        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tok, ${s.reason})`);
+    const lines = [];
+    if (plan.recommendations.length > 0) {
+      lines.push("**Frequently-used resources in this project:**");
+      for (const r of plan.recommendations.slice(0, 5)) {
+        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
       }
-      lines.push("Use SkillTool or ToolSearch to load these on demand if needed.");
+    }
+    if (plan.skipped.length > 0) {
+      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
+      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
     }
     return lines.join(`
 `);
@@ -1706,6 +1715,124 @@ function projectFromCwd(cwd) {
   return basename3(cwd);
 }
 
+// src/capture/batch-queue.ts
+import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync2 } from "fs";
+import { join as join5 } from "path";
+import { homedir as homedir4 } from "os";
+var log5 = createLogger("batch-queue");
+var DATA_DIR = join5(homedir4(), ".claude-memory-hub");
+var BATCH_DIR = join5(DATA_DIR, "batch");
+var QUEUE_PATH = join5(BATCH_DIR, "queue.jsonl");
+var LOCK_PATH = join5(BATCH_DIR, "queue.lock");
+var MAX_QUEUE_SIZE = 100 * 1024;
+var LOCK_STALE_MS = 30000;
+function enqueueEvent(event) {
+  try {
+    ensureBatchDir();
+    const line = JSON.stringify(event) + `
+`;
+    appendFileSync2(QUEUE_PATH, line, "utf-8");
+  } catch (err) {
+    log5.error("enqueue failed", { error: String(err) });
+    throw err;
+  }
+}
+function tryFlush() {
+  try {
+    if (!existsSync5(QUEUE_PATH))
+      return false;
+    const stat = statSync2(QUEUE_PATH);
+    if (stat.size === 0)
+      return false;
+    if (!tryAcquireLock())
+      return false;
+    try {
+      flushQueue();
+      return true;
+    } finally {
+      releaseLock();
+    }
+  } catch (err) {
+    log5.error("flush failed", { error: String(err) });
+    return false;
+  }
+}
+function flushQueue() {
+  const content = readFileSync3(QUEUE_PATH, "utf-8").trim();
+  if (!content)
+    return;
+  const events = [];
+  for (const line of content.split(`
+`)) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      log5.warn("skipping malformed queue line");
+    }
+  }
+  if (events.length === 0)
+    return;
+  const store = new SessionStore;
+  const tracker = new ResourceTracker;
+  const registry = getResourceRegistry();
+  const db = store["db"];
+  db.transaction(() => {
+    for (const event of events) {
+      store.upsertSession({
+        id: event.session.id,
+        project: event.session.project,
+        started_at: event.session.started_at,
+        status: "active"
+      });
+      for (const entity of event.entities) {
+        store.insertEntity({ ...entity, project: event.session.project });
+      }
+      if (event.resources) {
+        for (const r of event.resources) {
+          const resource = registry.resolve(r.type, r.name);
+          tracker.trackUsage(event.session.id, event.session.project, r.type, r.name, r.tokenCost ?? resource?.full_tokens ?? 0);
+        }
+      }
+    }
+  })();
+  writeFileSync(QUEUE_PATH, "", "utf-8");
+  log5.info("batch flushed", { events: events.length });
+}
+function tryAcquireLock() {
+  try {
+    if (existsSync5(LOCK_PATH)) {
+      const lockContent = readFileSync3(LOCK_PATH, "utf-8").trim();
+      const [pidStr, timestampStr] = lockContent.split(":");
+      const lockTime = Number(timestampStr);
+      if (Date.now() - lockTime < LOCK_STALE_MS) {
+        const pid = Number(pidStr);
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch {}
+      }
+    }
+    writeFileSync(LOCK_PATH, `${process.pid}:${Date.now()}`, "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+function releaseLock() {
+  try {
+    unlinkSync(LOCK_PATH);
+  } catch {}
+}
+function ensureBatchDir() {
+  if (!existsSync5(BATCH_DIR)) {
+    mkdirSync3(BATCH_DIR, { recursive: true, mode: 448 });
+  }
+}
+function isBatchEnabled() {
+  const mode = process.env["CLAUDE_MEMORY_HUB_BATCH"] ?? "auto";
+  return mode !== "disabled";
+}
+
 // src/hooks-entry/post-tool-use.ts
 async function main() {
   if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
@@ -1719,6 +1846,34 @@ async function main() {
   } catch {
     return;
   }
-  await handlePostToolUse(hook, projectFromCwd(process.env["CLAUDE_CWD"] ?? process.cwd()));
+  const project = projectFromCwd(process.env["CLAUDE_CWD"] ?? process.cwd());
+  if (isBatchEnabled()) {
+    try {
+      const entities = extractEntities(hook);
+      const resources = [];
+      if (hook.tool_name === "Skill") {
+        const skill = typeof hook.tool_input?.skill === "string" ? hook.tool_input.skill : undefined;
+        if (skill)
+          resources.push({ type: "skill", name: skill });
+      }
+      if (hook.tool_name === "Agent") {
+        const agent = typeof hook.tool_input?.subagent_type === "string" ? hook.tool_input.subagent_type : undefined;
+        if (agent)
+          resources.push({ type: "agent", name: agent });
+      }
+      if (hook.tool_name.startsWith("mcp__")) {
+        resources.push({ type: "mcp_tool", name: hook.tool_name });
+      }
+      enqueueEvent({
+        session: { id: hook.session_id, project, started_at: Date.now() },
+        entities,
+        resources: resources.length > 0 ? resources : undefined,
+        timestamp: Date.now()
+      });
+      tryFlush();
+      return;
+    } catch {}
+  }
+  await handlePostToolUse(hook, project);
 }
 main().catch(() => {}).finally(() => process.exit(0));

@@ -5,6 +5,132 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.8.0] - 2026-04-02
+
+Major release: test infrastructure, architectural fixes, hook performance, data portability.
+
+### Phase 1 — Unit Tests (0% → 91 tests)
+
+- **bun:test infrastructure** — 10 test files, 91 tests, 161 assertions, 225ms runtime
+- **In-memory SQLite** — all tests use `:memory:` databases for isolation, zero filesystem side effects
+- **Test coverage modules:** schema, session-store, long-term-store, entity-extractor, observation-extractor, vector-search, working-memory, injection-validator, compact-interceptor, health-monitor
+- **Test helpers** — `createTestDb()`, `seedSession()`, `seedEntity()`, `seedSummary()`, `mockPostToolUseHook()` in `tests/setup.ts`
+
+### Phase 4 — L1 WorkingMemory Redesign
+
+- **Read-through cache** — `WorkingMemory` rewritten from dead in-process Map to read-through cache over `SessionStore`. First call loads entities from SQLite, subsequent calls serve from cache (<1ms)
+- **Previous behavior:** `workingMemory.summarize()` always returned `""` because hook scripts (short-lived) wrote to L2 directly, MCP server never populated L1
+- **New behavior:** MCP server's `memory_session_notes` tool returns real data via L1 cache
+- **API changes:** removed `add()` method (no callers), added `refresh()` and `invalidate()`. Constructor accepts `SessionStore` for DI
+- **Cache TTL:** 5 minutes, invalidated on session end
+
+### Phase 5 — Hook Performance (Batch Queue)
+
+- **Batch queue** — `src/capture/batch-queue.ts` implements write-through batching for PostToolUse. Events appended to `~/.claude-memory-hub/batch/queue.jsonl` (~3ms) instead of direct DB write (~75ms)
+- **Opportunistic flush** — each hook invocation tries to flush batch to DB if lock available
+- **File-based lock** — PID-based with 30s staleness check, prevents dead lock accumulation
+- **Fallback** — if batch dir unavailable or enqueue fails, falls back to direct write
+- **Env var:** `CLAUDE_MEMORY_HUB_BATCH=auto|enabled|disabled`
+
+### Phase 6 — Export/Import CLI
+
+- **`bunx claude-memory-hub export`** — JSONL streaming export to stdout. Options: `--since TIMESTAMP`, `--table TABLE`
+- **`bunx claude-memory-hub import`** — JSONL import from stdin with UPSERT semantics. Option: `--dry-run`
+- **`bunx claude-memory-hub cleanup`** — remove old data beyond retention period. Option: `--days N` (default 90)
+- **BLOB handling** — embedding vectors encoded as `{"$base64": true, "encoded": "..."}` for JSON portability
+- **Schema version header** — first JSONL line declares `__schema_version` for compatibility validation
+- **Idempotent import** — sessions (ON CONFLICT id), summaries (ON CONFLICT session_id), embeddings (ON CONFLICT doc_type+doc_id)
+
+### Bug Fixes
+
+- **Observation regex trailing `\b`** — patterns ending with `:` (decision:, TODO:, performance:) had trailing `\b` that failed to match because `:` followed by space = no word boundary. Removed trailing `\b` from colon-ending patterns
+
+### New/Modified Files
+
+```
+NEW:
+  tests/setup.ts                       — test infrastructure
+  tests/unit/*.test.ts                 — 10 test files (91 tests)
+  src/capture/batch-queue.ts           — write-through batch queue
+  src/export/exporter.ts               — JSONL streaming export
+  src/export/importer.ts               — JSONL streaming import
+
+MODIFIED:
+  src/memory/working-memory.ts         — read-through cache over SessionStore
+  src/hooks-entry/post-tool-use.ts     — batch queue fast path
+  src/capture/observation-extractor.ts — regex trailing \b fix
+  src/cli/main.ts                      — export, import, cleanup commands
+  package.json                         — test scripts, version 0.8.0
+```
+
+### New CLI Commands
+
+```bash
+bunx claude-memory-hub export [--since T] [--table T]  # JSONL export to stdout
+bunx claude-memory-hub import [--dry-run]               # JSONL import from stdin
+bunx claude-memory-hub cleanup [--days N]               # Remove old data
+```
+
+### New Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_MEMORY_HUB_BATCH` | `auto` | Batch mode: auto, enabled, disabled |
+
+---
+
+## [0.7.0] - 2026-04-01
+
+Hardening release: honest resource analysis, search scaling, improved observation capture, DB auto-cleanup, summarizer reliability.
+
+### Correctness & Honesty
+
+- **Smart Resource Loader rewritten** — v0.4-v0.6 claimed "~24K tokens saved per session" but Claude Code has NO external API to filter resource loading (confirmed by reading Claude Code source). `formatContextAdvice()` now provides **honest, actionable advice**: shows frequently-used resources and overhead awareness instead of misleading "deferred for token efficiency" language
+- **Project CLAUDE.md name validation** — `scanClaudeMd()` now validates relative paths against `SAFE_COMMAND_NAME_RE` before registering, preventing invalid resource names in registry
+
+### Semantic Search Scaling
+
+- **Pre-filter by doc_type** — `semanticSearch()` accepts `docType` option to filter at SQL level, reducing memory usage for targeted queries
+- **Max candidates cap** — new `maxCandidates` option (default 2000) with `ORDER BY created_at DESC` prevents OOM on large datasets (>5000 embeddings)
+- **Configurable threshold** — similarity threshold now configurable via `SemanticSearchOptions` (default 0.2), was hard-coded
+- **Batch embedding reindex** — `reindexAllEmbeddings()` uses `embedBatch()` with chunk size 16 instead of processing 1-by-1. Tries batch API first, falls back to sequential
+
+### Embedding Model
+
+- **True batch processing** — `embedBatch()` processes in configurable chunks (default 8), attempts native `@huggingface/transformers` batch call first, falls back to individual if unsupported
+
+### Observation Extraction
+
+- **8 new patterns** — expanded from 6 to 14 heuristics:
+  - Tool output: DEPRECATED, SECURITY, VULNERABILITY (importance 4), "discovered", "root cause", "switched to" (3), HACK, WORKAROUND, "bottleneck", "OOM" (2)
+  - User prompts: "MUST" (4), "don't", "never", "avoid" (3), "prefer", "always use", "convention is" (2)
+- **Increased value capture** — max observation length 300 → 500 characters for richer context
+
+### Health Monitoring & Auto-Cleanup
+
+- **Embeddings size check** — new `checkEmbeddingsSize()` health check, warns when >5000 embeddings
+- **Disk check includes WAL** — total disk size now sums `memory.db` + `-wal` + `-shm` files. Tiered thresholds: 200MB warn, 500MB error
+- **`cleanupOldData()`** — transaction-safe cleanup with configurable retention (default 90 days). Deletes: sessions, entities, notes, summaries, embeddings, resource_usage, old health checks. Runs WAL checkpoint after large deletions
+
+### LLM Summarizer Reliability
+
+- **Retry logic** — `tryCliSummary()` now retries once (2 attempts total) with 1s pause between attempts before falling back to rule-based
+- **CLI availability TTL** — `isClaudeCliAvailable()` cache expires after 5 minutes when `false`, allowing recovery if `claude` CLI becomes available mid-session (was cached forever)
+
+### Modified Files
+
+```
+src/context/smart-resource-loader.ts  — honest advice, no misleading claims
+src/context/resource-registry.ts      — CLAUDE.md name validation
+src/search/semantic-search.ts         — pre-filter, maxCandidates, batch reindex
+src/search/embedding-model.ts         — true batch processing with chunking
+src/capture/observation-extractor.ts  — 8 new patterns, 500-char cap
+src/health/monitor.ts                 — embeddings check, WAL disk, auto-cleanup
+src/summarizer/cli-summarizer.ts      — retry logic, CLI TTL recovery
+```
+
+---
+
 ## [0.6.0] - 2026-04-01
 
 Major release: semantic search, resource intelligence, observation capture, CLAUDE.md tracking, LLM summarization.
@@ -191,10 +317,11 @@ Every Claude Code session loads ALL skills, agents, rules, and memory files into
 
 ### Impact
 ```
-BEFORE: 23-51K tokens overhead (all resources loaded)
-AFTER:  Only frequently-used resources recommended
-        Rare resources loaded on demand via SkillTool
-        ~10-30K tokens saved per session on heavy setups
+Tracks resource usage across sessions
+Identifies unused skills/agents with token cost estimates
+Provides recommendations for manual cleanup
+NOTE: Claude Code loads ALL resources regardless — this is
+      an analysis tool, not a filter. See v0.7.0 for details.
 ```
 
 ### Files

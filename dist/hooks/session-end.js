@@ -590,16 +590,22 @@ function extractCodePatterns(content) {
 
 // src/capture/observation-extractor.ts
 var TOOL_OUTPUT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL|WARNING)\b/i, importance: 4, label: "important" },
-  { pattern: /\b(decision:|decided to|NOTE:)\b/i, importance: 3, label: "decision-note" },
-  { pattern: /\b(TODO:|FIXME:)\b/i, importance: 2, label: "todo-note" },
+  { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
+  { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+  { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
+  { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
+  { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+  { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
+  { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
   { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
 ];
 var PROMPT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL)\b/i, importance: 4, label: "user-important" },
-  { pattern: /\b(remember that|note that|I decided|we should)\b/i, importance: 3, label: "user-note" }
+  { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
+  { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
+  { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
+  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" }
 ];
-var MAX_VALUE_LENGTH = 300;
+var MAX_VALUE_LENGTH = 500;
 var MIN_INPUT_LENGTH = 20;
 function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
   if (!output || output.length < MIN_INPUT_LENGTH)
@@ -1170,6 +1176,8 @@ class ResourceRegistry {
       if (!existsSync3(file))
         continue;
       const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
       const name = `project:${relPath}`;
       const fileSize = this.readFileSize(file);
       this.register({
@@ -1369,17 +1377,18 @@ class SmartResourceLoader {
     };
   }
   formatContextAdvice(plan) {
-    if (plan.skipped.length === 0)
+    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
       return "";
-    const lines = [
-      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used.`
-    ];
-    if (plan.skipped.length > 0) {
-      lines.push(`${plan.skipped.length} resource(s) deferred for token efficiency:`);
-      for (const s of plan.skipped.slice(0, 5)) {
-        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tok, ${s.reason})`);
+    const lines = [];
+    if (plan.recommendations.length > 0) {
+      lines.push("**Frequently-used resources in this project:**");
+      for (const r of plan.recommendations.slice(0, 5)) {
+        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
       }
-      lines.push("Use SkillTool or ToolSearch to load these on demand if needed.");
+    }
+    if (plan.skipped.length > 0) {
+      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
+      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
     }
     return lines.join(`
 `);
@@ -1740,7 +1749,12 @@ var MAX_PROMPT_CHARS = 4000;
 var MAX_OUTPUT_CHARS = 1000;
 var DEFAULT_TIMEOUT_MS = 30000;
 var _cliAvailable;
+var _cliCheckedAt = 0;
+var CLI_CHECK_TTL_MS = 5 * 60 * 1000;
 function isClaudeCliAvailable() {
+  if (_cliAvailable === false && Date.now() - _cliCheckedAt > CLI_CHECK_TTL_MS) {
+    _cliAvailable = undefined;
+  }
   if (_cliAvailable !== undefined)
     return _cliAvailable;
   try {
@@ -1749,6 +1763,7 @@ function isClaudeCliAvailable() {
   } catch {
     _cliAvailable = false;
   }
+  _cliCheckedAt = Date.now();
   return _cliAvailable;
 }
 function buildCliPrompt(ctx) {
@@ -1780,6 +1795,7 @@ function buildCliPrompt(ctx) {
   }
   return prompt;
 }
+var MAX_RETRIES = 2;
 async function tryCliSummary(ctx, timeoutMs) {
   const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
   const timeout = timeoutMs ?? envTimeout;
@@ -1788,6 +1804,17 @@ async function tryCliSummary(ctx, timeoutMs) {
     return;
   }
   const prompt = buildCliPrompt(ctx);
+  for (let attempt = 1;attempt <= MAX_RETRIES; attempt++) {
+    const result = await attemptCliCall(prompt, timeout, attempt);
+    if (result)
+      return result;
+    if (attempt < MAX_RETRIES)
+      await new Promise((r) => setTimeout(r, 1000));
+  }
+  log5.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
+  return;
+}
+async function attemptCliCall(prompt, timeout, attempt) {
   try {
     const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
       stdout: "pipe",
@@ -1810,12 +1837,12 @@ async function tryCliSummary(ctx, timeoutMs) {
       const output = await new Response(proc.stdout).text();
       const exitCode = await proc.exited;
       if (exitCode !== 0) {
-        log5.warn("claude CLI exited with non-zero", { exitCode });
+        log5.warn("claude CLI exited with non-zero", { exitCode, attempt });
         return;
       }
       const text = output.trim();
       if (!text || text.length < 10) {
-        log5.warn("claude CLI returned empty or too short output");
+        log5.warn("claude CLI returned empty or too short output", { attempt });
         return;
       }
       const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
@@ -1823,13 +1850,13 @@ async function tryCliSummary(ctx, timeoutMs) {
     })();
     const result = await Promise.race([outputPromise, timeoutPromise]);
     if (result) {
-      log5.info("Tier 2 CLI summary generated", { length: result.length });
+      log5.info("Tier 2 CLI summary generated", { length: result.length, attempt });
     } else {
-      log5.warn("Tier 2 CLI summary failed or timed out");
+      log5.warn("Tier 2 CLI attempt failed or timed out", { attempt });
     }
     return result;
   } catch (err) {
-    log5.error("Tier 2 CLI summary error", { error: String(err) });
+    log5.error("Tier 2 CLI attempt error", { error: String(err), attempt });
     return;
   }
 }
@@ -1918,19 +1945,30 @@ class EmbeddingModel {
       return null;
     }
   }
-  async embedBatch(texts) {
+  async embedBatch(texts, chunkSize = 8) {
     if (!this.available || texts.length === 0)
       return texts.map(() => null);
     await this.ensureLoaded();
     if (!this.pipeline)
       return texts.map(() => null);
     const results = [];
-    for (const text of texts) {
+    for (let i = 0;i < texts.length; i += chunkSize) {
+      const chunk = texts.slice(i, i + chunkSize);
       try {
-        const result = await this.pipeline(text, { pooling: "mean", normalize: true });
-        results.push(new Float32Array(result.data));
+        const result = await this.pipeline(chunk, { pooling: "mean", normalize: true });
+        for (let j = 0;j < chunk.length; j++) {
+          const offset = j * 384;
+          results.push(new Float32Array(result.data.slice(offset, offset + 384)));
+        }
       } catch {
-        results.push(null);
+        for (const text of chunk) {
+          try {
+            const r = await this.pipeline(text, { pooling: "mean", normalize: true });
+            results.push(new Float32Array(r.data));
+          } catch {
+            results.push(null);
+          }
+        }
       }
     }
     return results;

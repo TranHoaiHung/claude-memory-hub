@@ -1,15 +1,49 @@
 name: Publish to npm
 
+# Trigger: push to main with version change in package.json
+# This replaces manual GitHub Release creation
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - 'package.json'
 
 jobs:
-  publish:
-    name: Publish to npm
+  check-version:
+    name: Check Version Change
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.current }}
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect version change
+        id: version
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          # Compare with previous commit
+          PREVIOUS=$(git show HEAD~1:package.json 2>/dev/null | node -p "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).version" 2>/dev/null || echo "")
+
+          if [ "$CURRENT" != "$PREVIOUS" ] && [ -n "$PREVIOUS" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Version changed: $PREVIOUS → $CURRENT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version unchanged: $CURRENT"
+          fi
+
+  publish:
+    name: Publish v${{ needs.check-version.outputs.version }}
+    runs-on: ubuntu-latest
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -23,10 +57,44 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      # Verify build artifacts exist (dist/ is committed to public repo)
       - name: Verify dist exists
-        run: test -f dist/index.js && test -f dist/cli.js && echo "Build verified"
+        run: |
+          test -f dist/index.js        || (echo "FAIL: dist/index.js missing" && exit 1)
+          test -f dist/cli.js          || (echo "FAIL: dist/cli.js missing" && exit 1)
+          test -f dist/hooks/post-tool-use.js || (echo "FAIL: hooks missing" && exit 1)
+          echo "All dist files verified."
 
-      - name: Publish
+      # Run tests if test files exist (they're in src/ which is gitignored in public repo)
+      - name: Run tests (if available)
+        run: |
+          if [ -d "tests" ]; then
+            bun install --frozen-lockfile
+            bun test
+          else
+            echo "No tests directory (public repo). Skipping."
+          fi
+
+      # Publish to npm with provenance
+      - name: Publish to npm
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Create GitHub Release automatically
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          # Extract changelog for this version
+          CHANGELOG=$(awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md)
+
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="Release v${VERSION}. See [CHANGELOG.md](CHANGELOG.md) for details."
+          fi
+
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes "$CHANGELOG" \
+            --latest

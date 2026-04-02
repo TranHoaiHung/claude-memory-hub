@@ -590,16 +590,22 @@ function extractCodePatterns(content) {
 
 // src/capture/observation-extractor.ts
 var TOOL_OUTPUT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL|WARNING)\b/i, importance: 4, label: "important" },
-  { pattern: /\b(decision:|decided to|NOTE:)\b/i, importance: 3, label: "decision-note" },
-  { pattern: /\b(TODO:|FIXME:)\b/i, importance: 2, label: "todo-note" },
+  { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
+  { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+  { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
+  { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
+  { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+  { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
+  { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
   { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
 ];
 var PROMPT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL)\b/i, importance: 4, label: "user-important" },
-  { pattern: /\b(remember that|note that|I decided|we should)\b/i, importance: 3, label: "user-note" }
+  { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
+  { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
+  { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
+  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" }
 ];
-var MAX_VALUE_LENGTH = 300;
+var MAX_VALUE_LENGTH = 500;
 var MIN_INPUT_LENGTH = 20;
 function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
   if (!output || output.length < MIN_INPUT_LENGTH)
@@ -1170,6 +1176,8 @@ class ResourceRegistry {
       if (!existsSync3(file))
         continue;
       const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
       const name = `project:${relPath}`;
       const fileSize = this.readFileSize(file);
       this.register({
@@ -1369,17 +1377,18 @@ class SmartResourceLoader {
     };
   }
   formatContextAdvice(plan) {
-    if (plan.skipped.length === 0)
+    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
       return "";
-    const lines = [
-      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used.`
-    ];
-    if (plan.skipped.length > 0) {
-      lines.push(`${plan.skipped.length} resource(s) deferred for token efficiency:`);
-      for (const s of plan.skipped.slice(0, 5)) {
-        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tok, ${s.reason})`);
+    const lines = [];
+    if (plan.recommendations.length > 0) {
+      lines.push("**Frequently-used resources in this project:**");
+      for (const r of plan.recommendations.slice(0, 5)) {
+        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
       }
-      lines.push("Use SkillTool or ToolSearch to load these on demand if needed.");
+    }
+    if (plan.skipped.length > 0) {
+      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
+      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
     }
     return lines.join(`
 `);

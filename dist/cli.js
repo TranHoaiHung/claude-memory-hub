@@ -380,7 +380,8 @@ var init_schema = __esm(() => {
 var exports_monitor = {};
 __export(exports_monitor, {
   runHealthCheck: () => runHealthCheck,
-  formatHealthReport: () => formatHealthReport
+  formatHealthReport: () => formatHealthReport,
+  cleanupOldData: () => cleanupOldData
 });
 import { existsSync as existsSync4, statSync } from "fs";
 import { homedir as homedir4 } from "os";
@@ -425,18 +426,27 @@ function checkFTS5(db) {
 }
 function checkDiskSpace() {
   const start = performance.now();
-  const dbPath = join4(homedir4(), ".claude-memory-hub", "memory.db");
+  const dbDir = join4(homedir4(), ".claude-memory-hub");
+  const dbPath = join4(dbDir, "memory.db");
   try {
     if (!existsSync4(dbPath)) {
       return { component: "disk", status: "ok", message: "DB not yet created", latency_ms: 0 };
     }
-    const stats = statSync(dbPath);
-    const sizeMB = stats.size / (1024 * 1024);
-    const status = sizeMB > 500 ? "degraded" : "ok";
+    const dbSize = statSync(dbPath).size;
+    let totalSize = dbSize;
+    const walPath = dbPath + "-wal";
+    const shmPath = dbPath + "-shm";
+    if (existsSync4(walPath))
+      totalSize += statSync(walPath).size;
+    if (existsSync4(shmPath))
+      totalSize += statSync(shmPath).size;
+    const sizeMB = totalSize / (1024 * 1024);
+    const status = sizeMB > 500 ? "error" : sizeMB > 200 ? "degraded" : "ok";
+    const warning = status !== "ok" ? ` \u2014 consider running cleanup` : "";
     return {
       component: "disk",
       status,
-      message: `DB size: ${sizeMB.toFixed(1)}MB`,
+      message: `DB total: ${sizeMB.toFixed(1)}MB (db=${(dbSize / 1024 / 1024).toFixed(1)}MB)${warning}`,
       latency_ms: Math.round(performance.now() - start)
     };
   } catch (e) {
@@ -444,6 +454,28 @@ function checkDiskSpace() {
       component: "disk",
       status: "error",
       message: `Disk check failed: ${e}`,
+      latency_ms: Math.round(performance.now() - start)
+    };
+  }
+}
+function checkEmbeddingsSize(db) {
+  const start = performance.now();
+  try {
+    const row = db.query("SELECT COUNT(*) as c, COALESCE(SUM(LENGTH(vector)), 0) as total_bytes FROM embeddings").get();
+    const count = row?.c ?? 0;
+    const sizeMB = (row?.total_bytes ?? 0) / (1024 * 1024);
+    const status = count > 5000 ? "degraded" : "ok";
+    return {
+      component: "embeddings",
+      status,
+      message: `${count} embeddings (~${sizeMB.toFixed(1)}MB)${status === "degraded" ? " \u2014 consider pruning old entries" : ""}`,
+      latency_ms: Math.round(performance.now() - start)
+    };
+  } catch (e) {
+    return {
+      component: "embeddings",
+      status: "error",
+      message: `Embeddings check failed: ${e}`,
       latency_ms: Math.round(performance.now() - start)
     };
   }
@@ -483,6 +515,7 @@ function runHealthCheck(db) {
     checkDatabase(d),
     checkFTS5(d),
     checkDiskSpace(),
+    checkEmbeddingsSize(d),
     checkDataIntegrity(d)
   ];
   let overall = "ok";
@@ -521,6 +554,54 @@ function formatHealthReport(report) {
   return lines.join(`
 `);
 }
+function cleanupOldData(db, retentionDays = 90) {
+  const d = db ?? getDatabase();
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  const result = {
+    sessions_deleted: 0,
+    entities_deleted: 0,
+    embeddings_deleted: 0,
+    health_checks_deleted: 0,
+    resource_usage_deleted: 0
+  };
+  try {
+    d.transaction(() => {
+      const oldSessions = d.query("SELECT id FROM sessions WHERE status = 'completed' AND started_at < ?").all(cutoff);
+      if (oldSessions.length === 0)
+        return;
+      const sessionIds = oldSessions.map((s) => s.id);
+      const placeholders = sessionIds.map(() => "?").join(",");
+      const entRes = d.run(`DELETE FROM entities WHERE session_id IN (${placeholders})`, sessionIds);
+      result.entities_deleted = entRes.changes;
+      d.run(`DELETE FROM session_notes WHERE session_id IN (${placeholders})`, sessionIds);
+      const oldSummaryIds = d.query("SELECT id FROM long_term_summaries WHERE created_at < ?").all(cutoff);
+      if (oldSummaryIds.length > 0) {
+        const summaryPlaceholders = oldSummaryIds.map(() => "?").join(",");
+        const summaryIds = oldSummaryIds.map((s) => s.id);
+        const embRes = d.run(`DELETE FROM embeddings WHERE doc_type = 'summary' AND doc_id IN (${summaryPlaceholders})`, summaryIds);
+        result.embeddings_deleted = embRes.changes;
+        d.run("DELETE FROM long_term_summaries WHERE created_at < ?", [cutoff]);
+      }
+      const ruRes = d.run(`DELETE FROM resource_usage WHERE session_id IN (${placeholders})`, sessionIds);
+      result.resource_usage_deleted = ruRes.changes;
+      const sesRes = d.run(`DELETE FROM sessions WHERE id IN (${placeholders})`, sessionIds);
+      result.sessions_deleted = sesRes.changes;
+      const hcRes = d.run(`DELETE FROM health_checks WHERE id NOT IN (
+          SELECT id FROM health_checks ORDER BY checked_at DESC LIMIT 200
+        )`);
+      result.health_checks_deleted = hcRes.changes;
+    })();
+    if (result.sessions_deleted > 10) {
+      try {
+        d.run("PRAGMA wal_checkpoint(TRUNCATE)");
+      } catch {}
+    }
+    log2.info("Cleanup complete", { ...result });
+  } catch (e) {
+    log2.error("Cleanup failed", { error: String(e) });
+  }
+  return result;
+}
 var log2;
 var init_monitor = __esm(() => {
   init_schema();
@@ -547,19 +628,30 @@ class EmbeddingModel {
       return null;
     }
   }
-  async embedBatch(texts) {
+  async embedBatch(texts, chunkSize = 8) {
     if (!this.available || texts.length === 0)
       return texts.map(() => null);
     await this.ensureLoaded();
     if (!this.pipeline)
       return texts.map(() => null);
     const results = [];
-    for (const text of texts) {
+    for (let i = 0;i < texts.length; i += chunkSize) {
+      const chunk = texts.slice(i, i + chunkSize);
       try {
-        const result = await this.pipeline(text, { pooling: "mean", normalize: true });
-        results.push(new Float32Array(result.data));
+        const result = await this.pipeline(chunk, { pooling: "mean", normalize: true });
+        for (let j = 0;j < chunk.length; j++) {
+          const offset = j * 384;
+          results.push(new Float32Array(result.data.slice(offset, offset + 384)));
+        }
       } catch {
-        results.push(null);
+        for (const text of chunk) {
+          try {
+            const r = await this.pipeline(text, { pooling: "mean", normalize: true });
+            results.push(new Float32Array(r.data));
+          } catch {
+            results.push(null);
+          }
+        }
       }
     }
     return results;
@@ -621,19 +713,28 @@ async function indexEmbedding(docType, docId, text, db) {
        vector = excluded.vector,
        created_at = excluded.created_at`, [docType, docId, blob, Date.now()]);
 }
-async function semanticSearch(query, limit = 10, db) {
+async function semanticSearch(query, limitOrOpts = 10, db) {
+  const opts = typeof limitOrOpts === "number" ? { limit: limitOrOpts } : limitOrOpts;
+  const limit = opts.limit ?? 10;
+  const threshold = opts.threshold ?? 0.2;
+  const maxCandidates = opts.maxCandidates ?? 2000;
   const queryVec = await embeddingModel.embed(query);
   if (!queryVec)
     return [];
   const d = db ?? getDatabase();
-  const rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings").all();
+  let rows;
+  if (opts.docType) {
+    rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings WHERE doc_type = ? ORDER BY created_at DESC LIMIT ?").all(opts.docType, maxCandidates);
+  } else {
+    rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings ORDER BY created_at DESC LIMIT ?").all(maxCandidates);
+  }
   if (rows.length === 0)
     return [];
   const scored = [];
   for (const row of rows) {
     const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
     const score = cosineSimilarity(queryVec, docVec);
-    if (score > 0.2) {
+    if (score > threshold) {
       scored.push({ doc_type: row.doc_type, doc_id: row.doc_id, score });
     }
   }
@@ -646,19 +747,33 @@ async function reindexAllEmbeddings(db) {
   const d = db ?? getDatabase();
   log4.info("Starting embedding reindex...");
   const summaries = d.query("SELECT id, summary, files_touched, decisions FROM long_term_summaries").all();
+  const BATCH_SIZE = 16;
+  const summaryTexts = summaries.map((s) => [s.summary, s.files_touched, s.decisions].join(" "));
+  const summaryVectors = await embeddingModel.embedBatch(summaryTexts, BATCH_SIZE);
   let indexed = 0;
-  for (const s of summaries) {
-    const text = [s.summary, s.files_touched, s.decisions].join(" ");
-    await indexEmbedding("summary", s.id, text, d);
+  for (let i = 0;i < summaries.length; i++) {
+    const vector = summaryVectors[i];
+    if (!vector)
+      continue;
+    const blob = Buffer.from(vector.buffer);
+    d.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+       VALUES ('summary', ?, 'all-MiniLM-L6-v2', ?, ?)
+       ON CONFLICT(doc_type, doc_id) DO UPDATE SET vector = excluded.vector, created_at = excluded.created_at`, [summaries[i].id, blob, Date.now()]);
     indexed++;
     if (indexed % 50 === 0)
       log4.info("Embedding reindex progress", { indexed, total: summaries.length });
   }
   const entities = d.query("SELECT id, entity_value, context FROM entities WHERE entity_type IN ('decision', 'error', 'observation')").all();
-  for (const e of entities) {
-    const text = [e.entity_value, e.context || ""].join(" ");
-    await indexEmbedding("entity", e.id, text, d);
-    indexed++;
+  const entityTexts = entities.map((e) => [e.entity_value, e.context || ""].join(" "));
+  const entityVectors = await embeddingModel.embedBatch(entityTexts, BATCH_SIZE);
+  for (let i = 0;i < entities.length; i++) {
+    const vector = entityVectors[i];
+    if (!vector)
+      continue;
+    const blob = Buffer.from(vector.buffer);
+    d.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+       VALUES ('entity', ?, 'all-MiniLM-L6-v2', ?, ?)
+       ON CONFLICT(doc_type, doc_id) DO UPDATE SET vector = excluded.vector, created_at = excluded.created_at`, [entities[i].id, blob, Date.now()]);
   }
   log4.info("Embedding reindex complete", { summaries: summaries.length, entities: entities.length });
 }
@@ -1334,6 +1449,212 @@ var init_viewer = __esm(() => {
   log7 = createLogger("viewer");
 });
 
+// src/export/exporter.ts
+var exports_exporter = {};
+__export(exports_exporter, {
+  exportData: () => exportData
+});
+function exportData(options = {}, db) {
+  const d = db ?? getDatabase();
+  const since = options.since ?? 0;
+  const tables = options.table ? [options.table] : [...EXPORT_TABLES];
+  console.log(JSON.stringify({
+    __schema_version: SCHEMA_VERSION,
+    __exported_at: Date.now(),
+    __tables: tables
+  }));
+  let totalRows = 0;
+  for (const table of tables) {
+    const timeCol = getTimeColumn(table);
+    let sql;
+    let params;
+    if (since > 0 && timeCol) {
+      sql = `SELECT * FROM "${table}" WHERE "${timeCol}" > ? ORDER BY "${timeCol}"`;
+      params = [since];
+    } else {
+      sql = `SELECT * FROM "${table}"`;
+      params = [];
+    }
+    try {
+      const stmt = d.prepare(sql);
+      const rows = params.length > 0 ? stmt.all(...params) : stmt.all();
+      for (const row of rows) {
+        const encoded = encodeBlobs(row);
+        console.log(JSON.stringify({ __table: table, ...encoded }));
+        totalRows++;
+      }
+    } catch (err) {
+      log8.warn(`export skipped table ${table}`, { error: String(err) });
+    }
+  }
+  log8.info("export complete", { tables: tables.length, rows: totalRows });
+}
+function getTimeColumn(table) {
+  const map = {
+    sessions: "started_at",
+    entities: "created_at",
+    session_notes: "created_at",
+    long_term_summaries: "created_at",
+    embeddings: "created_at"
+  };
+  return map[table] ?? null;
+}
+function encodeBlobs(row) {
+  const result = { ...row };
+  for (const [key, value] of Object.entries(result)) {
+    if (value instanceof Buffer || value instanceof Uint8Array) {
+      result[key] = { $base64: true, encoded: Buffer.from(value).toString("base64") };
+    }
+  }
+  return result;
+}
+var log8, SCHEMA_VERSION = 5, EXPORT_TABLES;
+var init_exporter = __esm(() => {
+  init_schema();
+  init_logger();
+  log8 = createLogger("exporter");
+  EXPORT_TABLES = [
+    "sessions",
+    "entities",
+    "session_notes",
+    "long_term_summaries",
+    "embeddings"
+  ];
+});
+
+// src/export/importer.ts
+var exports_importer = {};
+__export(exports_importer, {
+  importData: () => importData
+});
+async function importData(dryRun = false, db) {
+  const input = await Bun.stdin.text();
+  const lines = input.trim().split(`
+`).filter(Boolean);
+  const stats = { imported: {}, skipped: 0, errors: 0 };
+  if (lines.length === 0) {
+    log9.warn("empty input");
+    return stats;
+  }
+  let header;
+  try {
+    header = JSON.parse(lines[0]);
+  } catch {
+    throw new Error("Invalid JSONL header \u2014 first line must be valid JSON");
+  }
+  const version = header.__schema_version;
+  if (version > MAX_SCHEMA_VERSION) {
+    throw new Error(`Schema version ${version} not supported. Max: ${MAX_SCHEMA_VERSION}`);
+  }
+  const d = dryRun ? null : db ?? getDatabase();
+  const importFn = () => {
+    for (let i = 1;i < lines.length; i++) {
+      try {
+        const record = JSON.parse(lines[i]);
+        const table = record.__table;
+        if (!table) {
+          stats.skipped++;
+          continue;
+        }
+        delete record.__table;
+        decodeBlobs(record);
+        if (!dryRun && d) {
+          upsertRecord(d, table, record);
+        }
+        stats.imported[table] = (stats.imported[table] ?? 0) + 1;
+      } catch (err) {
+        stats.errors++;
+        log9.warn(`import error at line ${i + 1}`, { error: String(err) });
+      }
+    }
+  };
+  if (d) {
+    d.transaction(importFn)();
+    try {
+      reindexAll(d);
+    } catch {}
+  } else {
+    importFn();
+  }
+  log9.info("import complete", { ...stats });
+  return stats;
+}
+function decodeBlobs(record) {
+  for (const [key, value] of Object.entries(record)) {
+    if (value && typeof value === "object" && !Array.isArray(value) && value.$base64 === true) {
+      record[key] = Buffer.from(value.encoded, "base64");
+    }
+  }
+}
+function toSql(v) {
+  if (v === undefined || v === null)
+    return null;
+  if (typeof v === "string" || typeof v === "number" || typeof v === "bigint" || typeof v === "boolean")
+    return v;
+  if (v instanceof Buffer || v instanceof Uint8Array)
+    return v;
+  return String(v);
+}
+function upsertRecord(db, table, record) {
+  const fields = Object.keys(record).filter((k) => k !== "id");
+  const values = fields.map((k) => toSql(record[k]));
+  switch (table) {
+    case "sessions": {
+      db.run(`INSERT INTO sessions(id, project, started_at, ended_at, user_prompt, status)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           ended_at = COALESCE(excluded.ended_at, ended_at),
+           status = excluded.status`, [
+        toSql(record.id),
+        toSql(record.project),
+        toSql(record.started_at),
+        toSql(record.ended_at),
+        toSql(record.user_prompt),
+        toSql(record.status)
+      ]);
+      break;
+    }
+    case "long_term_summaries": {
+      db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           summary = excluded.summary,
+           files_touched = excluded.files_touched`, [
+        toSql(record.session_id),
+        toSql(record.project),
+        toSql(record.summary),
+        toSql(record.files_touched),
+        toSql(record.decisions),
+        toSql(record.errors_fixed),
+        toSql(record.token_savings),
+        toSql(record.created_at)
+      ]);
+      break;
+    }
+    case "embeddings": {
+      db.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(doc_type, doc_id) DO UPDATE SET
+           vector = excluded.vector,
+           created_at = excluded.created_at`, [toSql(record.doc_type), toSql(record.doc_id), toSql(record.model), toSql(record.vector), toSql(record.created_at)]);
+      break;
+    }
+    default: {
+      if (fields.length === 0)
+        return;
+      const placeholders = fields.map(() => "?").join(", ");
+      db.run(`INSERT INTO "${table}"(${fields.join(", ")}) VALUES (${placeholders})`, values);
+    }
+  }
+}
+var log9, MAX_SCHEMA_VERSION = 5;
+var init_importer = __esm(() => {
+  init_schema();
+  init_vector_search();
+  init_logger();
+  log9 = createLogger("importer");
+});
+
 // src/cli/main.ts
 import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync, writeFileSync } from "fs";
 import { homedir as homedir5 } from "os";
@@ -1847,6 +2168,42 @@ switch (command) {
     console.log("Done.");
     break;
   }
+  case "export": {
+    const { exportData: exportData2 } = (init_exporter(), __toCommonJS(exports_exporter));
+    const sinceIdx = process.argv.indexOf("--since");
+    const tableIdx = process.argv.indexOf("--table");
+    const since = sinceIdx > -1 ? Number(process.argv[sinceIdx + 1]) : undefined;
+    const table = tableIdx > -1 ? process.argv[tableIdx + 1] : undefined;
+    exportData2({ since, table });
+    break;
+  }
+  case "import": {
+    const { importData: importData2 } = (init_importer(), __toCommonJS(exports_importer));
+    const dryRun = process.argv.includes("--dry-run");
+    importData2(dryRun).then((stats) => {
+      const total = Object.values(stats.imported).reduce((a, b) => a + b, 0);
+      console.error(`Imported: ${total} records, Skipped: ${stats.skipped}, Errors: ${stats.errors}`);
+      if (dryRun)
+        console.error("(dry run \u2014 no data written)");
+      for (const [table, count] of Object.entries(stats.imported)) {
+        console.error(`  ${table}: ${count}`);
+      }
+      process.exit(stats.errors > 0 ? 1 : 0);
+    }).catch((err) => {
+      console.error(`Import failed: ${err.message}`);
+      process.exit(2);
+    });
+    break;
+  }
+  case "cleanup": {
+    const { cleanupOldData: cleanupOldData2 } = (init_monitor(), __toCommonJS(exports_monitor));
+    const daysIdx = process.argv.indexOf("--days");
+    const days = daysIdx > -1 ? Number(process.argv[daysIdx + 1]) : 90;
+    console.log(`Cleaning up data older than ${days} days...`);
+    const result = cleanupOldData2(undefined, days);
+    console.log(`Deleted: ${result.sessions_deleted} sessions, ${result.entities_deleted} entities, ${result.embeddings_deleted} embeddings`);
+    break;
+  }
   default:
     console.log(`claude-memory-hub \u2014 persistent memory for Claude Code
 `);
@@ -1858,6 +2215,9 @@ switch (command) {
     console.log("  viewer      Open browser UI at localhost:37888");
     console.log("  health      Run health check");
     console.log("  reindex     Rebuild TF-IDF search index");
+    console.log("  export      Export data as JSONL (--since T, --table T)");
+    console.log("  import      Import JSONL from stdin (--dry-run)");
+    console.log("  cleanup     Remove old data (--days N, default 90)");
     console.log(`
 Usage: npx claude-memory-hub <command>`);
     break;

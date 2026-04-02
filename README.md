@@ -31,20 +31,21 @@ Long session: Claude auto-compacts at 200K tokens
 
 Every session: ALL skills + agents + rules loaded
                → 23-51K tokens consumed before you type anything
-               → Most of them never used
+               → No external tool can prevent this (Claude Code limitation)
+               → But you CAN identify and remove unused resources
 
 Search:        Keyword-only, no semantic ranking
                → Irrelevant results, wasted tokens on full records
 ```
 
-**Four problems. No existing tool solves all of them.**
+**Four problems. memory-hub solves three directly and provides analysis for the fourth.**
 
 | Problem | Claude Code built-in | claude-mem | memory-hub |
 |---------|:-------------------:|:----------:|:----------:|
 | Cross-session memory | -- | Yes | **Yes** |
 | Influence what compact preserves | -- | -- | **Yes** |
 | Save compact output | -- | -- | **Yes** |
-| Token budget optimization | -- | -- | **Yes** |
+| Token overhead analysis | -- | -- | **Yes** |
 | Semantic search (embeddings) | -- | Chroma (external) | **Yes (offline)** |
 | Hybrid search (FTS5 + TF-IDF + semantic) | -- | Partial | **Yes** |
 | 3-layer progressive search | -- | Yes | **Yes** |
@@ -112,25 +113,25 @@ Session N+1     → UserPromptSubmit hook fires
                 → Claude starts with history, not from zero
 ```
 
-### Layer 4 — Smart Resource Loading
+### Layer 4 — Resource Intelligence & Overhead Analysis
 
 ```
-                 Typical Claude Code session
+ResourceRegistry scans your setup:
+  58 skills, 36 agents, 65 commands, 10 workflows, CLAUDE.md chain
 
-    BEFORE memory-hub          AFTER memory-hub
-    ┌──────────────────┐        ┌──────────────────┐
-    │ System prompt 8K │        │ System prompt 8K │
-    │ ALL skills  10K  │        │ Used skills  3K  │
-    │ ALL agents   5K  │        │ Used agents  1K  │
-    │ ALL rules   15K  │        │ Key rules    5K  │
-    │ ALL memory   5K  │        │ Relevant mem 2K  │
-    ├──────────────────┤        ├──────────────────┤
-    │ OVERHEAD:  ~43K  │        │ OVERHEAD:  ~19K  │
-    │                  │        │ SAVED:     ~24K  │
-    └──────────────────┘        └──────────────────┘
+ResourceTracker records actual usage per session:
+  "skill:mobile-development used 4/5 recent sessions"
+  "agent:veo3-prompt-expert used 0/5 recent sessions"
+
+OverheadReport identifies waste:
+  "42/58 skills never used → ~1500 listing tokens overhead"
+  "CLAUDE.md chain is 8200 tokens → consider consolidating"
+
+UserPromptSubmit injects priority hints:
+  "Frequently-used: skill:debugging, agent:planner, agent:tester"
 ```
 
-memory-hub tracks which skills/agents/tools you **actually use**, then recommends only those for future sessions. Rare resources load on demand via SkillTool.
+> **Transparency note:** Claude Code loads ALL resources into its system prompt — no external tool can prevent this. memory-hub provides **analysis and prioritization**, not filtering. To actually reduce token overhead, remove or relocate unused skills/agents based on the overhead report.
 
 ### Layer 5 — 3-Layer Progressive Search + Semantic (new in v0.5/v0.6)
 
@@ -305,6 +306,9 @@ bunx claude-memory-hub migrate     # Import data from claude-mem
 bunx claude-memory-hub viewer      # Open browser UI at localhost:37888
 bunx claude-memory-hub health      # Run health diagnostics
 bunx claude-memory-hub reindex     # Rebuild TF-IDF search index
+bunx claude-memory-hub export      # Export data as JSONL to stdout
+bunx claude-memory-hub import      # Import JSONL from stdin
+bunx claude-memory-hub cleanup     # Remove old data (default: 90 days)
 ```
 
 ### Requirements
@@ -398,6 +402,8 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | **v0.4.0** | Smart resource loading, token budget optimization |
 | **v0.5.0** | Production hardening, hybrid search, 3-layer progressive search, browser UI, health monitoring, claude-mem migration |
 | **v0.6.0** | ResourceRegistry (170 resources), semantic search (384-dim embeddings), observation capture, CLAUDE.md tracking, 3-tier LLM summarization, overhead analysis |
+| **v0.7.0** | Honest resource analysis, semantic search scaling, batch embeddings, 14 observation patterns, DB auto-cleanup, summarizer retry |
+| **v0.8.0** | 91 unit tests (was 0%), L1 WorkingMemory read-through cache, PostToolUse batch queue (75ms→3ms), JSONL export/import CLI, data cleanup command |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
@@ -420,6 +426,7 @@ bun:sqlite                         Built-in, zero install
 | `CLAUDE_MEMORY_HUB_LLM` | `auto` | Summarization: auto, cli-only, rule-based |
 | `CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS` | `30000` | CLI summarizer timeout |
 | `CLAUDE_MEMORY_HUB_EMBEDDINGS` | `auto` | Embeddings: auto, disabled |
+| `CLAUDE_MEMORY_HUB_BATCH` | `auto` | PostToolUse batching: auto, enabled, disabled |
 | `CMH_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 
 ---

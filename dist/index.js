@@ -6852,19 +6852,30 @@ class EmbeddingModel {
       return null;
     }
   }
-  async embedBatch(texts) {
+  async embedBatch(texts, chunkSize = 8) {
     if (!this.available || texts.length === 0)
       return texts.map(() => null);
     await this.ensureLoaded();
     if (!this.pipeline)
       return texts.map(() => null);
     const results = [];
-    for (const text of texts) {
+    for (let i = 0;i < texts.length; i += chunkSize) {
+      const chunk = texts.slice(i, i + chunkSize);
       try {
-        const result = await this.pipeline(text, { pooling: "mean", normalize: true });
-        results.push(new Float32Array(result.data));
+        const result = await this.pipeline(chunk, { pooling: "mean", normalize: true });
+        for (let j = 0;j < chunk.length; j++) {
+          const offset = j * 384;
+          results.push(new Float32Array(result.data.slice(offset, offset + 384)));
+        }
       } catch {
-        results.push(null);
+        for (const text of chunk) {
+          try {
+            const r = await this.pipeline(text, { pooling: "mean", normalize: true });
+            results.push(new Float32Array(r.data));
+          } catch {
+            results.push(null);
+          }
+        }
       }
     }
     return results;
@@ -6908,19 +6919,28 @@ var init_embedding_model = __esm(() => {
 });
 
 // src/search/semantic-search.ts
-async function semanticSearch(query, limit = 10, db) {
+async function semanticSearch(query, limitOrOpts = 10, db) {
+  const opts = typeof limitOrOpts === "number" ? { limit: limitOrOpts } : limitOrOpts;
+  const limit = opts.limit ?? 10;
+  const threshold = opts.threshold ?? 0.2;
+  const maxCandidates = opts.maxCandidates ?? 2000;
   const queryVec = await embeddingModel.embed(query);
   if (!queryVec)
     return [];
   const d = db ?? getDatabase();
-  const rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings").all();
+  let rows;
+  if (opts.docType) {
+    rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings WHERE doc_type = ? ORDER BY created_at DESC LIMIT ?").all(opts.docType, maxCandidates);
+  } else {
+    rows = d.query("SELECT doc_type, doc_id, vector FROM embeddings ORDER BY created_at DESC LIMIT ?").all(maxCandidates);
+  }
   if (rows.length === 0)
     return [];
   const scored = [];
   for (const row of rows) {
     const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
     const score = cosineSimilarity(queryVec, docVec);
-    if (score > 0.2) {
+    if (score > threshold) {
       scored.push({ doc_type: row.doc_type, doc_id: row.doc_id, score });
     }
   }
@@ -14753,6 +14773,8 @@ class ResourceRegistry {
       if (!existsSync3(file))
         continue;
       const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
       const name = `project:${relPath}`;
       const fileSize = this.readFileSize(file);
       this.register({
@@ -14952,17 +14974,18 @@ class SmartResourceLoader {
     };
   }
   formatContextAdvice(plan) {
-    if (plan.skipped.length === 0)
+    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
       return "";
-    const lines = [
-      `Context budget: ${plan.total_tokens}/${plan.total_tokens + plan.budget_remaining} tokens used.`
-    ];
-    if (plan.skipped.length > 0) {
-      lines.push(`${plan.skipped.length} resource(s) deferred for token efficiency:`);
-      for (const s of plan.skipped.slice(0, 5)) {
-        lines.push(`  - ${s.resource_type}:${s.resource_name} (~${s.token_cost} tok, ${s.reason})`);
+    const lines = [];
+    if (plan.recommendations.length > 0) {
+      lines.push("**Frequently-used resources in this project:**");
+      for (const r of plan.recommendations.slice(0, 5)) {
+        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
       }
-      lines.push("Use SkillTool or ToolSearch to load these on demand if needed.");
+    }
+    if (plan.skipped.length > 0) {
+      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
+      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
     }
     return lines.join(`
 `);
@@ -14997,28 +15020,30 @@ function safeJson2(text, fallback) {
 }
 
 // src/memory/working-memory.ts
+var CACHE_TTL_MS = 5 * 60 * 1000;
 var MAX_ENTRIES_PER_SESSION = 50;
 
 class WorkingMemory {
-  store = new Map;
-  add(entity) {
-    const list = this.store.get(entity.session_id) ?? [];
-    list.push(entity);
-    if (list.length > MAX_ENTRIES_PER_SESSION)
-      list.shift();
-    this.store.set(entity.session_id, list);
+  cache = new Map;
+  store;
+  constructor(store) {
+    this.store = store ?? new SessionStore;
   }
-  getRecent(session_id, n = 10) {
-    return (this.store.get(session_id) ?? []).slice(-n);
+  getRecent(sessionId, n = 10) {
+    const cached2 = this.getOrLoad(sessionId);
+    return cached2.slice(-n);
   }
-  getAll(session_id) {
-    return this.store.get(session_id) ?? [];
+  getAll(sessionId) {
+    return this.getOrLoad(sessionId);
   }
-  clear(session_id) {
-    this.store.delete(session_id);
+  refresh(sessionId) {
+    this.cache.delete(sessionId);
   }
-  summarize(session_id) {
-    const entities = this.getRecent(session_id, 20);
+  invalidate(sessionId) {
+    this.cache.delete(sessionId);
+  }
+  summarize(sessionId) {
+    const entities = this.getRecent(sessionId, 20);
     if (entities.length === 0)
       return "";
     const byType = new Map;
@@ -15034,6 +15059,15 @@ class WorkingMemory {
     }
     return lines.join(`
 `);
+  }
+  getOrLoad(sessionId) {
+    const entry = this.cache.get(sessionId);
+    if (entry && Date.now() - entry.loadedAt < CACHE_TTL_MS) {
+      return entry.entities;
+    }
+    const entities = this.store.getSessionEntities(sessionId).slice(-MAX_ENTRIES_PER_SESSION);
+    this.cache.set(sessionId, { entities, loadedAt: Date.now() });
+    return entities;
   }
 }
 var workingMemory = new WorkingMemory;
@@ -15085,18 +15119,27 @@ function checkFTS5(db) {
 }
 function checkDiskSpace() {
   const start = performance.now();
-  const dbPath = join4(homedir4(), ".claude-memory-hub", "memory.db");
+  const dbDir = join4(homedir4(), ".claude-memory-hub");
+  const dbPath = join4(dbDir, "memory.db");
   try {
     if (!existsSync4(dbPath)) {
       return { component: "disk", status: "ok", message: "DB not yet created", latency_ms: 0 };
     }
-    const stats = statSync2(dbPath);
-    const sizeMB = stats.size / (1024 * 1024);
-    const status = sizeMB > 500 ? "degraded" : "ok";
+    const dbSize = statSync2(dbPath).size;
+    let totalSize = dbSize;
+    const walPath = dbPath + "-wal";
+    const shmPath = dbPath + "-shm";
+    if (existsSync4(walPath))
+      totalSize += statSync2(walPath).size;
+    if (existsSync4(shmPath))
+      totalSize += statSync2(shmPath).size;
+    const sizeMB = totalSize / (1024 * 1024);
+    const status = sizeMB > 500 ? "error" : sizeMB > 200 ? "degraded" : "ok";
+    const warning = status !== "ok" ? ` \u2014 consider running cleanup` : "";
     return {
       component: "disk",
       status,
-      message: `DB size: ${sizeMB.toFixed(1)}MB`,
+      message: `DB total: ${sizeMB.toFixed(1)}MB (db=${(dbSize / 1024 / 1024).toFixed(1)}MB)${warning}`,
       latency_ms: Math.round(performance.now() - start)
     };
   } catch (e) {
@@ -15104,6 +15147,28 @@ function checkDiskSpace() {
       component: "disk",
       status: "error",
       message: `Disk check failed: ${e}`,
+      latency_ms: Math.round(performance.now() - start)
+    };
+  }
+}
+function checkEmbeddingsSize(db) {
+  const start = performance.now();
+  try {
+    const row = db.query("SELECT COUNT(*) as c, COALESCE(SUM(LENGTH(vector)), 0) as total_bytes FROM embeddings").get();
+    const count = row?.c ?? 0;
+    const sizeMB = (row?.total_bytes ?? 0) / (1024 * 1024);
+    const status = count > 5000 ? "degraded" : "ok";
+    return {
+      component: "embeddings",
+      status,
+      message: `${count} embeddings (~${sizeMB.toFixed(1)}MB)${status === "degraded" ? " \u2014 consider pruning old entries" : ""}`,
+      latency_ms: Math.round(performance.now() - start)
+    };
+  } catch (e) {
+    return {
+      component: "embeddings",
+      status: "error",
+      message: `Embeddings check failed: ${e}`,
       latency_ms: Math.round(performance.now() - start)
     };
   }
@@ -15143,6 +15208,7 @@ function runHealthCheck(db) {
     checkDatabase(d),
     checkFTS5(d),
     checkDiskSpace(),
+    checkEmbeddingsSize(d),
     checkDataIntegrity(d)
   ];
   let overall = "ok";

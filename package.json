@@ -1,6 +1,6 @@
 {
   "name": "claude-memory-hub",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "description": "Persistent memory system for Claude Code. Zero API key. Zero Python. 5 hooks + MCP server + SQLite FTS5 + semantic search.",
   "type": "module",
   "main": "dist/index.js",
@@ -21,7 +21,9 @@
     "build:all": "bun run build && bun run build:cli && bun run build:hooks",
     "dev": "bun run --watch src/index.ts",
     "prepublishOnly": "test -f dist/index.js || bun run build:all",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage"
   },
   "keywords": [
     "claude",
