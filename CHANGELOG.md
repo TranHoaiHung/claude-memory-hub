@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.4] - 2026-04-02
+
+Windows path fix — backslashes no longer eaten by bash.
+
+### Bug Fixes
+
+- **Windows backslash paths in hooks** — `C:\Users\Admin\.bun\bin\bun.exe` was passed raw into bash commands, which stripped backslashes → `C:UsersAdmin.bunbinbun.exe`. New `shellPath()` utility converts all paths to forward slashes (`C:/Users/Admin/.bun/bin/bun.exe`) and quotes paths with spaces. Applied to: bun binary path, hook script paths, MCP server path
+- **`where` output parsing on Windows** — `where bun` returns `\r\n` line endings; now splits on `/\r?\n/` instead of `\n`
+
+---
+
+## [0.9.3] - 2026-04-02
+
+Summary quality improvements — cleaner data in, garbage data out.
+
+### Summary Quality
+
+- **Strip IDE tags from user_prompt** — `<ide_opened_file>`, `<ide_selection>`, `<system-reminder>` tags are now removed before storing `user_prompt` in L2. Summaries and search results no longer contain IDE noise
+- **Skip low-value sessions** — sessions with only `file_read` entities (browsing, no edits) and no errors/decisions/notes/observations are no longer summarized. Prevents generic "Session in project X" entries from polluting L3
+- **`hasModifiedFiles()` method** — new SessionStore method checks for `file_modified` or `file_created` entities efficiently
+
+### New CLI Command
+
+- **`prune` command** — removes low-quality summaries from L3: generic text ("Session worked on...", "Session in project..."), IDE tag noise, and empty summaries with no files/decisions/errors. Supports `--dry-run` for safe preview. Also cleans related embeddings
+
+```bash
+bunx claude-memory-hub prune --dry-run  # preview
+bunx claude-memory-hub prune            # delete
+```
+
+---
+
 ## [0.9.2] - 2026-04-02
 
 Cross-platform hook reliability — Windows/WSL no longer fails with "bun: command not found".

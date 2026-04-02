@@ -110,6 +110,13 @@ var init_logger = __esm(() => {
 });
 
 // src/db/schema.ts
+var exports_schema = {};
+__export(exports_schema, {
+  initDatabase: () => initDatabase,
+  getDbPath: () => getDbPath,
+  getDatabase: () => getDatabase,
+  closeDatabase: () => closeDatabase
+});
 import { Database } from "bun:sqlite";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
 import { homedir as homedir2 } from "os";
@@ -241,6 +248,12 @@ function getDatabase() {
     initDatabase(_db);
   }
   return _db;
+}
+function closeDatabase() {
+  if (_db) {
+    _db.close();
+    _db = null;
+  }
 }
 var log, CREATE_TABLES = `
 -- Migration version tracking
@@ -1954,29 +1967,32 @@ import { spawnSync } from "child_process";
 var CLAUDE_DIR = join5(homedir5(), ".claude");
 var SETTINGS_PATH = join5(CLAUDE_DIR, "settings.json");
 var PKG_DIR = resolve(dirname(import.meta.dir));
+function shellPath(p) {
+  const normalized = p.replace(/\\/g, "/");
+  return normalized.includes(" ") ? `"${normalized}"` : normalized;
+}
 function getBunPath() {
   const result = spawnSync(process.platform === "win32" ? "where" : "which", ["bun"], {
     encoding: "utf-8"
   });
-  const resolved = result.stdout?.trim().split(`
-`)[0]?.trim();
+  const resolved = result.stdout?.trim().split(/\r?\n/)[0]?.trim();
   if (resolved && existsSync5(resolved))
-    return resolved;
+    return shellPath(resolved);
   const candidates = [
     join5(homedir5(), ".bun", "bin", "bun"),
     join5(homedir5(), ".bun", "bin", "bun.exe")
   ];
   for (const c of candidates) {
     if (existsSync5(c))
-      return c;
+      return shellPath(c);
   }
   return "bun";
 }
 function getHookPath(hookName) {
-  return join5(PKG_DIR, "dist", "hooks", `${hookName}.js`);
+  return shellPath(join5(PKG_DIR, "dist", "hooks", `${hookName}.js`));
 }
 function getMcpServerPath() {
-  return join5(PKG_DIR, "dist", "index.js");
+  return shellPath(join5(PKG_DIR, "dist", "index.js"));
 }
 function loadSettings() {
   if (!existsSync5(SETTINGS_PATH))
@@ -2223,6 +2239,42 @@ switch (command) {
     console.log(`Deleted: ${result.sessions_deleted} sessions, ${result.entities_deleted} entities, ${result.embeddings_deleted} embeddings`);
     break;
   }
+  case "prune": {
+    const { getDatabase: getDatabase2 } = (init_schema(), __toCommonJS(exports_schema));
+    const db = getDatabase2();
+    const dryRun = process.argv.includes("--dry-run");
+    console.log(`claude-memory-hub \u2014 prune low-quality summaries${dryRun ? " (dry run)" : ""}
+`);
+    const garbage = db.query(`SELECT id, session_id, summary FROM long_term_summaries
+       WHERE length(summary) < 50
+          OR summary LIKE '%Session worked on%'
+          OR summary LIKE '%Session in project%'
+          OR summary LIKE '%<ide_%'
+          OR summary LIKE '%<system-reminder>%'
+          OR (files_touched = '[]' AND decisions = '[]' AND errors_fixed = '[]' AND length(summary) < 100)`).all();
+    if (garbage.length === 0) {
+      console.log("  No low-quality summaries found. Database is clean.");
+      break;
+    }
+    console.log(`  Found ${garbage.length} low-quality summaries:`);
+    for (const g of garbage.slice(0, 10)) {
+      console.log(`    [${g.id}] "${g.summary.slice(0, 80)}${g.summary.length > 80 ? "..." : ""}"`);
+    }
+    if (garbage.length > 10)
+      console.log(`    ... and ${garbage.length - 10} more`);
+    if (dryRun) {
+      console.log(`
+  Dry run \u2014 no changes made. Remove --dry-run to delete.`);
+    } else {
+      const ids = garbage.map((g) => g.id);
+      const placeholders = ids.map(() => "?").join(",");
+      db.run(`DELETE FROM long_term_summaries WHERE id IN (${placeholders})`, ids);
+      db.run(`DELETE FROM embeddings WHERE doc_type = 'summary' AND doc_id IN (${placeholders})`, ids.map(String));
+      console.log(`
+  Deleted ${garbage.length} summaries + related embeddings.`);
+    }
+    break;
+  }
   default:
     console.log(`claude-memory-hub \u2014 persistent memory for Claude Code
 `);
@@ -2237,6 +2289,7 @@ switch (command) {
     console.log("  export      Export data as JSONL (--since T, --table T)");
     console.log("  import      Import JSONL from stdin (--dry-run)");
     console.log("  cleanup     Remove old data (--days N, default 90)");
+    console.log("  prune       Remove low-quality summaries (--dry-run)");
     console.log(`
 Usage: npx claude-memory-hub <command>`);
     break;

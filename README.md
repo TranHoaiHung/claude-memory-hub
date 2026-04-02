@@ -285,6 +285,7 @@ bunx claude-memory-hub reindex     # Rebuild TF-IDF + embedding indexes
 bunx claude-memory-hub export      # Export data as JSONL to stdout
 bunx claude-memory-hub import      # Import JSONL from stdin (--dry-run)
 bunx claude-memory-hub cleanup     # Remove old data (--days N, default 90)
+bunx claude-memory-hub prune       # Remove low-quality summaries (--dry-run)
 ```
 
 ### Requirements

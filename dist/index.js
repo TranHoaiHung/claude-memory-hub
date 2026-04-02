@@ -14171,6 +14171,11 @@ class SessionStore {
          WHERE session_id = ? AND entity_type IN ('file_read','file_modified','file_created')
          ORDER BY importance DESC, created_at DESC`).all(session_id).map((r) => r.entity_value);
   }
+  hasModifiedFiles(session_id) {
+    const row = this.db.query(`SELECT COUNT(*) as c FROM entities
+         WHERE session_id = ? AND entity_type IN ('file_modified','file_created') LIMIT 1`).get(session_id);
+    return (row?.c ?? 0) > 0;
+  }
   insertNote(note) {
     this.db.run("INSERT INTO session_notes(session_id, content, created_at) VALUES (?, ?, ?)", [note.session_id, note.content, note.created_at]);
   }

@@ -407,6 +407,11 @@ class SessionStore {
          WHERE session_id = ? AND entity_type IN ('file_read','file_modified','file_created')
          ORDER BY importance DESC, created_at DESC`).all(session_id).map((r) => r.entity_value);
   }
+  hasModifiedFiles(session_id) {
+    const row = this.db.query(`SELECT COUNT(*) as c FROM entities
+         WHERE session_id = ? AND entity_type IN ('file_modified','file_created') LIMIT 1`).get(session_id);
+    return (row?.c ?? 0) > 0;
+  }
   insertNote(note) {
     this.db.run("INSERT INTO session_notes(session_id, content, created_at) VALUES (?, ?, ?)", [note.session_id, note.content, note.created_at]);
   }
@@ -1619,6 +1624,9 @@ function safeJson2(text, fallback) {
 
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
+function stripIdeTags(prompt) {
+  return prompt.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
+}
 async function handlePostToolUse(hook, project) {
   const store = new SessionStore;
   store.upsertSession({
@@ -1654,14 +1662,15 @@ async function handlePostToolUse(hook, project) {
 async function handleUserPromptSubmit(hook, project) {
   const store = new SessionStore;
   const ltStore = new LongTermStore;
+  const cleanPrompt = stripIdeTags(hook.prompt);
   store.upsertSession({
     id: hook.session_id,
     project,
     started_at: Date.now(),
-    user_prompt: hook.prompt.slice(0, 500),
+    user_prompt: cleanPrompt.slice(0, 500) || hook.prompt.slice(0, 500),
     status: "active"
   });
-  const promptObs = extractObservationFromPrompt(hook.prompt, hook.session_id, project, 0);
+  const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
   const results = ltStore.search(hook.prompt, 3);
@@ -1935,6 +1944,9 @@ class SessionSummarizer {
     const observations = this.sessionStore.getSessionObservations(session_id);
     const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
     if (files.length === 0 && errors.length === 0 && notes.length === 0)
+      return;
+    const hasModified = this.sessionStore.hasModifiedFiles(session_id);
+    if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0)
       return;
     const obsValues = observations.slice(0, 5).map((o) => o.entity_value);
     let summaryText;
