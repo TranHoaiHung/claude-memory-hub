@@ -1,6 +1,6 @@
 # Development files
 plans/
-hooks/
+/hooks/
 src/
 .claude/
 *.ts

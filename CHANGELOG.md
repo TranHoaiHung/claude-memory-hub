@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.2] - 2026-04-02
+
+Cross-platform hook reliability — Windows/WSL no longer fails with "bun: command not found".
+
+### Bug Fixes
+
+- **dist/hooks missing from npm package** — `.npmignore` pattern `hooks/` was matching `dist/hooks/` too, causing "Module not found" on Windows. Fixed to `/hooks/` (root-only match)
+
+### Upgrade Note
+
+After updating, run `bunx claude-memory-hub@latest install` to re-register hooks with the resolved bun path.
+
+
+---
+
 ## [0.9.1] - 2026-04-02
 
 Cross-platform hook reliability — Windows/WSL no longer fails with "bun: command not found".
@@ -13,6 +28,7 @@ Cross-platform hook reliability — Windows/WSL no longer fails with "bun: comma
 
 - **Full bun path resolution** — `install` now resolves absolute path to `bun` binary via `which` (macOS/Linux) or `where` (Windows), with fallback to `~/.bun/bin/bun`. All hooks and MCP server commands are registered with the full path instead of relying on PATH inheritance
 - **Windows/WSL compatibility** — fixes "bun: command not found" error caused by non-interactive shells (used by Claude Code to spawn hooks) not inheriting user's PATH where `bun` is installed
+- **dist/hooks missing from npm package** — `.npmignore` pattern `hooks/` was matching `dist/hooks/` too, causing "Module not found" on Windows. Fixed to `/hooks/` (root-only match)
 
 ### Upgrade Note
 
