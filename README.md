@@ -17,6 +17,31 @@ Zero API key. Zero Python. Zero config. One install command.
 
 ---
 
+## Why memory-hub?
+
+**Claude Code forgets everything.** Every session starts from zero. Auto-compact destroys 90% of your context. You lose files, decisions, errors — hours of work, gone.
+
+**claude-memory-hub fixes this.** One install command. No API key. No Python. No Docker.
+
+What makes it different? **The Compact Interceptor** — something no other memory tool has. When Claude Code auto-compacts at 200K tokens, memory-hub *tells the compact engine what matters*. PreCompact hook injects priority instructions. PostCompact hook saves the full summary. Result: 90% context salvage instead of vaporization.
+
+But it doesn't stop there:
+- **Cross-session memory** — past work auto-injected when you start a new session
+- **3-engine hybrid search** — FTS5 + TF-IDF + semantic embeddings (384-dim, offline)
+- **Proactive retrieval** — detects topic shifts mid-session, injects relevant context automatically
+- **91 unit tests**, batch queue (75ms→3ms), JSONL export/import, browser UI
+- **Multi-agent ready** — subagents share memory for free via MCP
+
+Built for developers who use Claude Code daily and are tired of repeating themselves.
+
+```bash
+bunx claude-memory-hub install
+```
+
+That's it. Your Claude now remembers.
+
+---
+
 ## The Problem
 
 Claude Code forgets everything between sessions. Within long sessions, auto-compact destroys 90% of context. Search is keyword-only with no ranking.
