@@ -1717,7 +1717,7 @@ function safeJson(text, fallback) {
 
 // src/context/injection-validator.ts
 var log5 = createLogger("injection-validator");
-var MAX_CHARS = 4500;
+var MAX_CHARS = 8000;
 
 class InjectionValidator {
   registry;

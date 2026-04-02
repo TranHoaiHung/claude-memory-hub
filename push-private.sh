@@ -14,6 +14,8 @@ BACKUP_DIR=$(mktemp -d)
 echo "  Backing up source to $BACKUP_DIR..."
 cp -R src/ "$BACKUP_DIR/src/" 2>/dev/null || true
 cp -R hooks/ "$BACKUP_DIR/hooks/" 2>/dev/null || true
+cp -R tests/ "$BACKUP_DIR/tests/" 2>/dev/null || true
+cp -R plans/ "$BACKUP_DIR/plans/" 2>/dev/null || true
 cp tsconfig.json "$BACKUP_DIR/" 2>/dev/null || true
 cp install.sh "$BACKUP_DIR/" 2>/dev/null || true
 
@@ -23,7 +25,7 @@ git stash 2>/dev/null || true
 git checkout -b "$TEMP_BRANCH"
 
 # Force add source files
-git add -f src/ hooks/ tsconfig.json install.sh 2>/dev/null || true
+git add -f src/ hooks/ tests/ plans/ tsconfig.json install.sh 2>/dev/null || true
 git add -f .claude/ 2>/dev/null || true
 git add -f dist/ .github/ README.md CHANGELOG.md LICENSE package.json bun.lock .gitignore .npmignore assets/ push-private.sh push-public.sh
 
@@ -41,6 +43,8 @@ git stash pop 2>/dev/null || true
 echo "  Restoring source..."
 cp -R "$BACKUP_DIR/src/" src/ 2>/dev/null || true
 cp -R "$BACKUP_DIR/hooks/" hooks/ 2>/dev/null || true
+cp -R "$BACKUP_DIR/tests/" tests/ 2>/dev/null || true
+cp -R "$BACKUP_DIR/plans/" plans/ 2>/dev/null || true
 cp "$BACKUP_DIR/tsconfig.json" . 2>/dev/null || true
 cp "$BACKUP_DIR/install.sh" . 2>/dev/null || true
 rm -rf "$BACKUP_DIR"

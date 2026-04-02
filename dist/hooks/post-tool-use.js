@@ -1424,7 +1424,7 @@ function safeJson(text, fallback) {
 
 // src/context/injection-validator.ts
 var log3 = createLogger("injection-validator");
-var MAX_CHARS = 4500;
+var MAX_CHARS = 8000;
 
 class InjectionValidator {
   registry;
@@ -1841,7 +1841,7 @@ var log6 = createLogger("proactive-retrieval");
 var DATA_DIR2 = join6(homedir5(), ".claude-memory-hub");
 var PROACTIVE_DIR = join6(DATA_DIR2, "proactive");
 var TOOL_CALL_INTERVAL = 15;
-var MAX_INJECTION_CHARS = 1500;
+var MAX_INJECTION_CHARS = 3000;
 function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse) {
   const state = loadState(sessionId);
   state.toolCallCount++;

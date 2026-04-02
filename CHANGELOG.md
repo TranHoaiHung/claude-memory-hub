@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.8.2] - 2026-04-02
+
+Increased context injection limits for richer cross-session memory.
+
+### Context Injection Limits
+
+- **UserPromptSubmit cap doubled** — `MAX_CHARS` increased from 4,500 (~1,125 tokens) to 8,000 (~2,000 tokens). Session-start context injection now carries significantly more past knowledge
+- **Proactive retrieval cap doubled** — `MAX_INJECTION_CHARS` increased from 1,500 (~375 tokens) to 3,000 (~750 tokens). Mid-session topic-shift injections now include fuller context from L3
+
+---
+
 ## [0.8.1] - 2026-04-02
 
 Token-budget-aware MCP tools + proactive mid-session memory retrieval.
