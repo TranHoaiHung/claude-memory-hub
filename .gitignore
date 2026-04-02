@@ -1,6 +1,7 @@
 # Source code — protected in private repo
 src/
 hooks/
+tests/
 plans/
 tsconfig.json
 install.sh
