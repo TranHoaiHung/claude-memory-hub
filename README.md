@@ -181,10 +181,10 @@ User prompt contains "remember that we use TypeScript strict"
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      Claude Code                             │
-│                                                              │
-│  5 Lifecycle Hooks                                           │
+┌─────────────────────────────────────────────────────────────┐
+│                      Claude Code                            │
+│                                                             │
+│  5 Lifecycle Hooks                                          │
 │  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐      │
 │  │ PostToolUse   │  │ PreCompact   │  │ PostCompact  │      │
 │  │ batch queue   │  │ inject       │  │ save summary │      │
@@ -194,25 +194,25 @@ User prompt contains "remember that we use TypeScript strict"
 │  │UserPrompt    │          │          │ Stop         │      │
 │  │Submit: inject│          │          │ session end  │      │
 │  │past context  │          │          │ summarize    │      │
-│  └──────────────┘          │          └──────────────┘      │
+│  └──────────────┘          │          └──────────────┘      │ 
 │                            │                                │
 │  MCP Server (stdio, long-lived)                             │
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │ memory_recall        memory_search  (L1 index)      │    │
 │  │ memory_entities      memory_timeline (L2 context)   │    │
 │  │ memory_session_notes memory_fetch   (L3 full)       │    │
-│  │ memory_store         memory_context_budget           │    │
-│  │ memory_health                                        │    │
-│  │                                                      │    │
-│  │ L1 WorkingMemory: read-through cache over L2         │    │
+│  │ memory_store         memory_context_budget          │    │
+│  │ memory_health                                       │    │
+│  │                                                     │    │
+│  │ L1 WorkingMemory: read-through cache over L2        │    │
 │  └─────────────────────────────────────────────────────┘    │
-│                                                              │
-│  Resource Intelligence    Browser UI (:37888)                │
+│                                                             │
+│  Resource Intelligence    Browser UI (:37888)               │
 │  ┌──────────────────┐     ┌──────────────────┐              │
 │  │ scan → track →   │     │ search, browse,  │              │
-│  │ analyze overhead  │     │ stats, health    │              │
+│  │ analyze overhead │     │ stats, health    │              │
 │  └──────────────────┘     └──────────────────┘              │
-└──────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────┘
                              │
                    ┌─────────┴──────────┐
                    │   SQLite + FTS5    │
@@ -220,7 +220,7 @@ User prompt contains "remember that we use TypeScript strict"
                    │   memory-hub/      │
                    │                    │
                    │   memory.db        │
-                   │   batch/queue.jsonl │
+                   │   batch/queue.jsonl│
                    │   logs/            │
                    └────────────────────┘
 ```
@@ -241,7 +241,7 @@ User prompt contains "remember that we use TypeScript strict"
 │  files, errors, decisions   Per-session scope       │
 │  observations (14 patterns) Importance scored 1-5   │
 ├─────────────────────────────────────────────────────┤
-│  L3: LongTermStore          SQLite + FTS5 + TF-IDF │
+│  L3: LongTermStore          SQLite + FTS5 + TF-IDF  │
 │  Cross-session summaries    <100ms access           │
 │  Hybrid ranked search       Persistent forever      │
 │  Semantic embeddings        3-layer progressive     │
