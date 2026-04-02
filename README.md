@@ -19,7 +19,7 @@ Zero API key. Zero Python. Zero config. One install command.
 
 ## The Problem
 
-Claude Code forgets everything between sessions. Within long sessions, auto-compact destroys 90% of context. Every session wastes tokens loading resources that aren't needed. Search is keyword-only with no ranking.
+Claude Code forgets everything between sessions. Within long sessions, auto-compact destroys 90% of context. Search is keyword-only with no ranking.
 
 ```
 Session 1: You spend 2 hours building auth system
@@ -29,37 +29,31 @@ Long session: Claude auto-compacts at 200K tokens
               → 180K tokens of context vaporized
               → Claude loses track of files, decisions, errors
 
-Every session: ALL skills + agents + rules loaded
-               → 23-51K tokens consumed before you type anything
-               → No external tool can prevent this (Claude Code limitation)
-               → But you CAN identify and remove unused resources
-
 Search:        Keyword-only, no semantic ranking
                → Irrelevant results, wasted tokens on full records
 ```
-
-**Four problems. memory-hub solves three directly and provides analysis for the fourth.**
 
 | Problem | Claude Code built-in | claude-mem | memory-hub |
 |---------|:-------------------:|:----------:|:----------:|
 | Cross-session memory | -- | Yes | **Yes** |
 | Influence what compact preserves | -- | -- | **Yes** |
-| Save compact output | -- | -- | **Yes** |
-| Token overhead analysis | -- | -- | **Yes** |
-| Semantic search (embeddings) | -- | Chroma (external) | **Yes (offline)** |
+| Save compact output to L3 | -- | -- | **Yes** |
 | Hybrid search (FTS5 + TF-IDF + semantic) | -- | Partial | **Yes** |
 | 3-layer progressive search | -- | Yes | **Yes** |
 | Resource overhead analysis | -- | -- | **Yes** |
 | CLAUDE.md rule tracking | -- | -- | **Yes** |
-| Free-form observation capture | -- | Yes | **Yes** |
+| Observation capture (14 patterns) | -- | Yes | **Yes** |
 | LLM summarization (3-tier) | -- | Yes (API) | **Yes (free)** |
+| Token-budget-aware tools (`max_tokens`) | -- | -- | **Yes** |
+| Proactive mid-session retrieval | -- | -- | **Yes** |
+| Multi-agent memory sharing | -- | -- | **Yes (free)** |
+| Permission-aware (approved only) | -- | -- | **Yes** |
+| Data export/import (JSONL) | -- | -- | **Yes** |
+| Hook batching (3ms vs 75ms) | -- | -- | **Yes** |
 | Browser UI | -- | Yes | **Yes** |
-| Health monitoring | -- | -- | **Yes** |
-| Migrate from claude-mem | N/A | N/A | **Yes** |
-| No API key needed | N/A | Yes | **Yes** |
-| No Python/Chroma needed | N/A | -- | **Yes** |
-| No XML format required | N/A | -- | **Yes** |
-| No HTTP server to manage | N/A | -- | **Yes** |
+| Health monitoring + auto-cleanup | -- | -- | **Yes** |
+| Unit tests (91 tests) | N/A | -- | **Yes** |
+| No API key / Python / Chroma | N/A | Partial | **Yes** |
 
 ---
 
@@ -75,6 +69,8 @@ Claude makes a decision → memory-hub records: decision text + importance score
 ```
 
 No XML. No special format. Extracted directly from hook JSON metadata.
+PostToolUse events are batched via write-through queue (~3ms per event vs ~75ms direct).
+Mid-session topic shifts auto-inject relevant past context (proactive retrieval).
 
 ### Layer 2 — Compact Interceptor (the key innovation)
 
@@ -99,41 +95,21 @@ No XML. No special format. Extracted directly from hook JSON metadata.
                       zero information loss
 ```
 
-**This is something no other memory tool does.** claude-mem never sees the compact. Built-in session memory is supplementary, not directive. memory-hub is the only system that **tells the compact what matters**.
+**No other memory tool does this.** memory-hub is the only system that **tells the compact what matters**.
 
 ### Layer 3 — Cross-Session Memory
 
 ```
-Session N ends  → rule-based summary from entities → SQLite L3
-                  OR PostCompact summary (richer) → SQLite L3
+Session N ends  → 3-tier summarization: PostCompact > CLI claude > rule-based
+                → Summary saved to SQLite L3 with FTS5 indexing
 
 Session N+1     → UserPromptSubmit hook fires
-                → FTS5 + TF-IDF hybrid search: match user prompt
-                → inject relevant context automatically
+                → FTS5 + TF-IDF + semantic search: match user prompt
+                → Inject relevant past context automatically
                 → Claude starts with history, not from zero
 ```
 
-### Layer 4 — Resource Intelligence & Overhead Analysis
-
-```
-ResourceRegistry scans your setup:
-  58 skills, 36 agents, 65 commands, 10 workflows, CLAUDE.md chain
-
-ResourceTracker records actual usage per session:
-  "skill:mobile-development used 4/5 recent sessions"
-  "agent:veo3-prompt-expert used 0/5 recent sessions"
-
-OverheadReport identifies waste:
-  "42/58 skills never used → ~1500 listing tokens overhead"
-  "CLAUDE.md chain is 8200 tokens → consider consolidating"
-
-UserPromptSubmit injects priority hints:
-  "Frequently-used: skill:debugging, agent:planner, agent:tester"
-```
-
-> **Transparency note:** Claude Code loads ALL resources into its system prompt — no external tool can prevent this. memory-hub provides **analysis and prioritization**, not filtering. To actually reduce token overhead, remove or relocate unused skills/agents based on the overhead report.
-
-### Layer 5 — 3-Layer Progressive Search + Semantic (new in v0.5/v0.6)
+### Layer 4 — 3-Layer Progressive Search
 
 ```
 Traditional search: query → ALL full records → 5000+ tokens wasted
@@ -146,34 +122,33 @@ memory-hub search:  query → Layer 1 (index)    → ~50 tokens/result
                     Token savings: ~80-90% vs. full context
 ```
 
-Hybrid ranking: FTS5 BM25 (keyword) + TF-IDF (term frequency) + **semantic cosine similarity** (384-dim embeddings, v0.6). "debugging tips" now matches "error fixing" even without shared keywords.
+Hybrid ranking: FTS5 BM25 (keyword) + TF-IDF (term frequency) + semantic cosine similarity (384-dim embeddings). "debugging tips" matches "error fixing" even without shared keywords.
 
-### Layer 6 — Resource Intelligence (new in v0.6)
+### Layer 5 — Resource Intelligence
 
 ```
 ResourceRegistry scans ALL .claude locations:
-  ~/.claude/skills/          58 skills → listing + full + total tokens
-  ~/.claude/agents/          36 agents → frontmatter name: resolution
-  ~/.claude/agent_mobile/    ios-developer → agent_mobile/ios/AGENT.md
-  ~/.claude/commands/        65 commands → relative path naming
-  ~/.claude/workflows/       10 workflows
-  ~/.claude/CLAUDE.md        + project CLAUDE.md chain
+  skills, agents, commands, workflows, CLAUDE.md chain
+  → 3-level token estimation: listing, full, total
 
-OverheadReport:
-  "56/64 skills unused in last 10 sessions → ~1033 listing tokens wasted"
-  "CLAUDE.md chain is 3222 tokens"
+ResourceTracker records actual usage per session
+OverheadReport identifies unused resources + token waste
 ```
 
-### Layer 7 — Observation Capture (new in v0.6)
+> **Transparency note:** Claude Code loads ALL resources into its system prompt — no external tool can prevent this. memory-hub provides **analysis and prioritization**, not filtering. To reduce token overhead, remove or relocate unused skills/agents based on the overhead report.
+
+### Layer 6 — Observation Capture
 
 ```
 Tool output contains "IMPORTANT: always pool DB connections"
   → observation entity (importance=4) saved to L2
-  → included in session summary
-  → searchable across sessions
 
 User prompt contains "remember that we use TypeScript strict"
   → observation entity (importance=3) saved to L2
+
+14 heuristic patterns: IMPORTANT, CRITICAL, SECURITY, DEPRECATED,
+  decision:, discovered, root cause, switched to, TODO:, FIXME:,
+  HACK:, performance:, bottleneck, OOM, don't, never, prefer, etc.
 ```
 
 ---
@@ -187,7 +162,7 @@ User prompt contains "remember that we use TypeScript strict"
 │  5 Lifecycle Hooks                                           │
 │  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐      │
 │  │ PostToolUse   │  │ PreCompact   │  │ PostCompact  │      │
-│  │ entity capture│  │ inject       │  │ save summary │      │
+│  │ batch queue   │  │ inject       │  │ save summary │      │
 │  └──────┬────────┘  │ priorities   │  └──────┬───────┘      │
 │         │           └──────┬───────┘         │              │
 │  ┌──────┴───────┐          │          ┌──────┴───────┐      │
@@ -196,43 +171,32 @@ User prompt contains "remember that we use TypeScript strict"
 │  │past context  │          │          │ summarize    │      │
 │  └──────────────┘          │          └──────────────┘      │
 │                            │                                │
-│  MCP Server (stdio)        │   Health Monitor               │
-│  ┌─────────────────────┐   │   ┌────────────────────────┐   │
-│  │ memory_recall       │   │   │ sqlite, fts5, disk,    │   │
-│  │ memory_entities     │   │   │ integrity checks       │   │
-│  │ memory_session_notes│   │   └────────────────────────┘   │
-│  │ memory_store        │   │                                │
-│  │ memory_context_budget│  │   Smart Resource Loader        │
-│  │ memory_search  ←L1  │   │   ┌────────────────────────┐   │
-│  │ memory_timeline ←L2 │   │   │ track usage → predict  │   │
-│  │ memory_fetch   ←L3  │   │   │ → budget → recommend   │   │
-│  │ memory_health       │   │   └────────────────────────┘   │
-│  └─────────────────────┘   │                                │
-│                            │   Browser UI (:37888)          │
-│                            │   ┌────────────────────────┐   │
-│                            │   │ search, browse, stats  │   │
-│                            │   └────────────────────────┘   │
-│                            │                                │
-└────────────────────────────┼────────────────────────────────┘
+│  MCP Server (stdio, long-lived)                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ memory_recall        memory_search  (L1 index)      │    │
+│  │ memory_entities      memory_timeline (L2 context)   │    │
+│  │ memory_session_notes memory_fetch   (L3 full)       │    │
+│  │ memory_store         memory_context_budget           │    │
+│  │ memory_health                                        │    │
+│  │                                                      │    │
+│  │ L1 WorkingMemory: read-through cache over L2         │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Resource Intelligence    Browser UI (:37888)                │
+│  ┌──────────────────┐     ┌──────────────────┐              │
+│  │ scan → track →   │     │ search, browse,  │              │
+│  │ analyze overhead  │     │ stats, health    │              │
+│  └──────────────────┘     └──────────────────┘              │
+└──────────────────────────────────────────────────────────────┘
                              │
                    ┌─────────┴──────────┐
                    │   SQLite + FTS5    │
                    │   ~/.claude-       │
                    │   memory-hub/      │
-                   │   memory.db        │
                    │                    │
-                   │   sessions         │
-                   │   entities         │
-                   │   session_notes    │
-                   │   long_term_       │
-                   │    summaries       │
-                   │   resource_usage   │
-                   │   fts_memories     │
-                   │   tfidf_index      │
-                   │   embeddings       │
-                   │   claude_md_       │
-                   │    registry        │
-                   │   health_checks    │
+                   │   memory.db        │
+                   │   batch/queue.jsonl │
+                   │   logs/            │
                    └────────────────────┘
 ```
 
@@ -242,19 +206,20 @@ User prompt contains "remember that we use TypeScript strict"
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  L1: WorkingMemory          in-process Map          │
-│  Current session only       <1ms access             │
-│  Lives in MCP server        FIFO 50 entries/session │
+│  L1: WorkingMemory          Read-through cache      │
+│  Lives in MCP server        <1ms (cache hit)        │
+│  Backed by SessionStore     Auto-refresh on miss    │
+│  TTL: 5 minutes             Max 50 entries/session  │
 ├─────────────────────────────────────────────────────┤
 │  L2: SessionStore           SQLite                  │
 │  Entities + notes           <10ms access            │
-│  files_read, file_modified  Per-session scope       │
-│  errors, decisions          Importance scored       │
+│  files, errors, decisions   Per-session scope       │
+│  observations (14 patterns) Importance scored 1-5   │
 ├─────────────────────────────────────────────────────┤
 │  L3: LongTermStore          SQLite + FTS5 + TF-IDF │
 │  Cross-session summaries    <100ms access           │
 │  Hybrid ranked search       Persistent forever      │
-│  Auto-injected on start     3-layer progressive     │
+│  Semantic embeddings        3-layer progressive     │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -270,7 +235,7 @@ bunx claude-memory-hub install
 
 One command. Registers MCP server + 5 hooks globally. Works on CLI, VS Code, JetBrains.
 
-**Coming from claude-mem?** The installer auto-detects `~/.claude-mem/claude-mem.db` and migrates your data automatically. No manual steps needed.
+**Coming from claude-mem?** The installer auto-detects `~/.claude-mem/claude-mem.db` and migrates your data automatically.
 
 ### Update
 
@@ -278,23 +243,7 @@ One command. Registers MCP server + 5 hooks globally. Works on CLI, VS Code, Jet
 bunx claude-memory-hub@latest install
 ```
 
-Or if installed globally:
-
-```bash
-bun install -g claude-memory-hub@latest
-claude-memory-hub install
-```
-
 Your data at `~/.claude-memory-hub/` is preserved across updates. Schema migrations run automatically.
-
-### From source
-
-```bash
-git clone https://github.com/TranHoaiHung/claude-memory-hub.git ~/.claude-memory-hub
-cd ~/.claude-memory-hub
-bun install && bun run build:all
-bunx . install
-```
 
 ### All CLI commands
 
@@ -305,10 +254,10 @@ bunx claude-memory-hub status      # Check installation
 bunx claude-memory-hub migrate     # Import data from claude-mem
 bunx claude-memory-hub viewer      # Open browser UI at localhost:37888
 bunx claude-memory-hub health      # Run health diagnostics
-bunx claude-memory-hub reindex     # Rebuild TF-IDF search index
+bunx claude-memory-hub reindex     # Rebuild TF-IDF + embedding indexes
 bunx claude-memory-hub export      # Export data as JSONL to stdout
-bunx claude-memory-hub import      # Import JSONL from stdin
-bunx claude-memory-hub cleanup     # Remove old data (default: 90 days)
+bunx claude-memory-hub import      # Import JSONL from stdin (--dry-run)
+bunx claude-memory-hub cleanup     # Remove old data (--days N, default 90)
 ```
 
 ### Requirements
@@ -327,13 +276,13 @@ Claude can call these tools directly during conversation:
 
 | Tool | What it does | When to use |
 |------|-------------|-------------|
-| `memory_recall` | FTS5 search past session summaries | Starting a task, looking for prior work |
+| `memory_recall` | FTS5 search past sessions (supports `max_tokens`) | Starting a task, looking for prior work |
 | `memory_entities` | Find all sessions that touched a file | Before editing a file, understanding history |
-| `memory_session_notes` | Current session activity summary | Mid-session, checking what's been done |
+| `memory_session_notes` | Current session activity (L1 cache) | Mid-session, checking what's been done |
 | `memory_store` | Manually save a note or decision | Preserving important context |
-| `memory_context_budget` | Analyze token costs + recommendations | Optimizing which resources to load |
+| `memory_context_budget` | Analyze token costs + overhead report | Understanding resource usage |
 
-### 3-Layer Search (new in v0.5)
+### 3-Layer Search
 
 | Tool | Layer | Tokens/result | When to use |
 |------|-------|---------------|-------------|
@@ -345,7 +294,46 @@ Claude can call these tools directly during conversation:
 
 | Tool | What it does |
 |------|-------------|
-| `memory_health` | Check database, FTS5, disk, integrity status |
+| `memory_health` | Check database, FTS5, disk, embeddings, integrity status |
+
+---
+
+## Data Export/Import
+
+### Export
+
+```bash
+# Full export
+bunx claude-memory-hub export > backup.jsonl
+
+# Incremental (since timestamp)
+bunx claude-memory-hub export --since 1743580800000 > incremental.jsonl
+
+# Single table
+bunx claude-memory-hub export --table sessions > sessions.jsonl
+```
+
+### Import
+
+```bash
+# Import from file
+bunx claude-memory-hub import < backup.jsonl
+
+# Validate without writing
+bunx claude-memory-hub import --dry-run < backup.jsonl
+```
+
+### Cleanup
+
+```bash
+# Remove data older than 90 days (default)
+bunx claude-memory-hub cleanup
+
+# Custom retention
+bunx claude-memory-hub cleanup --days 30
+```
+
+Format: JSONL (one JSON object per line). Embedding BLOBs encoded as base64. Import uses UPSERT — safe to re-run.
 
 ---
 
@@ -366,19 +354,13 @@ Opens a dark-themed dashboard at `http://localhost:37888` with:
 
 ## Migrating from claude-mem
 
-If you're already using [claude-mem](https://github.com/nicobailey-llc/claude-mem), migration is seamless:
-
 ```bash
 # Automatic (during install)
 bunx claude-memory-hub install
-# → Detects ~/.claude-mem/claude-mem.db automatically
-# → Migrates sessions, observations, summaries
 
 # Manual
 bunx claude-memory-hub migrate
 ```
-
-### What gets migrated
 
 | claude-mem | → | memory-hub |
 |------------|---|------------|
@@ -397,13 +379,14 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | Version | What it solved |
 |---------|---------------|
 | **v0.1.0** | Cross-session memory, entity tracking, FTS5 search |
-| **v0.2.0** | Compact interceptor (PreCompact/PostCompact hooks), context enrichment, importance scoring |
+| **v0.2.0** | Compact interceptor (PreCompact/PostCompact), context enrichment, importance scoring |
 | **v0.3.0** | Removed API key requirement, 1-command install |
-| **v0.4.0** | Smart resource loading, token budget optimization |
+| **v0.4.0** | Resource usage tracking, token overhead analysis |
 | **v0.5.0** | Production hardening, hybrid search, 3-layer progressive search, browser UI, health monitoring, claude-mem migration |
-| **v0.6.0** | ResourceRegistry (170 resources), semantic search (384-dim embeddings), observation capture, CLAUDE.md tracking, 3-tier LLM summarization, overhead analysis |
+| **v0.6.0** | ResourceRegistry (170 resources), semantic search (384-dim embeddings), observation capture, CLAUDE.md tracking, 3-tier LLM summarization |
 | **v0.7.0** | Honest resource analysis, semantic search scaling, batch embeddings, 14 observation patterns, DB auto-cleanup, summarizer retry |
-| **v0.8.0** | 91 unit tests (was 0%), L1 WorkingMemory read-through cache, PostToolUse batch queue (75ms→3ms), JSONL export/import CLI, data cleanup command |
+| **v0.8.0** | 91 unit tests (was 0%), L1 read-through cache, PostToolUse batch queue (75ms→3ms), JSONL export/import, data cleanup CLI, CI/CD auto-publish |
+| **v0.8.1** | Token-budget-aware MCP tools (`max_tokens`), proactive mid-session memory retrieval (topic-shift detection), session-end batch flush |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
@@ -437,7 +420,11 @@ All data stored locally at `~/.claude-memory-hub/`.
 
 ```
 ~/.claude-memory-hub/
-  ├── memory.db         # SQLite database (sessions, entities, summaries)
+  ├── memory.db           # SQLite database (all memory data)
+  ├── batch/
+  │   └── queue.jsonl     # PostToolUse batch queue (auto-flushed)
+  ├── proactive/
+  │   └── <session>.json  # Topic tracking state (auto-cleaned)
   └── logs/
       └── memory-hub.log  # Structured JSON logs (auto-rotated at 5MB)
 ```

@@ -1833,6 +1833,132 @@ function isBatchEnabled() {
   return mode !== "disabled";
 }
 
+// src/retrieval/proactive-retrieval.ts
+import { existsSync as existsSync6, readFileSync as readFileSync4, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4 } from "fs";
+import { join as join6 } from "path";
+import { homedir as homedir5 } from "os";
+var log6 = createLogger("proactive-retrieval");
+var DATA_DIR2 = join6(homedir5(), ".claude-memory-hub");
+var PROACTIVE_DIR = join6(DATA_DIR2, "proactive");
+var TOOL_CALL_INTERVAL = 15;
+var MAX_INJECTION_CHARS = 1500;
+function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse) {
+  const state = loadState(sessionId);
+  state.toolCallCount++;
+  const filePath = extractFilePath(toolName, toolInput);
+  if (filePath) {
+    state.recentFiles = [...new Set([filePath, ...state.recentFiles])].slice(0, 20);
+  }
+  const shouldTrigger = state.toolCallCount % TOOL_CALL_INTERVAL === 0 || toolName === "Bash" && typeof toolResponse.exit_code === "number" && toolResponse.exit_code !== 0 && state.toolCallCount > 5;
+  if (!shouldTrigger) {
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const currentTopic = detectTopic(state.recentFiles);
+  if (!currentTopic || state.injectedTopics.includes(currentTopic)) {
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const ltStore = new LongTermStore;
+  const results = ltStore.search(currentTopic, 2);
+  if (results.length === 0) {
+    state.injectedTopics.push(currentTopic);
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const lines = [`**Relevant past context** (topic: ${currentTopic}):`];
+  for (const r of results) {
+    const date = new Date(r.created_at).toLocaleDateString();
+    lines.push(`- [${date}] ${r.summary.slice(0, 200)}`);
+    const files = safeJson4(r.files_touched, []);
+    if (files.length > 0)
+      lines.push(`  Files: ${files.slice(0, 3).join(", ")}`);
+  }
+  let context = lines.join(`
+`);
+  if (context.length > MAX_INJECTION_CHARS) {
+    context = context.slice(0, MAX_INJECTION_CHARS) + `
+[...truncated]`;
+  }
+  state.injectedTopics.push(currentTopic);
+  state.lastInjectionAt = Date.now();
+  saveState(sessionId, state);
+  log6.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
+  return { shouldInject: true, additionalContext: context };
+}
+function cleanupProactiveState(sessionId) {
+  const path = statePath(sessionId);
+  try {
+    if (existsSync6(path)) {
+      const { unlinkSync: unlinkSync2 } = __require("fs");
+      unlinkSync2(path);
+    }
+  } catch {}
+}
+function detectTopic(recentFiles) {
+  if (recentFiles.length < 3)
+    return null;
+  const dirs = recentFiles.map((f) => f.split("/").slice(0, -1).join("/")).filter(Boolean);
+  const dirCounts = new Map;
+  for (const d of dirs) {
+    const parts = d.split("/").filter(Boolean);
+    const leaf = parts[parts.length - 1];
+    if (leaf && leaf !== "src" && leaf !== "lib" && leaf !== "utils") {
+      dirCounts.set(leaf, (dirCounts.get(leaf) ?? 0) + 1);
+    }
+  }
+  let bestTopic = null;
+  let bestCount = 0;
+  for (const [topic, count] of dirCounts) {
+    if (count > bestCount) {
+      bestTopic = topic;
+      bestCount = count;
+    }
+  }
+  const fileNames = recentFiles.map((f) => f.split("/").pop() ?? "").filter(Boolean);
+  const keywords = ["auth", "payment", "user", "api", "database", "config", "test", "migration", "deploy", "search"];
+  for (const kw of keywords) {
+    const matches = fileNames.filter((f) => f.toLowerCase().includes(kw));
+    if (matches.length >= 2)
+      return kw;
+  }
+  return bestTopic;
+}
+function statePath(sessionId) {
+  return join6(PROACTIVE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+}
+function loadState(sessionId) {
+  const path = statePath(sessionId);
+  try {
+    if (existsSync6(path)) {
+      return JSON.parse(readFileSync4(path, "utf-8"));
+    }
+  } catch {}
+  return { toolCallCount: 0, lastInjectionAt: 0, injectedTopics: [], recentFiles: [] };
+}
+function saveState(sessionId, state) {
+  try {
+    if (!existsSync6(PROACTIVE_DIR)) {
+      mkdirSync4(PROACTIVE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync2(statePath(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+function extractFilePath(toolName, toolInput) {
+  if (toolName === "Read" || toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit") {
+    const fp = toolInput.file_path;
+    return typeof fp === "string" ? fp : undefined;
+  }
+  return;
+}
+function safeJson4(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
 // src/hooks-entry/post-tool-use.ts
 async function main() {
   if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
@@ -1871,9 +1997,18 @@ async function main() {
         timestamp: Date.now()
       });
       tryFlush();
-      return;
-    } catch {}
+    } catch {
+      await handlePostToolUse(hook, project);
+    }
+  } else {
+    await handlePostToolUse(hook, project);
   }
-  await handlePostToolUse(hook, project);
+  try {
+    const result = evaluateProactiveInjection(hook.session_id, hook.tool_name, hook.tool_input ?? {}, hook.tool_response ?? {});
+    if (result.shouldInject && result.additionalContext) {
+      process.stdout.write(JSON.stringify({ additionalContext: result.additionalContext }) + `
+`);
+    }
+  } catch {}
 }
 main().catch(() => {}).finally(() => process.exit(0));

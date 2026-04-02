@@ -5,6 +5,48 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.8.1] - 2026-04-02
+
+Token-budget-aware MCP tools + proactive mid-session memory retrieval.
+
+### Token Budget Management
+
+- **`max_tokens` parameter** — added to `memory_recall`, `memory_search`, `memory_fetch` MCP tools. When set, output is truncated to fit within the specified token budget (~4 chars/token). Helps Claude manage context window when many tools compete for space
+- **`truncateToTokenBudget()` utility** — shared truncation function with `[...truncated to fit ~N token budget]` suffix
+
+### Proactive Memory Retrieval
+
+- **Topic-shift detection** — PostToolUse hook now monitors file activity and detects when conversation drifts to a new domain (e.g., auth → payment → migration). Detection uses directory clustering + keyword matching across recent files
+- **Mid-session context injection** — when topic shift detected, hook searches L3 for relevant past context and returns `additionalContext` via stdout JSON. Claude Code injects this into the conversation automatically
+- **Trigger conditions:** every 15 tool calls OR on Bash errors after warmup (5+ calls)
+- **State tracking** — per-session state at `~/.claude-memory-hub/proactive/<session_id>.json`, cleaned up on session end
+- **Injection cap:** ~375 tokens (1500 chars) per injection, deduplicated by topic
+
+### Session End Improvements
+
+- **Batch queue flush on session end** — `tryFlush()` called during Stop hook to prevent data loss from unflushed batch events
+- **Proactive state cleanup** — per-session state files removed on session end
+
+### Research Findings (documented, no code changes needed)
+
+Based on deep Claude Code source analysis:
+- **Resource filtering:** Claude Code already defers MCP tools automatically via `isDeferredTool()`. Skill listings have budget system (`SKILL_BUDGET_CONTEXT_PERCENT=1%`). No external filtering needed
+- **Multi-agent sharing:** Subagents inherit parent MCP servers via `initializeAgentMcpServers()`. Memory sharing via `memory_recall` works out-of-box — zero implementation needed
+- **Permission-aware:** PostToolUse hook only fires for approved tools. Denied tools fire separate `PermissionDenied` hook. memory-hub is already permission-aware by design
+- **IDE context:** Available as attachments in conversation (ide_selection, ide_opened_file) but not in hook inputs directly. Entity extraction captures file activity indirectly
+
+### Modified Files
+
+```
+src/mcp/tool-definitions.ts           — max_tokens param on 3 tools
+src/mcp/tool-handlers.ts              — truncateToTokenBudget() utility
+src/retrieval/proactive-retrieval.ts   — NEW: topic detection + injection
+src/hooks-entry/post-tool-use.ts       — proactive retrieval integration
+src/hooks-entry/session-end.ts         — batch flush + proactive cleanup
+```
+
+---
+
 ## [0.8.0] - 2026-04-02
 
 Major release: test infrastructure, architectural fixes, hook performance, data portability.

@@ -15593,8 +15593,17 @@ function sanitizeFtsQuery2(query) {
 }
 
 // src/mcp/tool-handlers.ts
+function truncateToTokenBudget(text, maxTokens) {
+  if (!maxTokens || maxTokens <= 0)
+    return text;
+  const maxChars = maxTokens * 4;
+  if (text.length <= maxChars)
+    return text;
+  return text.slice(0, maxChars) + `
+[...truncated to fit ~` + maxTokens + " token budget]";
+}
 async function handleMemoryRecall(args) {
-  const { query, limit = 5 } = args;
+  const { query, limit = 5, max_tokens } = args;
   if (!query?.trim())
     return "No query provided.";
   const builder = new ContextBuilder;
@@ -15604,9 +15613,10 @@ async function handleMemoryRecall(args) {
 
 This appears to be a new topic with no prior history.`;
   }
-  return `Found ${ctx.resultCount} relevant memory(ies) (~${ctx.tokenEstimate} tokens):
+  const output = `Found ${ctx.resultCount} relevant memory(ies) (~${ctx.tokenEstimate} tokens):
 
 ${ctx.text}`;
+  return truncateToTokenBudget(output, max_tokens);
 }
 async function handleMemoryEntities(args) {
   const { file_path } = args;
@@ -15648,11 +15658,11 @@ async function handleMemoryStore(args) {
   return `Note saved to session ${session_id}.`;
 }
 async function handleMemorySearch(args) {
-  const { query, limit = 20, offset = 0, project } = args;
+  const { query, limit = 20, offset = 0, project, max_tokens } = args;
   if (!query?.trim())
     return "No query provided.";
   const results = await searchIndex(query, { limit: Math.min(limit, 50), offset, ...project ? { project } : {} });
-  return formatSearchIndex(results);
+  return truncateToTokenBudget(formatSearchIndex(results), max_tokens);
 }
 async function handleMemoryTimeline(args) {
   const { id, type, depth = 3 } = args;
@@ -15662,11 +15672,11 @@ async function handleMemoryTimeline(args) {
   return formatTimeline(entries);
 }
 async function handleMemoryFetch(args) {
-  const { ids } = args;
+  const { ids, max_tokens } = args;
   if (!ids?.length)
     return "No IDs provided.";
   const records = fetchFullRecords(ids.slice(0, 20));
-  return formatFullRecords(records);
+  return truncateToTokenBudget(formatFullRecords(records), max_tokens);
 }
 async function handleMemoryHealth() {
   const report = runHealthCheck();
@@ -15741,7 +15751,8 @@ var TOOL_DEFINITIONS = [
       type: "object",
       properties: {
         query: { type: "string", description: "Natural language search query" },
-        limit: { type: "number", description: "Max results (default 5, max 10)" }
+        limit: { type: "number", description: "Max results (default 5, max 10)" },
+        max_tokens: { type: "number", description: "Max output tokens. Results truncated to fit budget. Default: unlimited" }
       },
       required: ["query"]
     }
@@ -15800,7 +15811,8 @@ var TOOL_DEFINITIONS = [
         query: { type: "string", description: "Search query" },
         limit: { type: "number", description: "Max results (default 20)" },
         offset: { type: "number", description: "Pagination offset (default 0)" },
-        project: { type: "string", description: "Filter by project" }
+        project: { type: "string", description: "Filter by project" },
+        max_tokens: { type: "number", description: "Max output tokens. Results truncated to fit budget" }
       },
       required: ["query"]
     }
@@ -15835,7 +15847,8 @@ var TOOL_DEFINITIONS = [
             required: ["id", "type"]
           },
           description: "Array of {id, type} from search results"
-        }
+        },
+        max_tokens: { type: "number", description: "Max output tokens. Records truncated to fit budget" }
       },
       required: ["ids"]
     }

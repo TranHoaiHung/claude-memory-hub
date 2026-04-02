@@ -2021,6 +2021,250 @@ async function indexEmbedding(docType, docId, text, db) {
        created_at = excluded.created_at`, [docType, docId, blob, Date.now()]);
 }
 
+// src/retrieval/proactive-retrieval.ts
+import { existsSync as existsSync5, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3 } from "fs";
+import { join as join5 } from "path";
+import { homedir as homedir4 } from "os";
+var log9 = createLogger("proactive-retrieval");
+var DATA_DIR = join5(homedir4(), ".claude-memory-hub");
+var PROACTIVE_DIR = join5(DATA_DIR, "proactive");
+var TOOL_CALL_INTERVAL = 15;
+var MAX_INJECTION_CHARS = 1500;
+function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse) {
+  const state = loadState(sessionId);
+  state.toolCallCount++;
+  const filePath = extractFilePath(toolName, toolInput);
+  if (filePath) {
+    state.recentFiles = [...new Set([filePath, ...state.recentFiles])].slice(0, 20);
+  }
+  const shouldTrigger = state.toolCallCount % TOOL_CALL_INTERVAL === 0 || toolName === "Bash" && typeof toolResponse.exit_code === "number" && toolResponse.exit_code !== 0 && state.toolCallCount > 5;
+  if (!shouldTrigger) {
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const currentTopic = detectTopic(state.recentFiles);
+  if (!currentTopic || state.injectedTopics.includes(currentTopic)) {
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const ltStore = new LongTermStore;
+  const results = ltStore.search(currentTopic, 2);
+  if (results.length === 0) {
+    state.injectedTopics.push(currentTopic);
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const lines = [`**Relevant past context** (topic: ${currentTopic}):`];
+  for (const r of results) {
+    const date = new Date(r.created_at).toLocaleDateString();
+    lines.push(`- [${date}] ${r.summary.slice(0, 200)}`);
+    const files = safeJson4(r.files_touched, []);
+    if (files.length > 0)
+      lines.push(`  Files: ${files.slice(0, 3).join(", ")}`);
+  }
+  let context = lines.join(`
+`);
+  if (context.length > MAX_INJECTION_CHARS) {
+    context = context.slice(0, MAX_INJECTION_CHARS) + `
+[...truncated]`;
+  }
+  state.injectedTopics.push(currentTopic);
+  state.lastInjectionAt = Date.now();
+  saveState(sessionId, state);
+  log9.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
+  return { shouldInject: true, additionalContext: context };
+}
+function cleanupProactiveState(sessionId) {
+  const path = statePath(sessionId);
+  try {
+    if (existsSync5(path)) {
+      const { unlinkSync } = __require("fs");
+      unlinkSync(path);
+    }
+  } catch {}
+}
+function detectTopic(recentFiles) {
+  if (recentFiles.length < 3)
+    return null;
+  const dirs = recentFiles.map((f) => f.split("/").slice(0, -1).join("/")).filter(Boolean);
+  const dirCounts = new Map;
+  for (const d of dirs) {
+    const parts = d.split("/").filter(Boolean);
+    const leaf = parts[parts.length - 1];
+    if (leaf && leaf !== "src" && leaf !== "lib" && leaf !== "utils") {
+      dirCounts.set(leaf, (dirCounts.get(leaf) ?? 0) + 1);
+    }
+  }
+  let bestTopic = null;
+  let bestCount = 0;
+  for (const [topic, count] of dirCounts) {
+    if (count > bestCount) {
+      bestTopic = topic;
+      bestCount = count;
+    }
+  }
+  const fileNames = recentFiles.map((f) => f.split("/").pop() ?? "").filter(Boolean);
+  const keywords = ["auth", "payment", "user", "api", "database", "config", "test", "migration", "deploy", "search"];
+  for (const kw of keywords) {
+    const matches = fileNames.filter((f) => f.toLowerCase().includes(kw));
+    if (matches.length >= 2)
+      return kw;
+  }
+  return bestTopic;
+}
+function statePath(sessionId) {
+  return join5(PROACTIVE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+}
+function loadState(sessionId) {
+  const path = statePath(sessionId);
+  try {
+    if (existsSync5(path)) {
+      return JSON.parse(readFileSync3(path, "utf-8"));
+    }
+  } catch {}
+  return { toolCallCount: 0, lastInjectionAt: 0, injectedTopics: [], recentFiles: [] };
+}
+function saveState(sessionId, state) {
+  try {
+    if (!existsSync5(PROACTIVE_DIR)) {
+      mkdirSync3(PROACTIVE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+function extractFilePath(toolName, toolInput) {
+  if (toolName === "Read" || toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit") {
+    const fp = toolInput.file_path;
+    return typeof fp === "string" ? fp : undefined;
+  }
+  return;
+}
+function safeJson4(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+// src/capture/batch-queue.ts
+import { existsSync as existsSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync2 } from "fs";
+import { join as join6 } from "path";
+import { homedir as homedir5 } from "os";
+var log10 = createLogger("batch-queue");
+var DATA_DIR2 = join6(homedir5(), ".claude-memory-hub");
+var BATCH_DIR = join6(DATA_DIR2, "batch");
+var QUEUE_PATH = join6(BATCH_DIR, "queue.jsonl");
+var LOCK_PATH = join6(BATCH_DIR, "queue.lock");
+var MAX_QUEUE_SIZE = 100 * 1024;
+var LOCK_STALE_MS = 30000;
+function enqueueEvent(event) {
+  try {
+    ensureBatchDir();
+    const line = JSON.stringify(event) + `
+`;
+    appendFileSync2(QUEUE_PATH, line, "utf-8");
+  } catch (err) {
+    log10.error("enqueue failed", { error: String(err) });
+    throw err;
+  }
+}
+function tryFlush() {
+  try {
+    if (!existsSync6(QUEUE_PATH))
+      return false;
+    const stat = statSync2(QUEUE_PATH);
+    if (stat.size === 0)
+      return false;
+    if (!tryAcquireLock())
+      return false;
+    try {
+      flushQueue();
+      return true;
+    } finally {
+      releaseLock();
+    }
+  } catch (err) {
+    log10.error("flush failed", { error: String(err) });
+    return false;
+  }
+}
+function flushQueue() {
+  const content = readFileSync4(QUEUE_PATH, "utf-8").trim();
+  if (!content)
+    return;
+  const events = [];
+  for (const line of content.split(`
+`)) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      log10.warn("skipping malformed queue line");
+    }
+  }
+  if (events.length === 0)
+    return;
+  const store = new SessionStore;
+  const tracker = new ResourceTracker;
+  const registry = getResourceRegistry();
+  const db = store["db"];
+  db.transaction(() => {
+    for (const event of events) {
+      store.upsertSession({
+        id: event.session.id,
+        project: event.session.project,
+        started_at: event.session.started_at,
+        status: "active"
+      });
+      for (const entity of event.entities) {
+        store.insertEntity({ ...entity, project: event.session.project });
+      }
+      if (event.resources) {
+        for (const r of event.resources) {
+          const resource = registry.resolve(r.type, r.name);
+          tracker.trackUsage(event.session.id, event.session.project, r.type, r.name, r.tokenCost ?? resource?.full_tokens ?? 0);
+        }
+      }
+    }
+  })();
+  writeFileSync2(QUEUE_PATH, "", "utf-8");
+  log10.info("batch flushed", { events: events.length });
+}
+function tryAcquireLock() {
+  try {
+    if (existsSync6(LOCK_PATH)) {
+      const lockContent = readFileSync4(LOCK_PATH, "utf-8").trim();
+      const [pidStr, timestampStr] = lockContent.split(":");
+      const lockTime = Number(timestampStr);
+      if (Date.now() - lockTime < LOCK_STALE_MS) {
+        const pid = Number(pidStr);
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch {}
+      }
+    }
+    writeFileSync2(LOCK_PATH, `${process.pid}:${Date.now()}`, "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+function releaseLock() {
+  try {
+    unlinkSync(LOCK_PATH);
+  } catch {}
+}
+function ensureBatchDir() {
+  if (!existsSync6(BATCH_DIR)) {
+    mkdirSync4(BATCH_DIR, { recursive: true, mode: 448 });
+  }
+}
+function isBatchEnabled() {
+  const mode = process.env["CLAUDE_MEMORY_HUB_BATCH"] ?? "auto";
+  return mode !== "disabled";
+}
+
 // src/hooks-entry/session-end.ts
 async function main() {
   if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
@@ -2036,6 +2280,10 @@ async function main() {
   }
   const project = projectFromCwd(hook.cwd ?? process.env["CLAUDE_CWD"] ?? process.cwd());
   await handleSessionEnd(hook, project);
+  try {
+    tryFlush();
+  } catch {}
+  cleanupProactiveState(hook.session_id);
   const store = new SessionStore;
   if (store.getSession(hook.session_id)) {
     await new SessionSummarizer().summarize(hook.session_id, project).catch(() => {});
