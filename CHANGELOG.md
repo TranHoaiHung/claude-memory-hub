@@ -5,6 +5,82 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.11.0] - 2026-04-03
+
+Privacy-first memory, smarter search, and slash commands. Three features the community asked for most.
+
+### New Feature: Privacy Protection (3-layer)
+
+- **`<private>` tag stripping** — wrap sensitive content in `<private>API_KEY=sk-xxx</private>` and it's replaced with `[REDACTED]` before reaching the database. Works across all capture points: entity extraction, observations, user prompts, transcript parsing
+- **Auto secret detection** — built-in regex patterns catch API keys (`sk-`, `ghp_`, `gho_`, `AKIA`), Bearer tokens, passwords, private key blocks, and hex/base64 secrets. Keeps first 12 chars for identification, redacts the rest
+- **Path-based filtering** — files matching `.env`, `.env.*`, `*.pem`, `*.key`, `*.p12`, `credentials.*`, `**/secrets/**`, `**/private/**` are completely excluded from entity tracking. No file_read/file_modified entities created for these paths
+- **Custom configuration** — create `~/.claude-memory-hub/privacy.json` to add your own ignored paths and regex patterns. Custom rules are added to defaults, not replacing them
+- **New file: `src/capture/privacy-filter.ts`** — self-contained privacy engine with `sanitize()` and `isIgnoredPath()` APIs. Called at every capture point. <1ms overhead (regex-only, no I/O)
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `src/capture/privacy-filter.ts` | **New** — 3-layer privacy engine (230 LOC) |
+| `src/capture/entity-extractor.ts` | `isIgnoredPath()` on file entities + `sanitize()` on all values/context |
+| `src/capture/observation-extractor.ts` | `sanitize()` input before heuristic matching |
+| `src/capture/hook-handler.ts` | `sanitize()` user prompts before saving to messages table |
+| `src/capture/transcript-parser.ts` | `sanitize()` all messages before returning |
+
+### New Feature: Enhanced Semantic Search
+
+- **Code-aware tokenizer** — TF-IDF tokenizer now splits camelCase (`getUserName` → `get`, `user`, `name`), snake_case (`user_auth_service` → `user`, `auth`, `service` + full compound), and file paths (`/src/hooks/auth.ts` → `src`, `hooks`, `auth`, `ts`). Dramatically improves search for code-heavy memory content
+- **Expanded stop words (100+)** — added code keywords (`const`, `let`, `var`, `function`, `return`, `class`, `import`, `export`, `async`, `await`, etc.) and CLI noise words (`file`, `line`, `error`, `warning`, `info`, `debug`, `log`). Reduces false matches on high-frequency, low-signal terms
+- **Recency decay** — search results from recent sessions are boosted: <7 days = 1.5x, <30 days = 1.2x, 30-90 days = 1.0x, >90 days = 0.8x. Yesterday's work ranks higher than last quarter's
+- **RRF multi-source fusion** — results found by 2+ search engines (FTS5, TF-IDF, semantic) get a boost: 2 engines = 1.2x, 3 engines = 1.4x. Cross-validated results are more likely relevant
+- **Score combination** — deduplication now properly combines scores across engines instead of just keeping max. RRF + recency + multi-source = significantly better ranking
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `src/search/vector-search.ts` | Code-aware tokenizer, 100+ stop words, `tokenize()` now exported |
+| `src/search/search-workflow.ts` | RRF fusion, recency decay, multi-source boost in `searchIndex()` |
+
+### New Feature: Slash Commands
+
+- **`/mem-search <query>`** — 3-layer progressive memory search. Guides Claude through the index → timeline → fetch workflow automatically
+- **`/mem-status [project]`** — runs health check + token budget analysis + current session activity in one command
+- **`/mem-save <note>`** — saves an important decision or finding to persistent memory via `memory_store`
+- **Auto-install** — commands are copied to `~/.claude/commands/` during `bunx claude-memory-hub install` and removed on `uninstall`
+- **Improved MCP tool descriptions** — all 10 tool descriptions rewritten with AUTO-USE hints, workflow guidance, and clearer parameter docs. `memory_recall` and `memory_entities` now suggest proactive usage
+
+#### Files changed
+
+| File | Change |
+|------|--------|
+| `commands/mem-search.md` | **New** — `/mem-search` slash command |
+| `commands/mem-status.md` | **New** — `/mem-status` slash command |
+| `commands/mem-save.md` | **New** — `/mem-save` slash command |
+| `src/cli/main.ts` | `installCommands()` + `uninstallCommands()` + install output updated |
+| `src/mcp/tool-definitions.ts` | All 10 tool descriptions rewritten with AUTO-USE and workflow hints |
+
+### Before vs After
+
+```
+Before (0.10.x):
+  Privacy:  None — API keys, tokens, passwords stored in plain text
+  Search:   "getUserName" only matches exact term; 3-month-old results rank same as today's
+  Commands: None — must know MCP tool names and call manually
+
+After (0.11.0):
+  Privacy:  <private> tags + auto-detect sk-/ghp_/Bearer/AKIA + .env/.pem excluded
+  Search:   "getUserName" matches "get", "user", "name"; today's work ranks 1.5x higher
+  Commands: /mem-search, /mem-status, /mem-save — Claude knows the workflow
+```
+
+### Documentation
+
+- **README.md** — added Privacy Protection section, Slash Commands section, updated comparison table (4 new rows), updated Data & Privacy section, updated Version History
+- **CLAUDE.md** — added `privacy-filter.ts` to project structure, updated search descriptions, added 4 new key patterns
+
+---
+
 ## [0.10.0] - 2026-04-03
 
 Full conversation capture — memory-hub now remembers what you said AND what Claude said.
