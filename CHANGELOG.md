@@ -5,6 +5,61 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.10.0] - 2026-04-03
+
+Full conversation capture — memory-hub now remembers what you said AND what Claude said.
+
+### New Feature: Conversation Capture
+
+- **All user prompts saved** — every `UserPromptSubmit` hook now inserts the user's message into a new `messages` table (up to 2000 chars each). Previously only the first prompt was stored in `sessions.user_prompt` (500 chars)
+- **Transcript parsing at session-end** — when session ends, the Stop hook reads Claude Code's JSONL transcript file (`transcript_path`) and extracts all user + assistant text messages. Tool blocks (tool_use/tool_result) are skipped since they're already captured as entities. Streaming parser handles files up to 10MB safely
+- **`messages` table + FTS5 search** — new schema v5 migration adds `messages` table with full-text search index. Supports deduplication by UUID, conversation chain tracking via `parent_uuid`, and role-based filtering
+- **`memory_conversation` MCP tool** — new tool to retrieve or search conversation history for any session. Supports: get all messages, filter by role, full-text search across all conversations
+
+### Enriched Summaries
+
+- **Conversation digest in summaries** — session summarizer (both Tier 2 CLI and Tier 3 rule-based) now includes a digest of user requests from the `messages` table. Summaries now show "User requests (3): [1] fix login bug; [2] add dark mode; [3] deploy to prod" instead of just the first prompt
+- **Search across conversations** — `searchMessages()` provides FTS5 search across all stored messages with LIKE fallback
+
+### Data Flow
+
+```
+Session Start:
+  UserPromptSubmit → save user prompt to messages table (real-time)
+
+Mid-Session:
+  UserPromptSubmit → save each subsequent prompt (real-time)
+  PostToolUse → capture entities as before
+
+Session End (Stop hook):
+  1. Parse transcript_path JSONL → extract user + assistant messages
+  2. Bulk insert to messages table (dedup by UUID)
+  3. Summarize with conversation digest
+  4. Generate embeddings
+```
+
+### Database
+
+- **Schema v5** — new `messages` table, `fts_messages` FTS5 virtual table, auto-sync triggers
+- **Migration**: automatic on first use after upgrade
+
+### Before vs After
+
+```
+Before (0.9.x):
+  Stored: first user prompt (500 chars) + file/error/decision entities
+  Missing: subsequent prompts, ALL assistant responses
+  Summary: "Task: fix login. Files: auth.ts."
+
+After (0.10.0):
+  Stored: ALL user prompts + ALL assistant responses + entities
+  Summary: "User requests (3): fix login bug; add dark mode; deploy.
+           Files: auth.ts, theme.ts. Decisions: JWT refresh, CSS vars."
+  Searchable: "authentication login" → finds matching conversations
+```
+
+---
+
 ## [0.9.6] - 2026-04-03
 
 Richer session capture — Agent results, higher limits, cleaner summaries.

@@ -6690,6 +6690,49 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
     log.info("Migration v4 complete");
   }
+  if (currentVersion < 5) {
+    log.info("Applying migration v5: messages table for conversation capture");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        project       TEXT NOT NULL,
+        role          TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        content       TEXT NOT NULL,
+        prompt_number INTEGER NOT NULL DEFAULT 0,
+        timestamp     INTEGER NOT NULL,
+        uuid          TEXT,
+        parent_uuid   TEXT
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, prompt_number)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_role    ON messages(session_id, role)`);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uuid ON messages(uuid) WHERE uuid IS NOT NULL`);
+    db.run(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+        session_id UNINDEXED,
+        role,
+        content,
+        tokenize = 'porter unicode61'
+      )
+    `);
+    db.run(`
+      CREATE TRIGGER IF NOT EXISTS fts_messages_insert
+        AFTER INSERT ON messages BEGIN
+          INSERT INTO fts_messages(rowid, session_id, role, content)
+          VALUES (new.id, new.session_id, new.role, new.content);
+        END
+    `);
+    db.run(`
+      CREATE TRIGGER IF NOT EXISTS fts_messages_delete
+        AFTER DELETE ON messages BEGIN
+          INSERT INTO fts_messages(fts_messages, rowid, session_id, role, content)
+          VALUES ('delete', old.id, old.session_id, old.role, old.content);
+        END
+    `);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
+    log.info("Migration v5 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -14187,6 +14230,68 @@ class SessionStore {
   getSessionNotes(session_id) {
     return this.db.query("SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
   }
+  insertMessage(msg) {
+    if (msg.uuid) {
+      const existing = this.db.query("SELECT COUNT(*) as c FROM messages WHERE uuid = ?").get(msg.uuid);
+      if (existing && existing.c > 0)
+        return -1;
+    }
+    const result = this.db.run(`INSERT INTO messages(session_id, project, role, content, prompt_number, timestamp, uuid, parent_uuid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
+      msg.session_id,
+      msg.project,
+      msg.role,
+      msg.content,
+      msg.prompt_number,
+      msg.timestamp,
+      msg.uuid ?? null,
+      msg.parent_uuid ?? null
+    ]);
+    return Number(result.lastInsertRowid);
+  }
+  insertMessages(msgs) {
+    let count = 0;
+    const db = this.db;
+    db.transaction(() => {
+      for (const msg of msgs) {
+        const id = this.insertMessage(msg);
+        if (id !== -1)
+          count++;
+      }
+    })();
+    return count;
+  }
+  getSessionMessages(session_id, role) {
+    if (role) {
+      return this.db.query("SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id, role);
+    }
+    return this.db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id);
+  }
+  getMessageCount(session_id, role) {
+    if (role) {
+      const row2 = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ? AND role = ?").get(session_id, role);
+      return row2?.c ?? 0;
+    }
+    const row = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ?").get(session_id);
+    return row?.c ?? 0;
+  }
+  searchMessages(query, limit = 10) {
+    if (!query.trim())
+      return [];
+    const words = query.trim().split(/\s+/).filter((w) => w.length > 1).map((w) => `"${w.replace(/["*^()]/g, "")}"`);
+    if (words.length === 0)
+      return [];
+    const ftsQuery = words.join(" ");
+    try {
+      return this.db.query(`SELECT m.*, rank FROM fts_messages
+           JOIN messages m ON m.id = fts_messages.rowid
+           WHERE fts_messages MATCH ?
+           ORDER BY rank LIMIT ?`).all(ftsQuery, limit);
+    } catch {
+      const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
+      return this.db.query("SELECT * FROM messages WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?").all(pattern, limit);
+    }
+  }
 }
 
 // src/db/long-term-store.ts
@@ -15751,6 +15856,42 @@ async function handleMemoryContextBudget(args) {
   return lines.join(`
 `);
 }
+async function handleMemoryConversation(args) {
+  const store = new SessionStore;
+  const limit = Math.min(args.limit ?? 50, 200);
+  if (args.search) {
+    const results = store.searchMessages(args.search, limit);
+    if (results.length === 0)
+      return "No messages matching query.";
+    const lines2 = [`## Conversation Search: "${args.search}" (${results.length} results)`];
+    for (const m of results) {
+      const date4 = new Date(m.timestamp).toISOString().slice(0, 19);
+      const tag = m.role === "user" ? "\uD83D\uDC64" : "\uD83E\uDD16";
+      lines2.push(`
+${tag} [${date4}] **${m.role}** (session: ${m.session_id.slice(0, 8)})`);
+      lines2.push(m.content.slice(0, 500));
+    }
+    return lines2.join(`
+`);
+  }
+  const messages = store.getSessionMessages(args.session_id, args.role);
+  if (messages.length === 0) {
+    return `No conversation messages found for session ${args.session_id.slice(0, 8)}. ` + "Messages are captured at session end from transcript.";
+  }
+  const shown = messages.slice(0, limit);
+  const lines = [
+    `## Conversation (${shown.length}/${messages.length} messages, session ${args.session_id.slice(0, 8)})`
+  ];
+  for (const m of shown) {
+    const date4 = new Date(m.timestamp).toISOString().slice(0, 19);
+    const tag = m.role === "user" ? "\uD83D\uDC64" : "\uD83E\uDD16";
+    lines.push(`
+${tag} [${date4}] **${m.role}** #${m.prompt_number}`);
+    lines.push(m.content.slice(0, 1000));
+  }
+  return lines.join(`
+`);
+}
 
 // src/mcp/tool-definitions.ts
 var TOOL_DEFINITIONS = [
@@ -15864,6 +16005,20 @@ var TOOL_DEFINITIONS = [
     }
   },
   {
+    name: "memory_conversation",
+    description: "Retrieve full conversation flow (user + assistant messages) for a session. " + "Returns chronological messages with role, content, and timestamps. " + "Use to understand what was discussed, what the user asked, and how the assistant responded.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID to retrieve conversation for" },
+        role: { type: "string", enum: ["user", "assistant"], description: "Filter by role (optional)" },
+        limit: { type: "number", description: "Max messages to return (default 50)" },
+        search: { type: "string", description: "Search within conversation messages (optional)" }
+      },
+      required: ["session_id"]
+    }
+  },
+  {
     name: "memory_health",
     description: "Run health check on memory-hub: database, FTS5, disk, integrity.",
     inputSchema: {
@@ -15891,6 +16046,8 @@ async function dispatchTool(name, args) {
         return await handleMemoryTimeline(args);
       case "memory_fetch":
         return await handleMemoryFetch(args);
+      case "memory_conversation":
+        return await handleMemoryConversation(args);
       case "memory_health":
         return await handleMemoryHealth();
       default:

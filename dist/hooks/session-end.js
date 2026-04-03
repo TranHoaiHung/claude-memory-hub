@@ -337,6 +337,49 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
     log.info("Migration v4 complete");
   }
+  if (currentVersion < 5) {
+    log.info("Applying migration v5: messages table for conversation capture");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        project       TEXT NOT NULL,
+        role          TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        content       TEXT NOT NULL,
+        prompt_number INTEGER NOT NULL DEFAULT 0,
+        timestamp     INTEGER NOT NULL,
+        uuid          TEXT,
+        parent_uuid   TEXT
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, prompt_number)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_role    ON messages(session_id, role)`);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uuid ON messages(uuid) WHERE uuid IS NOT NULL`);
+    db.run(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+        session_id UNINDEXED,
+        role,
+        content,
+        tokenize = 'porter unicode61'
+      )
+    `);
+    db.run(`
+      CREATE TRIGGER IF NOT EXISTS fts_messages_insert
+        AFTER INSERT ON messages BEGIN
+          INSERT INTO fts_messages(rowid, session_id, role, content)
+          VALUES (new.id, new.session_id, new.role, new.content);
+        END
+    `);
+    db.run(`
+      CREATE TRIGGER IF NOT EXISTS fts_messages_delete
+        AFTER DELETE ON messages BEGIN
+          INSERT INTO fts_messages(fts_messages, rowid, session_id, role, content)
+          VALUES ('delete', old.id, old.session_id, old.role, old.content);
+        END
+    `);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
+    log.info("Migration v5 complete");
+  }
 }
 var _db = null;
 function getDatabase() {
@@ -422,6 +465,68 @@ class SessionStore {
   }
   getSessionNotes(session_id) {
     return this.db.query("SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
+  }
+  insertMessage(msg) {
+    if (msg.uuid) {
+      const existing = this.db.query("SELECT COUNT(*) as c FROM messages WHERE uuid = ?").get(msg.uuid);
+      if (existing && existing.c > 0)
+        return -1;
+    }
+    const result = this.db.run(`INSERT INTO messages(session_id, project, role, content, prompt_number, timestamp, uuid, parent_uuid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
+      msg.session_id,
+      msg.project,
+      msg.role,
+      msg.content,
+      msg.prompt_number,
+      msg.timestamp,
+      msg.uuid ?? null,
+      msg.parent_uuid ?? null
+    ]);
+    return Number(result.lastInsertRowid);
+  }
+  insertMessages(msgs) {
+    let count = 0;
+    const db = this.db;
+    db.transaction(() => {
+      for (const msg of msgs) {
+        const id = this.insertMessage(msg);
+        if (id !== -1)
+          count++;
+      }
+    })();
+    return count;
+  }
+  getSessionMessages(session_id, role) {
+    if (role) {
+      return this.db.query("SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id, role);
+    }
+    return this.db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id);
+  }
+  getMessageCount(session_id, role) {
+    if (role) {
+      const row2 = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ? AND role = ?").get(session_id, role);
+      return row2?.c ?? 0;
+    }
+    const row = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ?").get(session_id);
+    return row?.c ?? 0;
+  }
+  searchMessages(query, limit = 10) {
+    if (!query.trim())
+      return [];
+    const words = query.trim().split(/\s+/).filter((w) => w.length > 1).map((w) => `"${w.replace(/["*^()]/g, "")}"`);
+    if (words.length === 0)
+      return [];
+    const ftsQuery = words.join(" ");
+    try {
+      return this.db.query(`SELECT m.*, rank FROM fts_messages
+           JOIN messages m ON m.id = fts_messages.rowid
+           WHERE fts_messages MATCH ?
+           ORDER BY rank LIMIT ?`).all(ftsQuery, limit);
+    } catch {
+      const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
+      return this.db.query("SELECT * FROM messages WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?").all(pattern, limit);
+    }
   }
 }
 
@@ -1694,6 +1799,18 @@ async function handleUserPromptSubmit(hook, project) {
     user_prompt: cleanPrompt.slice(0, 500) || hook.prompt.slice(0, 500),
     status: "active"
   });
+  const promptText = cleanPrompt || hook.prompt;
+  if (promptText.length > 5) {
+    const promptNum = store.getMessageCount(hook.session_id, "user");
+    store.insertMessage({
+      session_id: hook.session_id,
+      project,
+      role: "user",
+      content: promptText.slice(0, 2000),
+      prompt_number: promptNum,
+      timestamp: Date.now()
+    });
+  }
   const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
@@ -1800,14 +1917,112 @@ function projectFromCwd(cwd) {
   return basename3(cwd);
 }
 
-// src/summarizer/summarizer-prompts.ts
+// src/capture/transcript-parser.ts
+import { createReadStream, existsSync as existsSync5, statSync as statSync2 } from "fs";
+import { createInterface } from "readline";
+var log5 = createLogger("transcript-parser");
+var MAX_FILE_SIZE = 10 * 1024 * 1024;
+var MAX_MESSAGES = 200;
+var MAX_CONTENT_LENGTH = 2000;
+async function parseTranscript(transcriptPath, sessionId, project) {
+  if (!transcriptPath || !existsSync5(transcriptPath)) {
+    log5.info("Transcript not found, skipping", { path: transcriptPath });
+    return [];
+  }
+  try {
+    const stat = statSync2(transcriptPath);
+    if (stat.size > MAX_FILE_SIZE) {
+      log5.warn("Transcript too large, skipping", { size: stat.size, max: MAX_FILE_SIZE });
+      return [];
+    }
+  } catch {
+    return [];
+  }
+  const messages = [];
+  let promptNumber = 0;
+  try {
+    const rl = createInterface({
+      input: createReadStream(transcriptPath, { encoding: "utf-8" }),
+      crlfDelay: Infinity
+    });
+    for await (const line of rl) {
+      if (messages.length >= MAX_MESSAGES)
+        break;
+      if (!line.trim())
+        continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry.type !== "user" && entry.type !== "assistant")
+        continue;
+      if (!entry.message)
+        continue;
+      const role = entry.type;
+      const content = extractTextContent(entry.message.content);
+      if (!content || content.length < 3)
+        continue;
+      if (role === "user" && messages.length > 0)
+        promptNumber++;
+      const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+      const msg = {
+        session_id: sessionId,
+        project,
+        role,
+        content: content.slice(0, MAX_CONTENT_LENGTH),
+        prompt_number: promptNumber,
+        timestamp
+      };
+      if (entry.uuid)
+        msg.uuid = entry.uuid;
+      if (entry.parentUuid)
+        msg.parent_uuid = entry.parentUuid;
+      messages.push(msg);
+    }
+  } catch (err) {
+    log5.error("Transcript parse failed", { error: String(err) });
+    return [];
+  }
+  log5.info("Transcript parsed", {
+    path: transcriptPath,
+    total: messages.length,
+    user: messages.filter((m) => m.role === "user").length,
+    assistant: messages.filter((m) => m.role === "assistant").length
+  });
+  return messages;
+}
+function extractTextContent(content) {
+  if (!content)
+    return;
+  if (typeof content === "string") {
+    return stripNoiseTags(content);
+  }
+  if (!Array.isArray(content))
+    return;
+  const textParts = [];
+  for (const block of content) {
+    if (block.type === "text" && block.text) {
+      textParts.push(block.text);
+    }
+  }
+  const joined = textParts.join(`
+`).trim();
+  return joined ? stripNoiseTags(joined) : undefined;
+}
 function stripNoiseTags(text) {
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]*>[\s\S]*?<\/local-command-[\w-]*>\s*/g, "").replace(/<command-[\w-]*>[\s\S]*?<\/command-[\w-]*>\s*/g, "").trim();
+}
+
+// src/summarizer/summarizer-prompts.ts
+function stripNoiseTags2(text) {
   return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").trim();
 }
 function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   const parts = [];
   if (session.user_prompt) {
-    const cleanPrompt = stripNoiseTags(session.user_prompt);
+    const cleanPrompt = stripNoiseTags2(session.user_prompt);
     if (cleanPrompt) {
       parts.push(`Task: ${cleanPrompt.slice(0, 500)}.`);
     }
@@ -1838,7 +2053,7 @@ function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
 }
 
 // src/summarizer/cli-summarizer.ts
-var log5 = createLogger("cli-summarizer");
+var log6 = createLogger("cli-summarizer");
 var MAX_PROMPT_CHARS = 6000;
 var MAX_OUTPUT_CHARS = 2000;
 var DEFAULT_TIMEOUT_MS = 30000;
@@ -1897,7 +2112,7 @@ async function tryCliSummary(ctx, timeoutMs) {
   const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
   const timeout = timeoutMs ?? envTimeout;
   if (!isClaudeCliAvailable()) {
-    log5.info("claude CLI not found, skipping Tier 2");
+    log6.info("claude CLI not found, skipping Tier 2");
     return;
   }
   const prompt = buildCliPrompt(ctx);
@@ -1908,7 +2123,7 @@ async function tryCliSummary(ctx, timeoutMs) {
     if (attempt < MAX_RETRIES)
       await new Promise((r) => setTimeout(r, 1000));
   }
-  log5.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
+  log6.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
   return;
 }
 async function attemptCliCall(prompt, timeout, attempt) {
@@ -1934,12 +2149,12 @@ async function attemptCliCall(prompt, timeout, attempt) {
       const output = await new Response(proc.stdout).text();
       const exitCode = await proc.exited;
       if (exitCode !== 0) {
-        log5.warn("claude CLI exited with non-zero", { exitCode, attempt });
+        log6.warn("claude CLI exited with non-zero", { exitCode, attempt });
         return;
       }
       const text = output.trim();
       if (!text || text.length < 10) {
-        log5.warn("claude CLI returned empty or too short output", { attempt });
+        log6.warn("claude CLI returned empty or too short output", { attempt });
         return;
       }
       const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
@@ -1947,19 +2162,19 @@ async function attemptCliCall(prompt, timeout, attempt) {
     })();
     const result = await Promise.race([outputPromise, timeoutPromise]);
     if (result) {
-      log5.info("Tier 2 CLI summary generated", { length: result.length, attempt });
+      log6.info("Tier 2 CLI summary generated", { length: result.length, attempt });
     } else {
-      log5.warn("Tier 2 CLI attempt failed or timed out", { attempt });
+      log6.warn("Tier 2 CLI attempt failed or timed out", { attempt });
     }
     return result;
   } catch (err) {
-    log5.error("Tier 2 CLI attempt error", { error: String(err), attempt });
+    log6.error("Tier 2 CLI attempt error", { error: String(err), attempt });
     return;
   }
 }
 
 // src/summarizer/session-summarizer.ts
-var log6 = createLogger("session-summarizer");
+var log7 = createLogger("session-summarizer");
 
 class SessionSummarizer {
   sessionStore;
@@ -1979,11 +2194,14 @@ class SessionSummarizer {
     const decisions = this.sessionStore.getSessionDecisions(session_id);
     const observations = this.sessionStore.getSessionObservations(session_id);
     const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
-    if (files.length === 0 && errors.length === 0 && notes.length === 0)
+    const messages = this.sessionStore.getSessionMessages(session_id);
+    if (files.length === 0 && errors.length === 0 && notes.length === 0 && messages.length === 0)
       return;
     const hasModified = this.sessionStore.hasModifiedFiles(session_id);
-    if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0)
+    if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && messages.length === 0)
       return;
+    const userPrompts = messages.filter((m) => m.role === "user").slice(0, 10).map((m, i) => `[${i + 1}] ${m.content.slice(0, 150)}`);
+    const conversationDigest = userPrompts.length > 0 ? `User requests (${userPrompts.length}): ${userPrompts.join("; ")}` : "";
     const obsValues = observations.slice(0, 8).map((o) => o.entity_value);
     let summaryText;
     let tier = "rule-based";
@@ -1993,13 +2211,16 @@ class SessionSummarizer {
         const ctx2 = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
         return d.entity_value.slice(0, 150) + ctx2;
       });
+      const allNotes = [...notes.slice(0, 5)];
+      if (conversationDigest)
+        allNotes.push(conversationDigest);
       const ctx = {
         sessionId: session_id,
         project,
         files,
         errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 150)),
         decisions: decisionDetails,
-        notes: notes.slice(0, 5),
+        notes: allNotes,
         observations: obsValues.slice(0, 5)
       };
       summaryText = await tryCliSummary(ctx);
@@ -2008,9 +2229,11 @@ class SessionSummarizer {
     }
     if (!summaryText) {
       const allNotes = [...notes, ...obsValues];
+      if (conversationDigest)
+        allNotes.push(conversationDigest);
       summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
     }
-    log6.info("Summary generated", { session_id, tier, length: summaryText.length });
+    log7.info("Summary generated", { session_id, tier, length: summaryText.length });
     const ltSummary = {
       session_id,
       project,
@@ -2029,7 +2252,7 @@ function estimateTokenSavings(fileCount, errorCount, noteCount) {
 }
 
 // src/search/embedding-model.ts
-var log7 = createLogger("embedding-model");
+var log8 = createLogger("embedding-model");
 var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 class EmbeddingModel {
   pipeline = null;
@@ -2045,7 +2268,7 @@ class EmbeddingModel {
       const result = await this.pipeline(text, { pooling: "mean", normalize: true });
       return new Float32Array(result.data);
     } catch (err) {
-      log7.error("embed failed", { error: String(err) });
+      log8.error("embed failed", { error: String(err) });
       return null;
     }
   }
@@ -2101,9 +2324,9 @@ class EmbeddingModel {
       env.allowRemoteModels = true;
       const t0 = Date.now();
       this.pipeline = await pipeline("feature-extraction", MODEL_NAME, { dtype: "fp32" });
-      log7.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+      log8.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
     } catch (err) {
-      log7.warn("Embedding model unavailable", { error: String(err) });
+      log8.warn("Embedding model unavailable", { error: String(err) });
       this.available = false;
     }
   }
@@ -2111,7 +2334,7 @@ class EmbeddingModel {
 var embeddingModel = new EmbeddingModel;
 
 // src/search/semantic-search.ts
-var log8 = createLogger("semantic-search");
+var log9 = createLogger("semantic-search");
 async function indexEmbedding(docType, docId, text, db) {
   const vector = await embeddingModel.embed(text);
   if (!vector)
@@ -2126,10 +2349,10 @@ async function indexEmbedding(docType, docId, text, db) {
 }
 
 // src/retrieval/proactive-retrieval.ts
-import { existsSync as existsSync5, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3 } from "fs";
+import { existsSync as existsSync6, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3 } from "fs";
 import { join as join5 } from "path";
 import { homedir as homedir4 } from "os";
-var log9 = createLogger("proactive-retrieval");
+var log10 = createLogger("proactive-retrieval");
 var DATA_DIR = join5(homedir4(), ".claude-memory-hub");
 var PROACTIVE_DIR = join5(DATA_DIR, "proactive");
 var TOOL_CALL_INTERVAL = 15;
@@ -2175,13 +2398,13 @@ function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse
   state.injectedTopics.push(currentTopic);
   state.lastInjectionAt = Date.now();
   saveState(sessionId, state);
-  log9.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
+  log10.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
   return { shouldInject: true, additionalContext: context };
 }
 function cleanupProactiveState(sessionId) {
   const path = statePath(sessionId);
   try {
-    if (existsSync5(path)) {
+    if (existsSync6(path)) {
       const { unlinkSync } = __require("fs");
       unlinkSync(path);
     }
@@ -2222,7 +2445,7 @@ function statePath(sessionId) {
 function loadState(sessionId) {
   const path = statePath(sessionId);
   try {
-    if (existsSync5(path)) {
+    if (existsSync6(path)) {
       return JSON.parse(readFileSync3(path, "utf-8"));
     }
   } catch {}
@@ -2230,7 +2453,7 @@ function loadState(sessionId) {
 }
 function saveState(sessionId, state) {
   try {
-    if (!existsSync5(PROACTIVE_DIR)) {
+    if (!existsSync6(PROACTIVE_DIR)) {
       mkdirSync3(PROACTIVE_DIR, { recursive: true, mode: 448 });
     }
     writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
@@ -2252,10 +2475,10 @@ function safeJson4(text, fallback) {
 }
 
 // src/capture/batch-queue.ts
-import { existsSync as existsSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync2 } from "fs";
+import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync3 } from "fs";
 import { join as join6 } from "path";
 import { homedir as homedir5 } from "os";
-var log10 = createLogger("batch-queue");
+var log11 = createLogger("batch-queue");
 var DATA_DIR2 = join6(homedir5(), ".claude-memory-hub");
 var BATCH_DIR = join6(DATA_DIR2, "batch");
 var QUEUE_PATH = join6(BATCH_DIR, "queue.jsonl");
@@ -2269,15 +2492,15 @@ function enqueueEvent(event) {
 `;
     appendFileSync2(QUEUE_PATH, line, "utf-8");
   } catch (err) {
-    log10.error("enqueue failed", { error: String(err) });
+    log11.error("enqueue failed", { error: String(err) });
     throw err;
   }
 }
 function tryFlush() {
   try {
-    if (!existsSync6(QUEUE_PATH))
+    if (!existsSync7(QUEUE_PATH))
       return false;
-    const stat = statSync2(QUEUE_PATH);
+    const stat = statSync3(QUEUE_PATH);
     if (stat.size === 0)
       return false;
     if (!tryAcquireLock())
@@ -2289,7 +2512,7 @@ function tryFlush() {
       releaseLock();
     }
   } catch (err) {
-    log10.error("flush failed", { error: String(err) });
+    log11.error("flush failed", { error: String(err) });
     return false;
   }
 }
@@ -2303,7 +2526,7 @@ function flushQueue() {
     try {
       events.push(JSON.parse(line));
     } catch {
-      log10.warn("skipping malformed queue line");
+      log11.warn("skipping malformed queue line");
     }
   }
   if (events.length === 0)
@@ -2332,11 +2555,11 @@ function flushQueue() {
     }
   })();
   writeFileSync2(QUEUE_PATH, "", "utf-8");
-  log10.info("batch flushed", { events: events.length });
+  log11.info("batch flushed", { events: events.length });
 }
 function tryAcquireLock() {
   try {
-    if (existsSync6(LOCK_PATH)) {
+    if (existsSync7(LOCK_PATH)) {
       const lockContent = readFileSync4(LOCK_PATH, "utf-8").trim();
       const [pidStr, timestampStr] = lockContent.split(":");
       const lockTime = Number(timestampStr);
@@ -2360,7 +2583,7 @@ function releaseLock() {
   } catch {}
 }
 function ensureBatchDir() {
-  if (!existsSync6(BATCH_DIR)) {
+  if (!existsSync7(BATCH_DIR)) {
     mkdirSync4(BATCH_DIR, { recursive: true, mode: 448 });
   }
 }
@@ -2388,6 +2611,15 @@ async function main() {
     tryFlush();
   } catch {}
   cleanupProactiveState(hook.session_id);
+  if (hook.transcript_path) {
+    try {
+      const store2 = new SessionStore;
+      const messages = await parseTranscript(hook.transcript_path, hook.session_id, project);
+      if (messages.length > 0) {
+        const inserted = store2.insertMessages(messages);
+      }
+    } catch {}
+  }
   const store = new SessionStore;
   if (store.getSession(hook.session_id)) {
     await new SessionSummarizer().summarize(hook.session_id, project).catch(() => {});

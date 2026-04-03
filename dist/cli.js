@@ -240,6 +240,49 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (4, ?)", [Date.now()]);
     log.info("Migration v4 complete");
   }
+  if (currentVersion < 5) {
+    log.info("Applying migration v5: messages table for conversation capture");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        project       TEXT NOT NULL,
+        role          TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        content       TEXT NOT NULL,
+        prompt_number INTEGER NOT NULL DEFAULT 0,
+        timestamp     INTEGER NOT NULL,
+        uuid          TEXT,
+        parent_uuid   TEXT
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, prompt_number)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_messages_role    ON messages(session_id, role)`);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uuid ON messages(uuid) WHERE uuid IS NOT NULL`);
+    db.run(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+        session_id UNINDEXED,
+        role,
+        content,
+        tokenize = 'porter unicode61'
+      )
+    `);
+    db.run(`
+      CREATE TRIGGER IF NOT EXISTS fts_messages_insert
+        AFTER INSERT ON messages BEGIN
+          INSERT INTO fts_messages(rowid, session_id, role, content)
+          VALUES (new.id, new.session_id, new.role, new.content);
+        END
+    `);
+    db.run(`
+      CREATE TRIGGER IF NOT EXISTS fts_messages_delete
+        AFTER DELETE ON messages BEGIN
+          INSERT INTO fts_messages(fts_messages, rowid, session_id, role, content)
+          VALUES ('delete', old.id, old.session_id, old.role, old.content);
+        END
+    `);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
+    log.info("Migration v5 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {

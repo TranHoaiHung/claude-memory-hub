@@ -26,10 +26,11 @@ Zero API key. Zero Python. Zero config. One install command.
 What makes it different? **The Compact Interceptor** — something no other memory tool has. When Claude Code auto-compacts at 200K tokens, memory-hub *tells the compact engine what matters*. PreCompact hook injects priority instructions. PostCompact hook saves the full summary. Result: 90% context salvage instead of vaporization.
 
 But it doesn't stop there:
+- **Full conversation capture** — every user prompt + assistant response saved via transcript parsing
 - **Cross-session memory** — past work auto-injected when you start a new session
 - **3-engine hybrid search** — FTS5 + TF-IDF + semantic embeddings (384-dim, offline)
 - **Proactive retrieval** — detects topic shifts mid-session, injects relevant context automatically
-- **91 unit tests**, batch queue (75ms→3ms), JSONL export/import, browser UI
+- **100+ unit tests**, batch queue (75ms→3ms), JSONL export/import, browser UI
 - **Multi-agent ready** — subagents share memory for free via MCP
 
 Built for developers who use Claude Code daily and are tired of repeating themselves.
@@ -61,13 +62,15 @@ Search:        Keyword-only, no semantic ranking
 | Problem | Claude Code built-in | claude-mem | memory-hub |
 |---------|:-------------------:|:----------:|:----------:|
 | Cross-session memory | -- | Yes | **Yes** |
+| Full conversation capture (user+assistant) | -- | -- | **Yes** |
+| Conversation search (FTS5) | -- | -- | **Yes** |
 | Influence what compact preserves | -- | -- | **Yes** |
 | Save compact output to L3 | -- | -- | **Yes** |
 | Hybrid search (FTS5 + TF-IDF + semantic) | -- | Partial | **Yes** |
 | 3-layer progressive search | -- | Yes | **Yes** |
 | Resource overhead analysis | -- | -- | **Yes** |
 | CLAUDE.md rule tracking | -- | -- | **Yes** |
-| Observation capture (14 patterns) | -- | Yes | **Yes** |
+| Observation capture (20+ patterns) | -- | Yes | **Yes** |
 | LLM summarization (3-tier) | -- | Yes (API) | **Yes (free)** |
 | Token-budget-aware tools (`max_tokens`) | -- | -- | **Yes** |
 | Proactive mid-session retrieval | -- | -- | **Yes** |
@@ -79,25 +82,29 @@ Search:        Keyword-only, no semantic ranking
 | Hook batching (3ms vs 75ms) | -- | -- | **Yes** |
 | Browser UI | -- | Yes | **Yes** |
 | Health monitoring + auto-cleanup | -- | -- | **Yes** |
-| Unit tests (91 tests) | N/A | -- | **Yes** |
+| Unit tests (100+) | N/A | -- | **Yes** |
 | No API key / Python / Chroma | N/A | Partial | **Yes** |
 
 ---
 
 ## How It Works
 
-### Layer 1 — Entity Capture (every tool call)
+### Layer 1 — Entity + Conversation Capture (every tool call + every prompt)
 
 ```
 Claude reads a file     → memory-hub records: which file, code patterns found
 Claude edits a file     → memory-hub records: what changed (old → new diff)
 Claude runs a command   → memory-hub records: command, exit code, stderr
 Claude makes a decision → memory-hub records: decision text + importance score
+Claude spawns an agent  → memory-hub records: agent type, prompt, result summary
+User sends a prompt     → memory-hub records: full prompt text to messages table
+Session ends            → memory-hub parses transcript: ALL user + assistant messages
 ```
 
 No XML. No special format. Extracted directly from hook JSON metadata.
 PostToolUse events are batched via write-through queue (~3ms per event vs ~75ms direct).
 Mid-session topic shifts auto-inject relevant past context (proactive retrieval).
+Full conversation (user + assistant) captured from Claude Code's JSONL transcript at session end.
 
 ### Layer 2 — Compact Interceptor (the key innovation)
 
@@ -127,7 +134,9 @@ Mid-session topic shifts auto-inject relevant past context (proactive retrieval)
 ### Layer 3 — Cross-Session Memory
 
 ```
-Session N ends  → 3-tier summarization: PostCompact > CLI claude > rule-based
+Session N ends  → Parse transcript: capture full conversation (user + assistant)
+                → 3-tier summarization: PostCompact > CLI claude > rule-based
+                → Summary enriched with conversation digest
                 → Summary saved to SQLite L3 with FTS5 indexing
 
 Session N+1     → UserPromptSubmit hook fires
@@ -173,9 +182,12 @@ Tool output contains "IMPORTANT: always pool DB connections"
 User prompt contains "remember that we use TypeScript strict"
   → observation entity (importance=3) saved to L2
 
-14 heuristic patterns: IMPORTANT, CRITICAL, SECURITY, DEPRECATED,
-  decision:, discovered, root cause, switched to, TODO:, FIXME:,
-  HACK:, performance:, bottleneck, OOM, don't, never, prefer, etc.
+20+ heuristic patterns:
+  Tool output: IMPORTANT, CRITICAL, SECURITY, DEPRECATED, migration failed,
+    decision:, discovered, root cause, switched to, refactored, installed,
+    TODO:, FIXME:, performance:, bottleneck, tests pass/fail, deployed, etc.
+  User prompt: IMPORTANT, MUST, remember that, don't/never/avoid,
+    fix/debug/investigate, implement/build/create, prefer/always use, etc.
 ```
 
 ---
@@ -193,10 +205,11 @@ User prompt contains "remember that we use TypeScript strict"
 │  └──────┬────────┘  │ priorities   │  └──────┬───────┘      │
 │         │           └──────┬───────┘         │              │
 │  ┌──────┴───────┐          │          ┌──────┴───────┐      │
-│  │UserPrompt    │          │          │ Stop         │      │
-│  │Submit: inject│          │          │ session end  │      │
-│  │past context  │          │          │ summarize    │      │
-│  └──────────────┘          │          └──────────────┘      │ 
+│  │UserPrompt    │          │          │ Stop           │    │
+│  │Submit: inject│          │          │ parse transcript│    │
+│  │past context +│          │          │ capture convo  │    │
+│  │save prompt   │          │          │ summarize      │    │
+│  └──────────────┘          │          └────────────────┘    │
 │                            │                                │
 │  MCP Server (stdio, long-lived)                             │
 │  ┌─────────────────────────────────────────────────────┐    │
@@ -204,7 +217,7 @@ User prompt contains "remember that we use TypeScript strict"
 │  │ memory_entities      memory_timeline (L2 context)   │    │
 │  │ memory_session_notes memory_fetch   (L3 full)       │    │
 │  │ memory_store         memory_context_budget          │    │
-│  │ memory_health                                       │    │
+│  │ memory_conversation  memory_health                  │    │
 │  │                                                     │    │
 │  │ L1 WorkingMemory: read-through cache over L2        │    │
 │  └─────────────────────────────────────────────────────┘    │
@@ -241,7 +254,8 @@ User prompt contains "remember that we use TypeScript strict"
 │  L2: SessionStore           SQLite                  │
 │  Entities + notes           <10ms access            │
 │  files, errors, decisions   Per-session scope       │
-│  observations (14 patterns) Importance scored 1-5   │
+│  messages (user+assistant)  Importance scored 1-5   │
+│  observations (20+ patterns)FTS5 on conversations   │
 ├─────────────────────────────────────────────────────┤
 │  L3: LongTermStore          SQLite + FTS5 + TF-IDF  │
 │  Cross-session summaries    <100ms access           │
@@ -317,6 +331,12 @@ Claude can call these tools directly during conversation:
 | `memory_search` | 1 (index) | ~50 | First: find relevant memories by query |
 | `memory_timeline` | 2 (context) | ~200 | Then: see what happened before/after a result |
 | `memory_fetch` | 3 (full) | ~500 | Finally: get complete records for specific IDs |
+
+### Conversation
+
+| Tool | What it does | When to use |
+|------|-------------|-------------|
+| `memory_conversation` | Retrieve or search conversation messages | Reviewing what was discussed in a past session |
 
 ### Diagnostics
 
@@ -416,6 +436,9 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | **v0.8.0** | 91 unit tests (was 0%), L1 read-through cache, PostToolUse batch queue (75ms→3ms), JSONL export/import, data cleanup CLI, CI/CD auto-publish |
 | **v0.8.1** | Token-budget-aware MCP tools (`max_tokens`), proactive mid-session memory retrieval (topic-shift detection), session-end batch flush |
 | **v0.9.0** | Smart budget allocation (priority-based, memory never pushed out), CLAUDE.md adaptive compression (3 levels), overhead warning auto-injection, doubled injection limits |
+| **v0.9.5** | Stable install path — hooks no longer break after reboot or bunx cache cleanup |
+| **v0.9.6** | Agent/Skill result capture, higher summary limits, IDE tag stripping, PostCompact cap, broader observation patterns (20+) |
+| **v0.10.0** | **Full conversation capture** — all user prompts + assistant responses via transcript parsing, `messages` table with FTS5, `memory_conversation` MCP tool, conversation-enriched summaries |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
