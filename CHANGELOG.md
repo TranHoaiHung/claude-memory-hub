@@ -5,6 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.6] - 2026-04-03
+
+Richer session capture — Agent results, higher limits, cleaner summaries.
+
+### Enhancements
+
+- **Agent/Skill result capture** — `tool_response` from Agent and Skill tools is now saved into entity `context` field (up to 800 chars). Previously only the prompt was captured, losing all agent output. This is the biggest data quality improvement — multi-agent workflows now produce meaningful summaries
+- **Higher summary limits** — `user_prompt` 200→500 chars, `decisions` 3→5 entries with context, `errors` 2→5 entries, `notes` 2→5 entries. CLI summarizer bumped to 6K prompt / 2K output (was 4K/1K). Decision entities now include agent/skill results in summary text
+- **IDE/system tag stripping in summarizer** — `<ide_opened_file>`, `<ide_selection>`, `<system-reminder>`, `<local-command-*>`, `<command-*>` tags are now stripped at both rule-based and CLI summarizer stages. Prevents tag noise from polluting L3 summaries
+- **PostCompact summary cap** — compact summaries exceeding 5,000 chars are truncated (was unbounded — seen 22K in production). Reduces DB bloat and improves search relevance
+- **Broader observation heuristics** — added patterns for: refactoring, dependency changes, test results, deployments, scaffolding, data risks, user task/feature requests. Captures more meaningful observations from tool output and user prompts
+
+### Before vs After
+
+```
+Before: "Task: <ide_opened_file>...</ide_opened_file>. Files (49): ..."  (1165 chars, noisy)
+After:  "Task: fix broken hooks in memory-hub. Files (15): ... Decisions: agent:debugger: investigated... → Found temp path issue..."  (richer, clean)
+```
+
+---
+
 ## [0.9.5] - 2026-04-03
 
 Stable install path — hooks no longer break after reboot or bunx cache cleanup.

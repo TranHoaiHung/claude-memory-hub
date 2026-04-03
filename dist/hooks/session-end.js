@@ -602,18 +602,26 @@ function extractCodePatterns(content) {
 var TOOL_OUTPUT_HEURISTICS = [
   { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
   { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+  { pattern: /\b(migration failed|data loss|corrupt)/i, importance: 4, label: "data-risk" },
   { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
   { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
   { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+  { pattern: /\b(refactored?|migrated?|upgraded?|replaced)\b/i, importance: 3, label: "refactor" },
+  { pattern: /\b(installed|added dependency|npm install|bun add)\b/i, importance: 2, label: "dependency" },
   { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
   { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
+  { pattern: /\b(created|scaffolded|initialized|bootstrapped)\b/i, importance: 2, label: "creation" },
+  { pattern: /\b(tests? (?:pass|fail)|coverage|assertion)/i, importance: 2, label: "test-result" },
+  { pattern: /\b(deployed|published|released|pushed to)\b/i, importance: 2, label: "deployment" },
   { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
 ];
 var PROMPT_HEURISTICS = [
   { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
   { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
   { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
-  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" }
+  { pattern: /\b(fix|debug|investigate|analyze|resolve)\b/i, importance: 2, label: "user-task" },
+  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" },
+  { pattern: /\b(implement|build|create|add feature|integrate)\b/i, importance: 2, label: "user-feature" }
 ];
 var MAX_VALUE_LENGTH = 500;
 var MIN_INPUT_LENGTH = 20;
@@ -722,13 +730,15 @@ function extractEntities(hook, promptNumber = 0) {
     case "Agent": {
       const subagentType = stringField2(tool_input, "subagent_type") ?? "general-purpose";
       const prompt = stringField2(tool_input, "prompt") ?? "";
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 100)}`, 3, now, promptNumber));
+      const agentResult = extractAgentResult(tool_response);
+      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
       break;
     }
     case "Skill": {
       const skillName = stringField2(tool_input, "skill") ?? "unknown";
       const args = stringField2(tool_input, "args") ?? "";
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 80)}`.trim(), 2, now, promptNumber));
+      const skillResult = extractAgentResult(tool_response);
+      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
       break;
     }
     default:
@@ -758,6 +768,15 @@ function stringField2(obj, key) {
 }
 function deriveProject(hook) {
   return "unknown";
+}
+function extractAgentResult(response) {
+  if (!response)
+    return;
+  const r = response;
+  const text = typeof r === "string" ? r : stringField2(r, "result") ?? stringField2(r, "output") ?? stringField2(r, "content") ?? stringField2(r, "text");
+  if (!text)
+    return;
+  return text.length > 800 ? text.slice(0, 797) + "..." : text;
 }
 function extractFileFromBashCmd(cmd) {
   const patterns = [
@@ -1782,37 +1801,46 @@ function projectFromCwd(cwd) {
 }
 
 // src/summarizer/summarizer-prompts.ts
+function stripNoiseTags(text) {
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").trim();
+}
 function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   const parts = [];
   if (session.user_prompt) {
-    parts.push(`Task: ${session.user_prompt.slice(0, 200)}.`);
+    const cleanPrompt = stripNoiseTags(session.user_prompt);
+    if (cleanPrompt) {
+      parts.push(`Task: ${cleanPrompt.slice(0, 500)}.`);
+    }
   }
   if (files.length > 0) {
-    const listed = files.slice(0, 10).join(", ");
-    parts.push(`Files (${files.length}): ${listed}${files.length > 10 ? ` (+${files.length - 10} more)` : ""}.`);
+    const listed = files.slice(0, 15).join(", ");
+    parts.push(`Files (${files.length}): ${listed}${files.length > 15 ? ` (+${files.length - 15} more)` : ""}.`);
   }
   if (decisions.length > 0) {
-    const listed = decisions.slice(0, 3).map((d) => d.entity_value.slice(0, 100)).join("; ");
+    const listed = decisions.slice(0, 5).map((d) => {
+      const base = d.entity_value.slice(0, 150);
+      const ctx = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
+      return base + ctx;
+    }).join("; ");
     parts.push(`Decisions: ${listed}.`);
   }
   if (errors.length > 0) {
-    const first = errors[0];
-    const ctx = first.context ? ` (${first.context.slice(0, 60)})` : "";
-    parts.push(`Errors (${errors.length}): ${first.entity_value.slice(0, 100)}${ctx}.`);
-    if (errors.length > 1) {
-      parts.push(`Also: ${errors[1].entity_value.slice(0, 80)}.`);
-    }
+    const errorLines = errors.slice(0, 5).map((e) => {
+      const ctx = e.context ? ` (${e.context.slice(0, 100)})` : "";
+      return `${e.entity_value.slice(0, 150)}${ctx}`;
+    });
+    parts.push(`Errors (${errors.length}): ${errorLines.join("; ")}.`);
   }
   if (notes.length > 0) {
-    parts.push(`Notes: ${notes.slice(-2).join("; ").slice(0, 200)}.`);
+    parts.push(`Notes: ${notes.slice(-5).join("; ").slice(0, 500)}.`);
   }
   return parts.join(" ") || `Session in project ${session.project}.`;
 }
 
 // src/summarizer/cli-summarizer.ts
 var log5 = createLogger("cli-summarizer");
-var MAX_PROMPT_CHARS = 4000;
-var MAX_OUTPUT_CHARS = 1000;
+var MAX_PROMPT_CHARS = 6000;
+var MAX_OUTPUT_CHARS = 2000;
 var DEFAULT_TIMEOUT_MS = 30000;
 var _cliAvailable;
 var _cliCheckedAt = 0;
@@ -1832,27 +1860,30 @@ function isClaudeCliAvailable() {
   _cliCheckedAt = Date.now();
   return _cliAvailable;
 }
+function stripNoise(text) {
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").trim();
+}
 function buildCliPrompt(ctx) {
   const sections = [
-    "Summarize this coding session in 2-3 plain sentences. No markdown, no headers, no code blocks.",
-    "Focus on: what was accomplished, key decisions, important findings.",
+    "Summarize this coding session in 3-5 plain sentences. No markdown, no headers, no code blocks.",
+    "Focus on: what was accomplished, key decisions, important findings, tools/agents used.",
     "",
     `Project: ${ctx.project}`
   ];
   if (ctx.files.length > 0) {
-    sections.push(`Files modified: ${ctx.files.slice(0, 10).join(", ")}`);
+    sections.push(`Files modified: ${ctx.files.slice(0, 15).join(", ")}`);
   }
   if (ctx.errors.length > 0) {
-    sections.push(`Errors resolved: ${ctx.errors.slice(0, 5).join("; ")}`);
+    sections.push(`Errors resolved: ${ctx.errors.slice(0, 5).map(stripNoise).join("; ")}`);
   }
   if (ctx.decisions.length > 0) {
-    sections.push(`Decisions: ${ctx.decisions.slice(0, 5).join("; ")}`);
+    sections.push(`Decisions: ${ctx.decisions.slice(0, 8).map(stripNoise).join("; ")}`);
   }
   if (ctx.notes.length > 0) {
-    sections.push(`Notes: ${ctx.notes.slice(0, 3).join("; ")}`);
+    sections.push(`Notes: ${ctx.notes.slice(0, 5).map(stripNoise).join("; ")}`);
   }
   if (ctx.observations.length > 0) {
-    sections.push(`Key observations: ${ctx.observations.slice(0, 3).join("; ")}`);
+    sections.push(`Key observations: ${ctx.observations.slice(0, 5).map(stripNoise).join("; ")}`);
   }
   let prompt = sections.join(`
 `);
@@ -1953,19 +1984,23 @@ class SessionSummarizer {
     const hasModified = this.sessionStore.hasModifiedFiles(session_id);
     if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0)
       return;
-    const obsValues = observations.slice(0, 5).map((o) => o.entity_value);
+    const obsValues = observations.slice(0, 8).map((o) => o.entity_value);
     let summaryText;
     let tier = "rule-based";
     const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
     if (llmMode !== "rule-based") {
+      const decisionDetails = decisions.slice(0, 8).map((d) => {
+        const ctx2 = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
+        return d.entity_value.slice(0, 150) + ctx2;
+      });
       const ctx = {
         sessionId: session_id,
         project,
         files,
-        errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 100)),
-        decisions: decisions.slice(0, 5).map((d) => d.entity_value.slice(0, 100)),
-        notes: notes.slice(0, 3),
-        observations: obsValues.slice(0, 3)
+        errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 150)),
+        decisions: decisionDetails,
+        notes: notes.slice(0, 5),
+        observations: obsValues.slice(0, 5)
       };
       summaryText = await tryCliSummary(ctx);
       if (summaryText)

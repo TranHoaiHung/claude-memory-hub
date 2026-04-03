@@ -602,18 +602,26 @@ function extractCodePatterns(content) {
 var TOOL_OUTPUT_HEURISTICS = [
   { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
   { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+  { pattern: /\b(migration failed|data loss|corrupt)/i, importance: 4, label: "data-risk" },
   { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
   { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
   { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+  { pattern: /\b(refactored?|migrated?|upgraded?|replaced)\b/i, importance: 3, label: "refactor" },
+  { pattern: /\b(installed|added dependency|npm install|bun add)\b/i, importance: 2, label: "dependency" },
   { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
   { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
+  { pattern: /\b(created|scaffolded|initialized|bootstrapped)\b/i, importance: 2, label: "creation" },
+  { pattern: /\b(tests? (?:pass|fail)|coverage|assertion)/i, importance: 2, label: "test-result" },
+  { pattern: /\b(deployed|published|released|pushed to)\b/i, importance: 2, label: "deployment" },
   { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
 ];
 var PROMPT_HEURISTICS = [
   { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
   { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
   { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
-  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" }
+  { pattern: /\b(fix|debug|investigate|analyze|resolve)\b/i, importance: 2, label: "user-task" },
+  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" },
+  { pattern: /\b(implement|build|create|add feature|integrate)\b/i, importance: 2, label: "user-feature" }
 ];
 var MAX_VALUE_LENGTH = 500;
 var MIN_INPUT_LENGTH = 20;
@@ -722,13 +730,15 @@ function extractEntities(hook, promptNumber = 0) {
     case "Agent": {
       const subagentType = stringField2(tool_input, "subagent_type") ?? "general-purpose";
       const prompt = stringField2(tool_input, "prompt") ?? "";
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 100)}`, 3, now, promptNumber));
+      const agentResult = extractAgentResult(tool_response);
+      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
       break;
     }
     case "Skill": {
       const skillName = stringField2(tool_input, "skill") ?? "unknown";
       const args = stringField2(tool_input, "args") ?? "";
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 80)}`.trim(), 2, now, promptNumber));
+      const skillResult = extractAgentResult(tool_response);
+      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
       break;
     }
     default:
@@ -758,6 +768,15 @@ function stringField2(obj, key) {
 }
 function deriveProject(hook) {
   return "unknown";
+}
+function extractAgentResult(response) {
+  if (!response)
+    return;
+  const r = response;
+  const text = typeof r === "string" ? r : stringField2(r, "result") ?? stringField2(r, "output") ?? stringField2(r, "content") ?? stringField2(r, "text");
+  if (!text)
+    return;
+  return text.length > 800 ? text.slice(0, 797) + "..." : text;
 }
 function extractFileFromBashCmd(cmd) {
   const patterns = [
