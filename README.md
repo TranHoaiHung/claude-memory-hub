@@ -478,6 +478,64 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 
+## Troubleshooting
+
+### MCP server not connecting (most common issue)
+
+Claude Code stores MCP config in **`~/.claude.json`** (not `~/.claude/settings.json`). If memory tools aren't available after install:
+
+**1. Check MCP status:**
+```bash
+claude mcp list
+```
+
+If `claude-memory-hub` shows `✗ Failed to connect` or is missing:
+
+**2. Register directly via Claude CLI:**
+```bash
+claude mcp add claude-memory-hub -s user -- bun run ~/.claude-memory-hub/dist/index.js
+```
+
+**3. If CLI fails** (e.g., hook blocking `dist/` paths), edit `~/.claude.json` manually. Find the top-level `"mcpServers"` object and add:
+```json
+"claude-memory-hub": {
+  "type": "stdio",
+  "command": "/path/to/bun",
+  "args": ["run", "/Users/YOU/.claude-memory-hub/dist/index.js"]
+}
+```
+
+**4. Restart Claude Code** — MCP servers only load at startup.
+
+### How to verify it works
+
+After restart, check if memory tools appear:
+- Type `/mem-status` — should run health check
+- Or ask: *"Search my memory for recent sessions"* — Claude should call `memory_search`
+
+If Claude reads `MEMORY.md` instead of calling MCP tools, the MCP server is not connected.
+
+### Common issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "No memories found" on new session | MCP server not registered in `~/.claude.json` | Run `claude mcp add` (see above) |
+| `bunx` install shows old version | bunx cache | `bunx claude-memory-hub@latest install` |
+| Hooks registered but no context injected | Dist files outdated in `~/.claude-memory-hub/dist/` | Re-run install to copy latest dist |
+| Memory tools not in tool list | MCP server failed to start | Check `claude mcp list` for connection status |
+
+### Config file locations
+
+| File | What it stores |
+|------|---------------|
+| `~/.claude.json` | MCP server registrations (user-level) — **Claude Code reads this** |
+| `~/.claude/settings.json` | Hooks registration + fallback MCP config |
+| `~/.claude-memory-hub/memory.db` | All memory data (sessions, entities, summaries) |
+| `~/.claude-memory-hub/dist/` | Compiled hook + MCP server scripts |
+| `~/.claude/commands/` | Slash commands (`/mem-search`, `/mem-status`, `/mem-save`) |
+
+---
+
 ## Uninstall
 
 ```bash

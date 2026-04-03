@@ -2198,6 +2198,45 @@ function saveSettings(settings) {
   writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
 `);
 }
+var CLAUDE_JSON_PATH = join5(homedir5(), ".claude.json");
+function loadClaudeJson() {
+  if (!existsSync5(CLAUDE_JSON_PATH))
+    return {};
+  try {
+    return JSON.parse(readFileSync(CLAUDE_JSON_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function saveClaudeJson(data) {
+  writeFileSync(CLAUDE_JSON_PATH, JSON.stringify(data, null, 2) + `
+`);
+}
+function registerMcpInClaudeJson(bunBin, mcpPath) {
+  try {
+    const claudeJson = loadClaudeJson();
+    const servers = claudeJson.mcpServers ?? {};
+    servers["claude-memory-hub"] = {
+      type: "stdio",
+      command: bunBin,
+      args: ["run", mcpPath]
+    };
+    claudeJson.mcpServers = servers;
+    saveClaudeJson(claudeJson);
+  } catch {
+    console.log("   Warning: could not register in ~/.claude.json \u2014 register manually:");
+    console.log(`   claude mcp add claude-memory-hub -s user -- ${bunBin} run ${mcpPath}`);
+  }
+}
+function unregisterMcpFromClaudeJson() {
+  try {
+    const claudeJson = loadClaudeJson();
+    const servers = claudeJson.mcpServers ?? {};
+    delete servers["claude-memory-hub"];
+    claudeJson.mcpServers = servers;
+    saveClaudeJson(claudeJson);
+  } catch {}
+}
 function installCommands() {
   let srcCommands = join5(PKG_DIR, "commands");
   if (!existsSync5(srcCommands))
@@ -2245,15 +2284,16 @@ function install() {
     stdio: "inherit"
   });
   if (result.status !== 0) {
-    console.log("   claude CLI not available \u2014 registering in settings.json directly");
-    const settings2 = loadSettings();
-    settings2.mcpServers ??= {};
-    settings2.mcpServers["claude-memory-hub"] = {
-      command: bunBin,
-      args: ["run", mcpPath]
-    };
-    saveSettings(settings2);
+    console.log("   claude CLI not available \u2014 registering directly");
   }
+  const settingsForMcp = loadSettings();
+  settingsForMcp.mcpServers ??= {};
+  settingsForMcp.mcpServers["claude-memory-hub"] = {
+    command: bunBin,
+    args: ["run", mcpPath]
+  };
+  saveSettings(settingsForMcp);
+  registerMcpInClaudeJson(bunBin, mcpPath);
   console.log("   MCP server registered.");
   console.log(`
 2. Registering hooks...`);
@@ -2325,6 +2365,7 @@ function uninstall() {
 `);
   uninstallCommands();
   console.log("Removed slash commands from ~/.claude/commands/");
+  unregisterMcpFromClaudeJson();
   spawnSync("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
     stdio: "inherit"
   });

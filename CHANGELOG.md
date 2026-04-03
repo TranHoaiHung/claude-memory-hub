@@ -5,6 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.11.3] - 2026-04-03
+
+MCP registration fix + troubleshooting guide. The installer was registering MCP server in the wrong config file.
+
+### Critical Bugfix: MCP Server Not Connecting
+
+**Root cause:** `bunx claude-memory-hub install` registered the MCP server in `~/.claude/settings.json`, but Claude Code reads MCP config from **`~/.claude.json`** (top-level `mcpServers` object). Result: MCP server was never started by Claude Code, so `memory_recall`, `memory_search`, and all memory tools were unavailable. Claude fell back to reading `MEMORY.md` (built-in) which was empty.
+
+Additionally, when `claude mcp add` was used previously, it registered with a `bunx` temp path (`/private/tmp/bunx-501-...`) that got deleted after reboot, causing "Failed to connect" on subsequent sessions.
+
+**Fix approach:** The installer now registers MCP server in **both** `~/.claude/settings.json` (for hooks) and `~/.claude.json` (for MCP server). If `claude` CLI is available, it uses `claude mcp add -s user` which writes to the correct location.
+
+### Documentation
+
+- **Troubleshooting section** added to README with:
+  - Step-by-step MCP registration fix
+  - Manual `~/.claude.json` edit instructions
+  - Verification steps (`/mem-status`, `claude mcp list`)
+  - Common issues table (5 symptoms + causes + fixes)
+  - Config file locations reference table
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/cli/main.ts` | Register MCP in `~/.claude.json` alongside `settings.json` |
+| `README.md` | Added Troubleshooting section |
+| `package.json` | Version bump to 0.11.3 |
+
+---
+
 ## [0.11.2] - 2026-04-03
 
 Critical fix — context injection was silently failing, causing Claude to start every session from zero.
