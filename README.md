@@ -520,6 +520,7 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | **v0.9.6** | Agent/Skill result capture, higher summary limits, IDE tag stripping, PostCompact cap, broader observation patterns (20+) |
 | **v0.10.0** | **Full conversation capture** — all user prompts + assistant responses via transcript parsing, `messages` table with FTS5, `memory_conversation` MCP tool, conversation-enriched summaries |
 | **v0.11.0** | **Privacy + Search + Commands** — 3-layer privacy filtering (`<private>` tags, auto secret detection, path filtering), code-aware tokenizer (camelCase/snake_case/path splitting), recency-aware ranking (7d/30d/90d decay), RRF multi-source fusion, slash commands (`/mem-search`, `/mem-status`, `/mem-save`), improved MCP tool descriptions with AUTO-USE hints |
+| **v0.11.1** | **Quality hardening** — clock skew guard for recency ranking, import consistency fix, 47 new unit tests (privacy filter + tokenizer edge cases), test count 108 → 155 (+44%) |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 

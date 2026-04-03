@@ -15539,7 +15539,7 @@ var STOP_WORDS = new Set([
 ]);
 function tokenize(text) {
   const tokens = [];
-  const camelSplit = text.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+  const camelSplit = text.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2");
   const words = camelSplit.toLowerCase().replace(/[^a-z0-9_./\-]/g, " ").split(/\s+/).filter(Boolean);
   for (const word of words) {
     if (word.includes("/") && word.length > 3) {
@@ -15685,7 +15685,7 @@ async function searchIndex(query, opts = {}, db) {
   const now = Date.now();
   const merged = [...deduped.values()].map((r) => {
     let score = r.score;
-    const ageMs = now - r.created_at;
+    const ageMs = Math.max(0, now - r.created_at);
     const ageDays = ageMs / (1000 * 60 * 60 * 24);
     if (ageDays < 7)
       score *= 1.5;

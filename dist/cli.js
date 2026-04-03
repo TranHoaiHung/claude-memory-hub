@@ -859,7 +859,7 @@ __export(exports_vector_search, {
 });
 function tokenize(text) {
   const tokens = [];
-  const camelSplit = text.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+  const camelSplit = text.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2");
   const words = camelSplit.toLowerCase().replace(/[^a-z0-9_./\-]/g, " ").split(/\s+/).filter(Boolean);
   for (const word of words) {
     if (word.includes("/") && word.length > 3) {
@@ -1223,7 +1223,7 @@ async function searchIndex(query, opts = {}, db) {
   const now = Date.now();
   const merged = [...deduped.values()].map((r) => {
     let score = r.score;
-    const ageMs = now - r.created_at;
+    const ageMs = Math.max(0, now - r.created_at);
     const ageDays = ageMs / (1000 * 60 * 60 * 24);
     if (ageDays < 7)
       score *= 1.5;
@@ -1820,7 +1820,7 @@ var init_importer = __esm(() => {
 });
 
 // src/cli/main.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync, writeFileSync, readdirSync } from "fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync, writeFileSync, readdirSync, unlinkSync } from "fs";
 import { homedir as homedir5 } from "os";
 import { join as join5, resolve, dirname } from "path";
 
@@ -2210,7 +2210,7 @@ function uninstallCommands() {
     const p = join5(COMMANDS_DIR, file);
     try {
       if (existsSync5(p))
-        __require("fs").unlinkSync(p);
+        unlinkSync(p);
     } catch {}
   }
 }

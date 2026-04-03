@@ -5,6 +5,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.11.1] - 2026-04-03
+
+Quality hardening — more tests, bugfixes, and robustness improvements for v0.11.0 features.
+
+### Bugfixes
+
+- **Clock skew guard** — recency decay in search ranking now uses `Math.max(0, ageMs)` to prevent negative age values when `created_at` is in the future due to clock skew. Previously could produce unpredictable scoring
+- **Import consistency** — `uninstallCommands()` in `cli/main.ts` now uses top-level `unlinkSync` import instead of inline `require("fs").unlinkSync`. Cleaner code, consistent with rest of the file
+
+### Testing
+
+- **Privacy filter tests** — 35 new unit tests covering all 3 privacy layers:
+  - Layer 1: `<private>` tag stripping (single, multiple, multiline, case-insensitive, disable toggle)
+  - Layer 2: Secret detection (sk-, ghp_, gho_, Bearer, AKIA, passwords, private keys, hex secrets, short value safety, normal code safety)
+  - Layer 3: Path filtering (.env, .env.*, .pem, .key, .p12, credentials, secrets/**, private/**, Windows paths, custom paths)
+  - Custom patterns (user-defined regex, invalid pattern graceful handling)
+  - Combined layers (tags + secrets in same text)
+- **Tokenizer tests** — 12 new unit tests for code-aware tokenizer:
+  - camelCase splitting (`getUserName` → get, user, name)
+  - PascalCase splitting (`AuthController` → auth, controller)
+  - Acronym handling (`HTMLParser` → html, parser)
+  - snake_case splitting + compound preservation (`user_auth_service` → user, auth, service, user_auth_service)
+  - File path splitting (`/src/hooks/auth.ts` → src, hooks, auth, ts)
+  - Stop word filtering (code keywords + English)
+  - Mixed code content, empty input, short tokens
+- **Test count: 108 → 155** (+44% coverage increase)
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/search/search-workflow.ts` | Clock skew guard on recency decay |
+| `src/cli/main.ts` | Import `unlinkSync` properly |
+| `tests/unit/privacy-filter.test.ts` | **New** — 35 tests for privacy filtering |
+| `tests/unit/vector-search.test.ts` | +12 tokenizer edge case tests |
+
+---
+
 ## [0.11.0] - 2026-04-03
 
 Privacy-first memory, smarter search, and slash commands. Three features the community asked for most.
