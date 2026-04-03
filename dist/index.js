@@ -16004,11 +16004,11 @@ ${tag} [${date4}] **${m.role}** #${m.prompt_number}`);
 var TOOL_DEFINITIONS = [
   {
     name: "memory_recall",
-    description: "Search long-term memory for relevant context from past Claude sessions. " + "AUTO-USE: Call this proactively at the start of any task to check for prior work " + "on the same topic, files, or problem area. Returns formatted summaries with file lists.",
+    description: "Search long-term memory for relevant context from past Claude sessions. " + "AUTO-USE: Call this proactively at the start of any task to check for prior work " + "on the same topic, files, or problem area. Returns formatted summaries with file lists. " + "IMPORTANT: Use specific technical keywords (file names, feature names, error messages, " + "tool names) \u2014 NOT generic terms like 'recent sessions'. The search uses FTS5 keyword " + "matching, so 'auth JWT token' works but 'what did we do recently' does not.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Natural language search query (e.g., 'auth login bug', 'payment integration')" },
+        query: { type: "string", description: "Specific keywords to search (e.g., 'auth JWT', 'privacy filter', 'android SDK debug'). Use technical terms, NOT generic phrases." },
         limit: { type: "number", description: "Max results (default 5, max 10)" },
         max_tokens: { type: "number", description: "Max output tokens. Results truncated to fit budget. Default: unlimited" }
       },
@@ -16062,11 +16062,11 @@ var TOOL_DEFINITIONS = [
   },
   {
     name: "memory_search",
-    description: "Layer 1 search: returns lightweight index of matching memories (~50 tokens/result). " + "Uses FTS5 + TF-IDF + semantic hybrid ranking with recency boost. " + "WORKFLOW: Start here, then use memory_timeline for context or memory_fetch for full records.",
+    description: "Layer 1 search: returns lightweight index of matching memories (~50 tokens/result). " + "Uses FTS5 + TF-IDF + semantic hybrid ranking with recency boost. " + "WORKFLOW: Start here, then use memory_timeline for context or memory_fetch for full records. " + "Use specific keywords (project names, file names, technologies, error types) for best results.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query \u2014 supports natural language and code terms" },
+        query: { type: "string", description: "Specific keywords to search (e.g., 'privacy filter', 'compact interceptor', 'CORS bug'). Technical terms work best." },
         limit: { type: "number", description: "Max results (default 20, max 50)" },
         offset: { type: "number", description: "Pagination offset (default 0)" },
         project: { type: "string", description: "Filter by project name (optional)" },

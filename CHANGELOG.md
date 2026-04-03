@@ -5,6 +5,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.11.4] - 2026-04-03
+
+Search quality fix — pruned garbage summaries and guided Claude to use specific keywords.
+
+### Search Quality
+
+- **Pruned 30 garbage summaries** — generic `"Session worked on auth system"` with project `"p"` flooded search results. Reduced from 45 → 15 quality summaries. These were created by the rule-based summarizer (Tier 3) when sessions had insufficient context
+- **Improved tool descriptions** — `memory_recall` and `memory_search` now explicitly instruct: *"Use specific technical keywords (file names, feature names, error messages) — NOT generic terms like 'recent sessions'"*. FTS5 keyword matching requires actual content terms, not conversational phrases
+- **Better query parameter docs** — examples changed from `"auth login bug"` to `"auth JWT"`, `"privacy filter"`, `"android SDK debug"` to encourage technical keyword usage
+
+### Root Cause Analysis
+
+Claude was searching with generic queries (`"recent sessions"`, `"recent work sessions activities"`) which returned 0 results because no summary contains the word "recent". FTS5 matches keywords in stored content, not natural language intent. The fix is two-fold: (1) better descriptions guide Claude to use matching keywords, (2) garbage data removed so good results surface.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/mcp/tool-definitions.ts` | `memory_recall` + `memory_search` descriptions + query param docs |
+| Database | Pruned 30 low-quality summaries, FTS5 rebuilt |
+
+---
+
 ## [0.11.3] - 2026-04-03
 
 MCP registration fix + troubleshooting guide. The installer was registering MCP server in the wrong config file.
