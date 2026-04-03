@@ -1669,7 +1669,7 @@ var init_importer = __esm(() => {
 });
 
 // src/cli/main.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync, writeFileSync } from "fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync, writeFileSync, readdirSync } from "fs";
 import { homedir as homedir5 } from "os";
 import { join as join5, resolve, dirname } from "path";
 
@@ -1967,6 +1967,7 @@ import { spawnSync } from "child_process";
 var CLAUDE_DIR = join5(homedir5(), ".claude");
 var SETTINGS_PATH = join5(CLAUDE_DIR, "settings.json");
 var PKG_DIR = resolve(dirname(import.meta.dir));
+var STABLE_DIR = join5(homedir5(), ".claude-memory-hub");
 function shellPath(p) {
   const normalized = p.replace(/\\/g, "/");
   return normalized.includes(" ") ? `"${normalized}"` : normalized;
@@ -1988,11 +1989,37 @@ function getBunPath() {
   }
   return "bun";
 }
+function copyDistToStableDir() {
+  const srcDist = join5(PKG_DIR, "dist");
+  const destDist = join5(STABLE_DIR, "dist");
+  if (!existsSync5(srcDist)) {
+    throw new Error(`dist/ not found at ${srcDist}. Run 'bun run build:all' first.`);
+  }
+  const destHooks = join5(destDist, "hooks");
+  mkdirSync3(destHooks, { recursive: true });
+  for (const file of readdirSync(srcDist)) {
+    if (file.endsWith(".js")) {
+      const src = join5(srcDist, file);
+      const dest = join5(destDist, file);
+      writeFileSync(dest, readFileSync(src));
+    }
+  }
+  const srcHooks = join5(srcDist, "hooks");
+  if (existsSync5(srcHooks)) {
+    for (const file of readdirSync(srcHooks)) {
+      if (file.endsWith(".js")) {
+        const src = join5(srcHooks, file);
+        const dest = join5(destHooks, file);
+        writeFileSync(dest, readFileSync(src));
+      }
+    }
+  }
+}
 function getHookPath(hookName) {
-  return shellPath(join5(PKG_DIR, "dist", "hooks", `${hookName}.js`));
+  return shellPath(join5(STABLE_DIR, "dist", "hooks", `${hookName}.js`));
 }
 function getMcpServerPath() {
-  return shellPath(join5(PKG_DIR, "dist", "index.js"));
+  return shellPath(join5(STABLE_DIR, "dist", "index.js"));
 }
 function loadSettings() {
   if (!existsSync5(SETTINGS_PATH))
@@ -2012,7 +2039,16 @@ function saveSettings(settings) {
 function install() {
   console.log(`claude-memory-hub \u2014 install
 `);
-  console.log("1. Registering MCP server...");
+  console.log("0. Copying dist/ to ~/.claude-memory-hub/dist/...");
+  try {
+    copyDistToStableDir();
+    console.log("   Files copied to stable location.");
+  } catch (e) {
+    console.error(`   Failed to copy dist/: ${e}`);
+    console.error("   Hooks will reference package location (may break after bunx cleanup).");
+  }
+  console.log(`
+1. Registering MCP server...`);
   const mcpPath = getMcpServerPath();
   const bunBin = getBunPath();
   const result = spawnSync("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
@@ -2044,14 +2080,12 @@ function install() {
   for (const [event, scriptPath] of hookEntries) {
     const hooks = settings.hooks;
     hooks[event] ??= [];
-    const exists = hooks[event].some((e) => JSON.stringify(e).includes("claude-memory-hub"));
-    if (!exists) {
-      hooks[event].push({
-        matcher: "",
-        hooks: [{ type: "command", command: `${bunBin} run ${scriptPath}` }]
-      });
-      registered++;
-    }
+    hooks[event] = hooks[event].filter((e) => !JSON.stringify(e).includes("claude-memory-hub"));
+    hooks[event].push({
+      matcher: "",
+      hooks: [{ type: "command", command: `${bunBin} run ${scriptPath}` }]
+    });
+    registered++;
   }
   saveSettings(settings);
   console.log(`   ${registered} hook(s) registered. (${5 - registered} already existed)`);

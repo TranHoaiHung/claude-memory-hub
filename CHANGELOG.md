@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.5] - 2026-04-03
+
+Stable install path — hooks no longer break after reboot or bunx cache cleanup.
+
+### Bug Fixes
+
+- **Hooks pointing to temp `bunx` path** — `bunx claude-memory-hub install` registered hooks at `/private/tmp/bunx-*/...` (macOS) or `%TEMP%/bunx-*/...` (Windows). These paths are ephemeral and get deleted on reboot or cache cleanup, causing **all hooks to silently fail** — sessions stop being captured with no error visible to the user
+- **Install now copies `dist/` to `~/.claude-memory-hub/dist/`** — a stable, persistent location under the user's home directory. Both hooks and MCP server reference this path instead of the package install location
+- **Old hook entries auto-replaced** — `install` removes previous claude-memory-hub hook entries before registering new ones, fixing stale paths from prior installs without manual cleanup
+- **`install.sh` updated** — shell-based installer uses the same stable path strategy with full bun binary resolution
+
+### How It Works
+
+```
+bunx claude-memory-hub install
+  1. Downloads package to temp dir (bunx behavior)
+  2. Copies dist/*.js + dist/hooks/*.js → ~/.claude-memory-hub/dist/  ← NEW
+  3. Registers hooks pointing to ~/.claude-memory-hub/dist/hooks/      ← STABLE
+  4. Registers MCP server pointing to ~/.claude-memory-hub/dist/index.js
+```
+
+### Upgrade Note
+
+Run `bunx claude-memory-hub@latest install` to fix broken hooks. No data loss — only hook paths are updated.
+
+---
+
 ## [0.9.4] - 2026-04-02
 
 Windows path fix — backslashes no longer eaten by bash.

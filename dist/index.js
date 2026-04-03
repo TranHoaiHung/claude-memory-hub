@@ -14140,6 +14140,11 @@ class SessionStore {
     this.db.run("UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ?", [Date.now(), id]);
   }
   insertEntity(entity) {
+    if (entity.entity_type === "decision" || entity.entity_type === "observation") {
+      const existing = this.db.query("SELECT COUNT(*) as c FROM entities WHERE session_id = ? AND entity_type = ? AND entity_value = ?").get(entity.session_id, entity.entity_type, entity.entity_value);
+      if (existing && existing.c > 0)
+        return -1;
+    }
     const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
       entity.session_id,
