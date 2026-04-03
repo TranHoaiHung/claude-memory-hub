@@ -852,12 +852,42 @@ var init_semantic_search = __esm(() => {
 var exports_vector_search = {};
 __export(exports_vector_search, {
   vectorSearch: () => vectorSearch,
+  tokenize: () => tokenize,
   reindexAll: () => reindexAll,
   rebuildIDF: () => rebuildIDF,
   indexDocument: () => indexDocument
 });
 function tokenize(text) {
-  return text.toLowerCase().replace(/[^a-z0-9_./\-]/g, " ").split(/\s+/).filter((w) => w.length > 1 && !STOP_WORDS.has(w));
+  const tokens = [];
+  const camelSplit = text.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+  const words = camelSplit.toLowerCase().replace(/[^a-z0-9_./\-]/g, " ").split(/\s+/).filter(Boolean);
+  for (const word of words) {
+    if (word.includes("/") && word.length > 3) {
+      const parts = word.split("/").filter((p) => p.length > 1);
+      for (const part of parts) {
+        const subparts = part.split(".").filter((s) => s.length > 1);
+        for (const sp of subparts) {
+          if (!STOP_WORDS.has(sp))
+            tokens.push(sp);
+        }
+      }
+      continue;
+    }
+    if (word.includes("_") && word.length > 3) {
+      const parts = word.split("_").filter((p) => p.length > 1);
+      for (const part of parts) {
+        if (!STOP_WORDS.has(part))
+          tokens.push(part);
+      }
+      if (!STOP_WORDS.has(word))
+        tokens.push(word);
+      continue;
+    }
+    if (word.length > 1 && !STOP_WORDS.has(word)) {
+      tokens.push(word);
+    }
+  }
+  return tokens;
 }
 function computeTF(tokens) {
   const freq = new Map;
@@ -1056,7 +1086,63 @@ var init_vector_search = __esm(() => {
     "her",
     "they",
     "them",
-    "their"
+    "their",
+    "const",
+    "let",
+    "var",
+    "function",
+    "return",
+    "class",
+    "new",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "void",
+    "type",
+    "interface",
+    "export",
+    "import",
+    "from",
+    "default",
+    "async",
+    "await",
+    "try",
+    "catch",
+    "throw",
+    "if",
+    "else",
+    "for",
+    "while",
+    "switch",
+    "case",
+    "break",
+    "continue",
+    "public",
+    "private",
+    "protected",
+    "static",
+    "readonly",
+    "extends",
+    "implements",
+    "super",
+    "this",
+    "typeof",
+    "instanceof",
+    "file",
+    "line",
+    "error",
+    "warning",
+    "info",
+    "debug",
+    "log",
+    "true",
+    "false",
+    "yes",
+    "no",
+    "ok",
+    "done",
+    "success"
   ]);
 });
 
@@ -1127,10 +1213,32 @@ async function searchIndex(query, opts = {}, db) {
   for (const r of filtered) {
     const key = `${r.type}:${r.id}`;
     const existing = deduped.get(key);
-    if (!existing || r.score > existing.score)
-      deduped.set(key, r);
+    if (!existing) {
+      deduped.set(key, { ...r, sourceCount: 1 });
+    } else {
+      existing.score = Math.max(existing.score, r.score);
+      existing.sourceCount++;
+    }
   }
-  const merged = [...deduped.values()];
+  const now = Date.now();
+  const merged = [...deduped.values()].map((r) => {
+    let score = r.score;
+    const ageMs = now - r.created_at;
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    if (ageDays < 7)
+      score *= 1.5;
+    else if (ageDays < 30)
+      score *= 1.2;
+    else if (ageDays < 90)
+      score *= 1;
+    else
+      score *= 0.8;
+    if (r.sourceCount >= 3)
+      score *= 1.4;
+    else if (r.sourceCount >= 2)
+      score *= 1.2;
+    return { ...r, score };
+  });
   merged.sort((a, b) => b.score - a.score);
   return merged.slice(0, limit);
 }
@@ -2009,6 +2117,7 @@ function buildSummaryText(s) {
 import { spawnSync } from "child_process";
 var CLAUDE_DIR = join5(homedir5(), ".claude");
 var SETTINGS_PATH = join5(CLAUDE_DIR, "settings.json");
+var COMMANDS_DIR = join5(CLAUDE_DIR, "commands");
 var PKG_DIR = resolve(dirname(import.meta.dir));
 var STABLE_DIR = join5(homedir5(), ".claude-memory-hub");
 function shellPath(p) {
@@ -2079,6 +2188,32 @@ function saveSettings(settings) {
   writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
 `);
 }
+function installCommands() {
+  const srcCommands = join5(PKG_DIR, "commands");
+  if (!existsSync5(srcCommands))
+    return 0;
+  mkdirSync3(COMMANDS_DIR, { recursive: true });
+  let count = 0;
+  for (const file of readdirSync(srcCommands)) {
+    if (!file.endsWith(".md"))
+      continue;
+    const src = join5(srcCommands, file);
+    const dest = join5(COMMANDS_DIR, file);
+    writeFileSync(dest, readFileSync(src));
+    count++;
+  }
+  return count;
+}
+function uninstallCommands() {
+  const memCommands = ["mem-search.md", "mem-status.md", "mem-save.md"];
+  for (const file of memCommands) {
+    const p = join5(COMMANDS_DIR, file);
+    try {
+      if (existsSync5(p))
+        __require("fs").unlinkSync(p);
+    } catch {}
+  }
+}
 function install() {
   console.log(`claude-memory-hub \u2014 install
 `);
@@ -2142,13 +2277,18 @@ function install() {
 3. Data directory exists: ${dataDir}`);
   }
   console.log(`
+4. Installing slash commands...`);
+  const cmdCount = installCommands();
+  console.log(`   ${cmdCount} command(s) installed to ~/.claude/commands/`);
+  console.log(`
 ========================================`);
   console.log("Installation complete!");
   console.log("");
-  console.log("  MCP:   claude-memory-hub");
-  console.log("  Hooks: PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop");
-  console.log("  Data:  ~/.claude-memory-hub/memory.db");
-  console.log("  Key:   not needed");
+  console.log("  MCP:      claude-memory-hub");
+  console.log("  Hooks:    PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop");
+  console.log("  Commands: /mem-search, /mem-status, /mem-save");
+  console.log("  Data:     ~/.claude-memory-hub/memory.db");
+  console.log("  Key:      not needed");
   console.log("");
   console.log("  Restart Claude Code to activate.");
   console.log("========================================");
@@ -2171,6 +2311,8 @@ function install() {
 function uninstall() {
   console.log(`claude-memory-hub \u2014 uninstall
 `);
+  uninstallCommands();
+  console.log("Removed slash commands from ~/.claude/commands/");
   spawnSync("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
     stdio: "inherit"
   });

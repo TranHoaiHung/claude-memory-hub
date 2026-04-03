@@ -13,7 +13,7 @@
   <a href="https://github.com/TranHoaiHung/claude-memory-hub/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/claude-memory-hub.svg" alt="license" /></a>
 </p>
 
-Zero API key. Zero Python. Zero config. One install command.
+Zero API key. Zero Python. Zero config. One install command. Privacy-first.
 
 ---
 
@@ -28,7 +28,9 @@ What makes it different? **The Compact Interceptor** — something no other memo
 But it doesn't stop there:
 - **Full conversation capture** — every user prompt + assistant response saved via transcript parsing
 - **Cross-session memory** — past work auto-injected when you start a new session
-- **3-engine hybrid search** — FTS5 + TF-IDF + semantic embeddings (384-dim, offline)
+- **3-engine hybrid search** — FTS5 + TF-IDF + semantic embeddings with recency-aware ranking
+- **Privacy-first** — `<private>` tags, auto secret detection, path-based filtering
+- **Slash commands** — `/mem-search`, `/mem-status`, `/mem-save` built-in
 - **Proactive retrieval** — detects topic shifts mid-session, injects relevant context automatically
 - **100+ unit tests**, batch queue (75ms→3ms), JSONL export/import, browser UI
 - **Multi-agent ready** — subagents share memory for free via MCP
@@ -64,6 +66,10 @@ Search:        Keyword-only, no semantic ranking
 | Cross-session memory | -- | Yes | **Yes** |
 | Full conversation capture (user+assistant) | -- | -- | **Yes** |
 | Conversation search (FTS5) | -- | -- | **Yes** |
+| Privacy filtering (`<private>` tags + secret detection) | -- | Partial | **Yes** |
+| Slash commands (`/mem-search`, `/mem-status`, `/mem-save`) | -- | Yes | **Yes** |
+| Code-aware search (camelCase, snake_case, paths) | -- | -- | **Yes** |
+| Recency-aware ranking (recent sessions boosted) | -- | -- | **Yes** |
 | Influence what compact preserves | -- | -- | **Yes** |
 | Save compact output to L3 | -- | -- | **Yes** |
 | Hybrid search (FTS5 + TF-IDF + semantic) | -- | Partial | **Yes** |
@@ -158,7 +164,7 @@ memory-hub search:  query → Layer 1 (index)    → ~50 tokens/result
                     Token savings: ~80-90% vs. full context
 ```
 
-Hybrid ranking: FTS5 BM25 (keyword) + TF-IDF (term frequency) + semantic cosine similarity (384-dim embeddings). "debugging tips" matches "error fixing" even without shared keywords.
+Hybrid ranking: FTS5 BM25 (keyword) + TF-IDF (term frequency) + semantic cosine similarity (384-dim embeddings). Code-aware tokenizer splits camelCase, snake_case, and file paths into meaningful tokens. Recency decay boosts recent sessions (7d=1.5x, 30d=1.2x, >90d=0.8x). Multi-source boost rewards results found by 2+ engines. "debugging tips" matches "error fixing" even without shared keywords.
 
 ### Layer 5 — Resource Intelligence
 
@@ -266,6 +272,80 @@ User prompt contains "remember that we use TypeScript strict"
 
 ---
 
+## Privacy Protection
+
+3-layer privacy system — sensitive data never reaches the database.
+
+### Layer 1: `<private>` Tags
+
+Wrap sensitive content in `<private>` tags — stripped before storage:
+
+```
+<private>API_KEY=sk-abc123def456</private>
+→ stored as: [REDACTED]
+```
+
+### Layer 2: Auto Secret Detection
+
+Built-in patterns catch common secrets automatically:
+
+```
+sk-proj-abc123...          → sk-proj-abc1[REDACTED]
+Bearer eyJhbGci...         → Bearer eyJhb[REDACTED]
+password: "hunter2"        → password: "h[REDACTED]
+AKIAIOSFODNN7...           → AKIAIOSFODNN[REDACTED]
+-----BEGIN PRIVATE KEY---- → [REDACTED]
+```
+
+Detected: API keys (`sk-`, `ghp_`, `gho_`, `AKIA`), Bearer tokens, passwords, private keys, hex/base64 secrets.
+
+### Layer 3: Path Filtering
+
+Sensitive files are completely excluded from entity tracking:
+
+```
+.env, .env.*, *.pem, *.key, *.p12
+credentials.*, **/secrets/**, **/private/**
+```
+
+### Custom Configuration
+
+Create `~/.claude-memory-hub/privacy.json` to extend:
+
+```json
+{
+  "tag_stripping": true,
+  "auto_detect_secrets": true,
+  "ignored_paths": ["my-secrets.yaml", "**/vault/**"],
+  "custom_patterns": ["INTERNAL_TOKEN_[A-Z0-9]{20,}"]
+}
+```
+
+Custom paths and patterns are **added** to defaults, not replacing them.
+
+---
+
+## Slash Commands
+
+Installed automatically with `bunx claude-memory-hub install`. Available as `/mem-*` in Claude Code.
+
+| Command | What it does |
+|---------|-------------|
+| `/mem-search <query>` | 3-layer progressive search — finds past sessions by topic, file, or keyword |
+| `/mem-status [project]` | Health check + token budget analysis + current session activity |
+| `/mem-save <note>` | Save an important decision or finding to persistent memory |
+
+```bash
+# Examples
+/mem-search auth login bug
+/mem-status claude-memory-hub
+/mem-save Decided to use JWT refresh tokens with 15min expiry
+```
+
+Commands are copied to `~/.claude/commands/` during install and removed on uninstall.
+
+---
+
 ## Install
 
 ### From npm (recommended)
@@ -274,7 +354,7 @@ User prompt contains "remember that we use TypeScript strict"
 bunx claude-memory-hub install
 ```
 
-One command. Registers MCP server + 5 hooks globally. Works on CLI, VS Code, JetBrains.
+One command. Registers MCP server + 5 hooks + 3 slash commands globally. Works on CLI, VS Code, JetBrains.
 
 **Coming from claude-mem?** The installer auto-detects `~/.claude-mem/claude-mem.db` and migrates your data automatically.
 
@@ -318,11 +398,11 @@ Claude can call these tools directly during conversation:
 
 | Tool | What it does | When to use |
 |------|-------------|-------------|
-| `memory_recall` | FTS5 search past sessions (supports `max_tokens`) | Starting a task, looking for prior work |
-| `memory_entities` | Find all sessions that touched a file | Before editing a file, understanding history |
-| `memory_session_notes` | Current session activity (L1 cache) | Mid-session, checking what's been done |
-| `memory_store` | Manually save a note or decision | Preserving important context |
-| `memory_context_budget` | Analyze token costs + overhead report | Understanding resource usage |
+| `memory_recall` | FTS5 + semantic search past sessions (AUTO-USE) | Starting any task — proactively checks for prior work |
+| `memory_entities` | Find all sessions that touched a file (AUTO-USE) | Before editing any file — understand its history |
+| `memory_session_notes` | Current session activity (L1 cache) | Mid-session review of files, decisions, errors |
+| `memory_store` | Save a note/decision to persistent memory | Architectural decisions, key findings, workarounds |
+| `memory_context_budget` | Token overhead analysis + recommendations | When sessions feel slow or context seems bloated |
 
 ### 3-Layer Search
 
@@ -439,6 +519,7 @@ Migration is idempotent — safe to run multiple times with zero duplicates.
 | **v0.9.5** | Stable install path — hooks no longer break after reboot or bunx cache cleanup |
 | **v0.9.6** | Agent/Skill result capture, higher summary limits, IDE tag stripping, PostCompact cap, broader observation patterns (20+) |
 | **v0.10.0** | **Full conversation capture** — all user prompts + assistant responses via transcript parsing, `messages` table with FTS5, `memory_conversation` MCP tool, conversation-enriched summaries |
+| **v0.11.0** | **Privacy + Search + Commands** — 3-layer privacy filtering (`<private>` tags, auto secret detection, path filtering), code-aware tokenizer (camelCase/snake_case/path splitting), recency-aware ranking (7d/30d/90d decay), RRF multi-source fusion, slash commands (`/mem-search`, `/mem-status`, `/mem-save`), improved MCP tool descriptions with AUTO-USE hints |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
 
@@ -468,11 +549,12 @@ bun:sqlite                         Built-in, zero install
 
 ## Data & Privacy
 
-All data stored locally at `~/.claude-memory-hub/`.
+All data stored locally at `~/.claude-memory-hub/`. **Privacy-first by design.**
 
 ```
 ~/.claude-memory-hub/
   ├── memory.db           # SQLite database (all memory data)
+  ├── privacy.json        # Privacy config (optional — custom patterns/paths)
   ├── batch/
   │   └── queue.jsonl     # PostToolUse batch queue (auto-flushed)
   ├── proactive/
@@ -480,6 +562,11 @@ All data stored locally at `~/.claude-memory-hub/`.
   └── logs/
       └── memory-hub.log  # Structured JSON logs (auto-rotated at 5MB)
 ```
+
+**3-layer privacy protection** (see [Privacy Protection](#privacy-protection)):
+- `<private>` tags stripped before storage
+- API keys, tokens, passwords auto-detected and redacted
+- Sensitive file paths (`.env`, `*.pem`, `*.key`) excluded from tracking
 
 No cloud. No telemetry. No network calls. Your memory stays on your machine.
 

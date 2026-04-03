@@ -703,6 +703,144 @@ function extractCodePatterns(content) {
   return [...new Set(patterns)];
 }
 
+// src/capture/privacy-filter.ts
+var log2 = createLogger("privacy-filter");
+var DEFAULT_PRIVACY_CONFIG = {
+  tag_stripping: true,
+  auto_detect_secrets: true,
+  ignored_paths: [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.credentials",
+    "credentials.*",
+    "**/secrets/**",
+    "**/.secrets/**",
+    "**/private/**"
+  ],
+  custom_patterns: []
+};
+var PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
+function stripPrivateTags(text) {
+  return text.replace(PRIVATE_TAG_RE, "[REDACTED]");
+}
+var SECRET_PATTERNS = [
+  /(?:api[_-]?key|api[_-]?secret|access[_-]?key)\s*[:=]\s*['"]?[\w\-./+]{8,}['"]?/gi,
+  /(?:sk-|pk_|pk-|ghp_|gho_|ghr_|ghs_|ghv_|xox[bsrap]-|hf_|glpat-)[\w\-]{20,}/g,
+  /Bearer\s+[\w\-./+=]{20,}/g,
+  /(?:password|passwd|secret|token|credential)\s*[:=]\s*['"]?[^\s'"]{8,}['"]?/gi,
+  /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
+  /(?:AKIA|ASIA)[A-Z0-9]{16}/g,
+  /(?:secret|token|key|password|auth)\s*[:=]\s*['"]?[a-f0-9]{32,}['"]?/gi
+];
+function redactSecrets(text) {
+  let result = text;
+  for (const pattern of SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, (match) => {
+      const prefix = match.slice(0, Math.min(12, match.length));
+      return `${prefix}[REDACTED]`;
+    });
+  }
+  return result;
+}
+function isIgnoredPath(filePath, config = DEFAULT_PRIVACY_CONFIG) {
+  if (!filePath)
+    return false;
+  const normalized = filePath.replace(/\\/g, "/");
+  for (const pattern of config.ignored_paths) {
+    if (matchGlob(normalized, pattern)) {
+      log2.debug("Path ignored by privacy filter", { path: filePath, pattern });
+      return true;
+    }
+  }
+  return false;
+}
+function matchGlob(path, pattern) {
+  const pathBasename = path.split("/").pop() || "";
+  if (!pattern.includes("/") && !pattern.includes("**")) {
+    return matchSimple(pathBasename, pattern);
+  }
+  const re = globToRegex(pattern);
+  return re.test(path);
+}
+function matchSimple(name, pattern) {
+  if (name === pattern)
+    return true;
+  if (pattern.includes(".*")) {
+    const base = pattern.replace(".*", "");
+    if (name === base || name.startsWith(base + "."))
+      return true;
+  }
+  if (pattern.startsWith("*")) {
+    const ext = pattern.slice(1);
+    if (name.endsWith(ext))
+      return true;
+  }
+  return false;
+}
+function globToRegex(pattern) {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "___DOUBLESTAR___").replace(/\*/g, "[^/]*").replace(/___DOUBLESTAR___/g, ".*");
+  return new RegExp(`(?:^|/)${escaped}(?:$|/)`, "i");
+}
+var compiledCustomCache = new Map;
+function getCustomPatterns(config) {
+  const results = [];
+  for (const p of config.custom_patterns) {
+    let compiled = compiledCustomCache.get(p);
+    if (!compiled) {
+      try {
+        compiled = new RegExp(p, "gi");
+        compiledCustomCache.set(p, compiled);
+      } catch {
+        log2.warn("Invalid custom privacy pattern", { pattern: p });
+        continue;
+      }
+    }
+    results.push(compiled);
+  }
+  return results;
+}
+function sanitize(text, config = DEFAULT_PRIVACY_CONFIG) {
+  if (!text)
+    return text;
+  let result = text;
+  if (config.tag_stripping) {
+    result = stripPrivateTags(result);
+  }
+  if (config.auto_detect_secrets) {
+    result = redactSecrets(result);
+  }
+  const customPatterns = getCustomPatterns(config);
+  for (const pattern of customPatterns) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, "[REDACTED]");
+  }
+  return result;
+}
+function loadPrivacyConfig() {
+  try {
+    const { existsSync: existsSync3, readFileSync } = __require("fs");
+    const { join: join3 } = __require("path");
+    const { homedir: homedir3 } = __require("os");
+    const configPath = join3(homedir3(), ".claude-memory-hub", "privacy.json");
+    if (!existsSync3(configPath))
+      return DEFAULT_PRIVACY_CONFIG;
+    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    return {
+      tag_stripping: raw.tag_stripping ?? DEFAULT_PRIVACY_CONFIG.tag_stripping,
+      auto_detect_secrets: raw.auto_detect_secrets ?? DEFAULT_PRIVACY_CONFIG.auto_detect_secrets,
+      ignored_paths: Array.isArray(raw.ignored_paths) ? [...DEFAULT_PRIVACY_CONFIG.ignored_paths, ...raw.ignored_paths] : DEFAULT_PRIVACY_CONFIG.ignored_paths,
+      custom_patterns: Array.isArray(raw.custom_patterns) ? raw.custom_patterns : []
+    };
+  } catch {
+    return DEFAULT_PRIVACY_CONFIG;
+  }
+}
+
 // src/capture/observation-extractor.ts
 var TOOL_OUTPUT_HEURISTICS = [
   { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
@@ -733,12 +871,14 @@ var MIN_INPUT_LENGTH = 20;
 function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
   if (!output || output.length < MIN_INPUT_LENGTH)
     return;
-  return matchHeuristics(output, TOOL_OUTPUT_HEURISTICS, sessionId, project, toolName, promptNumber);
+  const clean = sanitize(output, loadPrivacyConfig());
+  return matchHeuristics(clean, TOOL_OUTPUT_HEURISTICS, sessionId, project, toolName, promptNumber);
 }
 function extractObservationFromPrompt(prompt, sessionId, project, promptNumber) {
   if (!prompt || prompt.length < MIN_INPUT_LENGTH)
     return;
-  return matchHeuristics(prompt, PROMPT_HEURISTICS, sessionId, project, "UserPrompt", promptNumber);
+  const clean = sanitize(prompt, loadPrivacyConfig());
+  return matchHeuristics(clean, PROMPT_HEURISTICS, sessionId, project, "UserPrompt", promptNumber);
 }
 function matchHeuristics(text, heuristics, sessionId, project, toolName, promptNumber) {
   let bestMatch;
@@ -783,17 +923,18 @@ function extractEntities(hook, promptNumber = 0) {
   const project = deriveProject(hook);
   const now = Date.now();
   const raw = [];
+  const privacyConfig = loadPrivacyConfig();
   switch (tool_name) {
     case "Read": {
       const path = stringField2(tool_input, "file_path");
-      if (path) {
+      if (path && !isIgnoredPath(path, privacyConfig)) {
         raw.push(makeEntity(session_id, project, tool_name, "file_read", path, 1, now, promptNumber));
       }
       break;
     }
     case "Write": {
       const path = stringField2(tool_input, "file_path");
-      if (path) {
+      if (path && !isIgnoredPath(path, privacyConfig)) {
         raw.push(makeEntity(session_id, project, tool_name, "file_created", path, 4, now, promptNumber));
       }
       break;
@@ -801,7 +942,7 @@ function extractEntities(hook, promptNumber = 0) {
     case "Edit":
     case "MultiEdit": {
       const path = stringField2(tool_input, "file_path");
-      if (path) {
+      if (path && !isIgnoredPath(path, privacyConfig)) {
         raw.push(makeEntity(session_id, project, tool_name, "file_modified", path, 4, now, promptNumber));
       }
       break;
@@ -855,6 +996,11 @@ function extractEntities(hook, promptNumber = 0) {
     const obs = extractObservationFromOutput(output, session_id, project, tool_name, promptNumber);
     if (obs)
       enriched.push(obs);
+  }
+  for (const e of enriched) {
+    e.entity_value = sanitize(e.entity_value, privacyConfig);
+    if (e.context)
+      e.context = sanitize(e.context, privacyConfig);
   }
   return enriched;
 }
@@ -986,7 +1132,7 @@ class ResourceTracker {
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
-var log2 = createLogger("resource-registry");
+var log3 = createLogger("resource-registry");
 var CHARS_PER_TOKEN = 3.75;
 var SCAN_TTL_MS = 5 * 60 * 1000;
 var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
@@ -1013,7 +1159,7 @@ class ResourceRegistry {
       this.scanClaudeMd(cwd);
       this.lastScanAt = Date.now();
     } catch (err) {
-      log2.error("scan failed", { error: String(err) });
+      log3.error("scan failed", { error: String(err) });
     }
   }
   resolve(kind, name) {
@@ -1115,7 +1261,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log2.error(`scanSkillDir ${dir}`, { error: String(err) });
+      log3.error(`scanSkillDir ${dir}`, { error: String(err) });
     }
   }
   scanFlatAgents(dir) {
@@ -1147,7 +1293,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log2.error(`scanFlatAgents ${dir}`, { error: String(err) });
+      log3.error(`scanFlatAgents ${dir}`, { error: String(err) });
     }
   }
   scanAgentPackages(claudeDir) {
@@ -1161,7 +1307,7 @@ class ResourceRegistry {
         this.scanAgentPackageDir(packageDir);
       }
     } catch (err) {
-      log2.error("scanAgentPackages", { error: String(err) });
+      log3.error("scanAgentPackages", { error: String(err) });
     }
   }
   scanAgentPackageDir(packageDir) {
@@ -1215,7 +1361,7 @@ class ResourceRegistry {
         }
       }
     } catch (err) {
-      log2.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+      log3.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
     }
   }
   scanCommands(globalDir, cwd) {
@@ -1253,7 +1399,7 @@ class ResourceRegistry {
         }
       }
     } catch (err) {
-      log2.error(`scanCommandDir ${dir}`, { error: String(err) });
+      log3.error(`scanCommandDir ${dir}`, { error: String(err) });
     }
   }
   scanWorkflows(dir) {
@@ -1281,7 +1427,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log2.error(`scanWorkflows ${dir}`, { error: String(err) });
+      log3.error(`scanWorkflows ${dir}`, { error: String(err) });
     }
   }
   scanClaudeMd(cwd) {
@@ -1557,7 +1703,7 @@ function safeJson(text, fallback) {
 }
 
 // src/context/injection-validator.ts
-var log3 = createLogger("injection-validator");
+var log4 = createLogger("injection-validator");
 var MAX_CHARS = 8000;
 
 class InjectionValidator {
@@ -1578,7 +1724,7 @@ class InjectionValidator {
       }
       return text;
     } catch (err) {
-      log3.error("validation failed, returning empty", { error: String(err) });
+      log4.error("validation failed, returning empty", { error: String(err) });
       return "";
     }
   }
@@ -1589,7 +1735,7 @@ class InjectionValidator {
         return true;
       const alive = this.registry.exists(kind, r.resource_name);
       if (!alive) {
-        log3.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
+        log4.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
       }
       return alive;
     });
@@ -1612,7 +1758,7 @@ function mapResourceTypeToKind(type) {
 // src/context/claude-md-tracker.ts
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
 import { join as join4, dirname, basename as basename2 } from "path";
-var log4 = createLogger("claude-md-tracker");
+var log5 = createLogger("claude-md-tracker");
 var MAX_WALK_DEPTH = 20;
 var CHARS_PER_TOKEN2 = 3.75;
 var STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
@@ -1654,7 +1800,7 @@ class ClaudeMdTracker {
           entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
         }
       } catch (err) {
-        log4.error(`Failed to process ${filePath}`, { error: String(err) });
+        log5.error(`Failed to process ${filePath}`, { error: String(err) });
       }
     }
     return entries;
@@ -1791,7 +1937,8 @@ async function handlePostToolUse(hook, project) {
 async function handleUserPromptSubmit(hook, project) {
   const store = new SessionStore;
   const ltStore = new LongTermStore;
-  const cleanPrompt = stripIdeTags(hook.prompt);
+  const privacyConfig = loadPrivacyConfig();
+  const cleanPrompt = sanitize(stripIdeTags(hook.prompt), privacyConfig);
   store.upsertSession({
     id: hook.session_id,
     project,

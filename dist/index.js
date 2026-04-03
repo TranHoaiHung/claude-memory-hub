@@ -15479,10 +15479,95 @@ var STOP_WORDS = new Set([
   "her",
   "they",
   "them",
-  "their"
+  "their",
+  "const",
+  "let",
+  "var",
+  "function",
+  "return",
+  "class",
+  "new",
+  "true",
+  "false",
+  "null",
+  "undefined",
+  "void",
+  "type",
+  "interface",
+  "export",
+  "import",
+  "from",
+  "default",
+  "async",
+  "await",
+  "try",
+  "catch",
+  "throw",
+  "if",
+  "else",
+  "for",
+  "while",
+  "switch",
+  "case",
+  "break",
+  "continue",
+  "public",
+  "private",
+  "protected",
+  "static",
+  "readonly",
+  "extends",
+  "implements",
+  "super",
+  "this",
+  "typeof",
+  "instanceof",
+  "file",
+  "line",
+  "error",
+  "warning",
+  "info",
+  "debug",
+  "log",
+  "true",
+  "false",
+  "yes",
+  "no",
+  "ok",
+  "done",
+  "success"
 ]);
 function tokenize(text) {
-  return text.toLowerCase().replace(/[^a-z0-9_./\-]/g, " ").split(/\s+/).filter((w) => w.length > 1 && !STOP_WORDS.has(w));
+  const tokens = [];
+  const camelSplit = text.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+  const words = camelSplit.toLowerCase().replace(/[^a-z0-9_./\-]/g, " ").split(/\s+/).filter(Boolean);
+  for (const word of words) {
+    if (word.includes("/") && word.length > 3) {
+      const parts = word.split("/").filter((p) => p.length > 1);
+      for (const part of parts) {
+        const subparts = part.split(".").filter((s) => s.length > 1);
+        for (const sp of subparts) {
+          if (!STOP_WORDS.has(sp))
+            tokens.push(sp);
+        }
+      }
+      continue;
+    }
+    if (word.includes("_") && word.length > 3) {
+      const parts = word.split("_").filter((p) => p.length > 1);
+      for (const part of parts) {
+        if (!STOP_WORDS.has(part))
+          tokens.push(part);
+      }
+      if (!STOP_WORDS.has(word))
+        tokens.push(word);
+      continue;
+    }
+    if (word.length > 1 && !STOP_WORDS.has(word)) {
+      tokens.push(word);
+    }
+  }
+  return tokens;
 }
 function computeTF(tokens) {
   const freq = new Map;
@@ -15590,10 +15675,32 @@ async function searchIndex(query, opts = {}, db) {
   for (const r of filtered) {
     const key = `${r.type}:${r.id}`;
     const existing = deduped.get(key);
-    if (!existing || r.score > existing.score)
-      deduped.set(key, r);
+    if (!existing) {
+      deduped.set(key, { ...r, sourceCount: 1 });
+    } else {
+      existing.score = Math.max(existing.score, r.score);
+      existing.sourceCount++;
+    }
   }
-  const merged = [...deduped.values()];
+  const now = Date.now();
+  const merged = [...deduped.values()].map((r) => {
+    let score = r.score;
+    const ageMs = now - r.created_at;
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    if (ageDays < 7)
+      score *= 1.5;
+    else if (ageDays < 30)
+      score *= 1.2;
+    else if (ageDays < 90)
+      score *= 1;
+    else
+      score *= 0.8;
+    if (r.sourceCount >= 3)
+      score *= 1.4;
+    else if (r.sourceCount >= 2)
+      score *= 1.2;
+    return { ...r, score };
+  });
   merged.sort((a, b) => b.score - a.score);
   return merged.slice(0, limit);
 }
@@ -15897,11 +16004,11 @@ ${tag} [${date4}] **${m.role}** #${m.prompt_number}`);
 var TOOL_DEFINITIONS = [
   {
     name: "memory_recall",
-    description: "Search long-term memory for relevant context from past Claude sessions. " + "Use this at the start of a task to find prior work on the same topic, files, or problem area.",
+    description: "Search long-term memory for relevant context from past Claude sessions. " + "AUTO-USE: Call this proactively at the start of any task to check for prior work " + "on the same topic, files, or problem area. Returns formatted summaries with file lists.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Natural language search query" },
+        query: { type: "string", description: "Natural language search query (e.g., 'auth login bug', 'payment integration')" },
         limit: { type: "number", description: "Max results (default 5, max 10)" },
         max_tokens: { type: "number", description: "Max output tokens. Results truncated to fit budget. Default: unlimited" }
       },
@@ -15910,18 +16017,18 @@ var TOOL_DEFINITIONS = [
   },
   {
     name: "memory_entities",
-    description: "Find all past sessions that read or modified a specific file. " + "Useful for understanding the history of a file before editing it.",
+    description: "Find all past sessions that read or modified a specific file. " + "AUTO-USE: Call this before editing any file to understand its history \u2014 " + "who changed it, what decisions were made, what errors occurred.",
     inputSchema: {
       type: "object",
       properties: {
-        file_path: { type: "string", description: "File path to look up" }
+        file_path: { type: "string", description: "Absolute or relative file path to look up" }
       },
       required: ["file_path"]
     }
   },
   {
     name: "memory_session_notes",
-    description: "Get notes and activity summary for the current session \u2014 files touched, decisions, errors.",
+    description: "Get notes and activity summary for the current session \u2014 files touched, decisions made, errors encountered. " + "Use to review what has been accomplished in this session before summarizing or wrapping up.",
     inputSchema: {
       type: "object",
       properties: {
@@ -15932,37 +16039,37 @@ var TOOL_DEFINITIONS = [
   },
   {
     name: "memory_store",
-    description: "Manually save an important note or decision to memory. Use for architectural decisions, key findings.",
+    description: "Manually save an important note or decision to persistent memory. " + "Use for: architectural decisions with rationale, key debugging findings, " + "workarounds and constraints, configuration choices. Survives across sessions.",
     inputSchema: {
       type: "object",
       properties: {
-        note: { type: "string", description: "Note or decision to save" },
-        session_id: { type: "string", description: "Session ID to save to" }
+        note: { type: "string", description: "Note or decision to save (be specific and include rationale)" },
+        session_id: { type: "string", description: "Session ID to attach the note to" }
       },
       required: ["note", "session_id"]
     }
   },
   {
     name: "memory_context_budget",
-    description: "Analyze token overhead, resource usage, and recommendations. " + "Shows: fixed cost breakdown (skills/agents/commands/CLAUDE.md listings), " + "unused resources wasting tokens, potential savings, and usage-based recommendations. " + "Use to understand and optimize context token efficiency.",
+    description: "Analyze token overhead from skills, agents, commands, and CLAUDE.md files. " + "Shows: fixed cost breakdown per category, unused resources wasting tokens, " + "potential savings, and usage-based optimization recommendations. " + "Use when sessions feel slow or context seems bloated.",
     inputSchema: {
       type: "object",
       properties: {
-        project: { type: "string", description: "Project name to analyze" }
+        project: { type: "string", description: "Project name (directory basename) to analyze" }
       },
       required: ["project"]
     }
   },
   {
     name: "memory_search",
-    description: "Layer 1 search: returns lightweight index of matching memories (~50 tokens/result). " + "Uses FTS5 + TF-IDF hybrid for better ranking. " + "Follow up with memory_timeline or memory_fetch for details.",
+    description: "Layer 1 search: returns lightweight index of matching memories (~50 tokens/result). " + "Uses FTS5 + TF-IDF + semantic hybrid ranking with recency boost. " + "WORKFLOW: Start here, then use memory_timeline for context or memory_fetch for full records.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query" },
-        limit: { type: "number", description: "Max results (default 20)" },
+        query: { type: "string", description: "Search query \u2014 supports natural language and code terms" },
+        limit: { type: "number", description: "Max results (default 20, max 50)" },
         offset: { type: "number", description: "Pagination offset (default 0)" },
-        project: { type: "string", description: "Filter by project" },
+        project: { type: "string", description: "Filter by project name (optional)" },
         max_tokens: { type: "number", description: "Max output tokens. Results truncated to fit budget" }
       },
       required: ["query"]
@@ -15970,20 +16077,20 @@ var TOOL_DEFINITIONS = [
   },
   {
     name: "memory_timeline",
-    description: "Layer 2: get chronological context around a search result. " + "Shows what happened before and after a specific memory entry.",
+    description: "Layer 2: get chronological context around a search result (~200 tokens). " + "Shows what happened before and after a specific memory entry. " + "Use after memory_search to understand the sequence of events.",
     inputSchema: {
       type: "object",
       properties: {
-        id: { type: "number", description: "Record ID from memory_search results" },
-        type: { type: "string", enum: ["summary", "entity"], description: "Record type" },
-        depth: { type: "number", description: "How many entries before/after (default 3)" }
+        id: { type: "number", description: "Record ID from memory_search results (e.g., summary#42)" },
+        type: { type: "string", enum: ["summary", "entity"], description: "Record type from search results" },
+        depth: { type: "number", description: "How many entries before/after (default 3, max 10)" }
       },
       required: ["id", "type"]
     }
   },
   {
     name: "memory_fetch",
-    description: "Layer 3: fetch full records by IDs. Returns complete content (~500 tokens/result). " + "Only use after filtering with memory_search to avoid wasting tokens.",
+    description: "Layer 3: fetch full records by IDs (~500 tokens/result). Returns complete content including " + "summaries, file lists, decisions, and error details. " + "IMPORTANT: Only use after filtering with memory_search \u2014 fetching blindly wastes tokens.",
     inputSchema: {
       type: "object",
       properties: {
@@ -15997,7 +16104,7 @@ var TOOL_DEFINITIONS = [
             },
             required: ["id", "type"]
           },
-          description: "Array of {id, type} from search results"
+          description: "Array of {id, type} from search results (max 20)"
         },
         max_tokens: { type: "number", description: "Max output tokens. Records truncated to fit budget" }
       },
@@ -16006,21 +16113,21 @@ var TOOL_DEFINITIONS = [
   },
   {
     name: "memory_conversation",
-    description: "Retrieve full conversation flow (user + assistant messages) for a session. " + "Returns chronological messages with role, content, and timestamps. " + "Use to understand what was discussed, what the user asked, and how the assistant responded.",
+    description: "Retrieve full conversation flow (user + assistant messages) for a session. " + "Returns chronological messages with role, content, and timestamps. " + "Use to understand what was discussed and decided. Supports FTS5 search across all conversations.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string", description: "Session ID to retrieve conversation for" },
         role: { type: "string", enum: ["user", "assistant"], description: "Filter by role (optional)" },
-        limit: { type: "number", description: "Max messages to return (default 50)" },
-        search: { type: "string", description: "Search within conversation messages (optional)" }
+        limit: { type: "number", description: "Max messages to return (default 50, max 200)" },
+        search: { type: "string", description: "Full-text search across all conversations (ignores session_id when used)" }
       },
       required: ["session_id"]
     }
   },
   {
     name: "memory_health",
-    description: "Run health check on memory-hub: database, FTS5, disk, integrity.",
+    description: "Run health check on memory-hub: database integrity, FTS5 index status, " + "disk space, embedding count, and overall system health. " + "Use when memory seems slow or search returns unexpected results.",
     inputSchema: {
       type: "object",
       properties: {}
