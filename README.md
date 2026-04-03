@@ -463,6 +463,7 @@ Idempotent — safe to run multiple times.
 | Version | Highlight |
 |---------|-----------|
 | **v0.11.1** | Quality hardening — clock skew guard, 155 unit tests (+44%) |
+| **v0.11.2** | **Critical fix** — context injection was silently failing (null crash in validator), slash commands install fallback for bunx, null-safe budget allocation |
 | **v0.11.0** | 3-layer privacy, code-aware search, recency ranking, slash commands |
 | **v0.10.0** | Full conversation capture (user + assistant), `memory_conversation` tool |
 | **v0.9.x** | Smart budget allocation, stable install paths, agent/skill capture |

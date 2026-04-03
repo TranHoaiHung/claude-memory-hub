@@ -2166,6 +2166,16 @@ function copyDistToStableDir() {
       }
     }
   }
+  const srcCmds = join5(PKG_DIR, "commands");
+  if (existsSync5(srcCmds)) {
+    const destCmds = join5(STABLE_DIR, "commands");
+    mkdirSync3(destCmds, { recursive: true });
+    for (const file of readdirSync(srcCmds)) {
+      if (file.endsWith(".md")) {
+        writeFileSync(join5(destCmds, file), readFileSync(join5(srcCmds, file)));
+      }
+    }
+  }
 }
 function getHookPath(hookName) {
   return shellPath(join5(STABLE_DIR, "dist", "hooks", `${hookName}.js`));
@@ -2189,7 +2199,9 @@ function saveSettings(settings) {
 `);
 }
 function installCommands() {
-  const srcCommands = join5(PKG_DIR, "commands");
+  let srcCommands = join5(PKG_DIR, "commands");
+  if (!existsSync5(srcCommands))
+    srcCommands = join5(STABLE_DIR, "commands");
   if (!existsSync5(srcCommands))
     return 0;
   mkdirSync3(COMMANDS_DIR, { recursive: true });

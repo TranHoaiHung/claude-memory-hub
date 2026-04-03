@@ -5,6 +5,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.11.2] - 2026-04-03
+
+Critical fix — context injection was silently failing, causing Claude to start every session from zero.
+
+### Critical Bugfix: Context Injection Failure
+
+**Root cause:** `InjectionValidator.validate()` crashed with `TypeError: null is not an object (evaluating 'text.replace')` when `fitWithinBudget()` passed `null`/`undefined` to it. The catch block returned `""`, so `UserPromptSubmit` hook injected **empty context** every session. Claude never received past session data despite 165 sessions and 36 summaries in the database.
+
+**Impact:** All users. Every new session started from zero — the core value proposition of memory-hub was broken.
+
+**Fixes:**
+
+- **`injection-validator.ts`** — added null guard: `if (!rawContext) return ""` before `text.replace()`. Prevents crash when upstream passes null
+- **`hook-handler.ts`** — all `fitWithinBudget()` inputs now null-safe: `memoryText || ""` for all 4 sections. Prevents null from propagating through budget allocation
+- **`cli/main.ts`** — slash commands install now falls back to `~/.claude-memory-hub/commands/` when `PKG_DIR/commands/` doesn't exist (common with `bunx` temp dirs). Also copies commands to stable dir during `copyDistToStableDir()`
+- **`package.json`** — added `commands/` to `files` array so slash commands are included in npm publish
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/context/injection-validator.ts` | Null guard on `validate()` input |
+| `src/capture/hook-handler.ts` | Null-safe `fitWithinBudget()` section inputs |
+| `src/cli/main.ts` | Commands install fallback + copy to stable dir |
+| `package.json` | Added `commands/` to `files`, version bump |
+
+---
+
 ## [0.11.1] - 2026-04-03
 
 Quality hardening — more tests, bugfixes, and robustness improvements for v0.11.0 features.

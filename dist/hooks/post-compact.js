@@ -2037,6 +2037,8 @@ class InjectionValidator {
   }
   validate(rawContext, recommendations) {
     try {
+      if (!rawContext)
+        return "";
       let text = rawContext;
       text = text.replace(/<!--[\s\S]*?-->/g, "");
       text = text.replace(/<\/?system-reminder>/gi, "");
@@ -2322,10 +2324,10 @@ async function handleUserPromptSubmit(hook, project) {
 function fitWithinBudget(memoryText, mdText, adviceText, overheadText) {
   const MAX_CHARS2 = 8000;
   const sections = [
-    { text: memoryText, priority: 1, minChars: 500 },
-    { text: mdText, priority: 2, minChars: 200 },
-    { text: adviceText, priority: 3, minChars: 0 },
-    { text: overheadText, priority: 4, minChars: 0 }
+    { text: memoryText || "", priority: 1, minChars: 500 },
+    { text: mdText || "", priority: 2, minChars: 200 },
+    { text: adviceText || "", priority: 3, minChars: 0 },
+    { text: overheadText || "", priority: 4, minChars: 0 }
   ].filter((s) => s.text.length > 0);
   const totalNeeded = sections.reduce((sum, s) => sum + s.text.length, 0);
   if (totalNeeded <= MAX_CHARS2) {
