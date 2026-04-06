@@ -587,6 +587,17 @@ class LongTermStore {
          WHERE summary LIKE ? OR files_touched LIKE ? OR decisions LIKE ?
          ORDER BY created_at DESC LIMIT ?`).all(pattern, pattern, pattern, limit);
   }
+  countSummaries(project) {
+    if (project) {
+      const row2 = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries WHERE project = ?").get(project);
+      return row2?.c ?? 0;
+    }
+    const row = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries").get();
+    return row?.c ?? 0;
+  }
+  getRecentSummariesAll(limit = 5) {
+    return this.db.query("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ?").all(limit);
+  }
   findByFile(filePath, limit = 10) {
     const escaped = filePath.replace(/[%_]/g, "\\$&");
     return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
@@ -2287,7 +2298,25 @@ async function handleUserPromptSubmit(hook, project) {
   const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
-  const results = ltStore.search(hook.prompt, 3);
+  let results = ltStore.search(hook.prompt, 3);
+  let memoryHint = "";
+  if (results.length === 0) {
+    const recent = ltStore.getRecentSummariesAll(3);
+    if (recent.length > 0) {
+      results = recent.map((r) => ({
+        session_id: r.session_id,
+        project: r.project,
+        summary: r.summary,
+        files_touched: r.files_touched,
+        decisions: r.decisions,
+        errors_fixed: r.errors_fixed,
+        created_at: r.created_at,
+        rank: 0
+      }));
+      const total = ltStore.countSummaries();
+      memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+    }
+  }
   const registry = getResourceRegistry();
   registry.scan(hook.cwd);
   const validator = new InjectionValidator(registry);
@@ -2317,7 +2346,7 @@ async function handleUserPromptSubmit(hook, project) {
       overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
     }
   } catch {}
-  const memorySection = buildMemorySection(results);
+  const memorySection = buildMemorySection(results, memoryHint);
   const safeContext = validator.validate(fitWithinBudget(memorySection, mdSummary, advice, overheadWarning));
   return { additionalContext: safeContext };
 }
@@ -2353,7 +2382,7 @@ function fitWithinBudget(memoryText, mdText, adviceText, overheadText) {
 
 `);
 }
-function buildMemorySection(results) {
+function buildMemorySection(results, hint = "") {
   if (results.length === 0)
     return "";
   const lines = ["**Past session context:**"];
@@ -2364,10 +2393,13 @@ function buildMemorySection(results) {
     if (files.length > 0)
       lines.push(`  Files: ${files.slice(0, 5).join(", ")}`);
   }
+  if (hint)
+    lines.push(`
+_${hint}_`);
   return lines.join(`
 `);
 }
-async function handleSessionEnd(hook, project) {
+async function handleSessionEnd(hook, _project) {
   const store = new SessionStore;
   store.completeSession(hook.session_id);
 }

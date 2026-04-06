@@ -14353,6 +14353,17 @@ class LongTermStore {
          WHERE summary LIKE ? OR files_touched LIKE ? OR decisions LIKE ?
          ORDER BY created_at DESC LIMIT ?`).all(pattern, pattern, pattern, limit);
   }
+  countSummaries(project) {
+    if (project) {
+      const row2 = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries WHERE project = ?").get(project);
+      return row2?.c ?? 0;
+    }
+    const row = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries").get();
+    return row?.c ?? 0;
+  }
+  getRecentSummariesAll(limit = 5) {
+    return this.db.query("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ?").all(limit);
+  }
   findByFile(filePath, limit = 10) {
     const escaped = filePath.replace(/[%_]/g, "\\$&");
     return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at

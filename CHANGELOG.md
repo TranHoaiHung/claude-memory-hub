@@ -5,6 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.11.5] - 2026-04-06
+
+Memory hint injection — Claude now always knows memory hub is active, even when FTS5 finds no keyword match.
+
+### Bugfix: Silent Context Gap on Generic Queries
+
+**Root cause:** When the user asked in Vietnamese or used natural-language phrases like "cuộc trò chuyện gần nhất", `ltStore.search()` ran FTS5 with those words against English summaries — no match. `buildMemorySection([])` returned `""`. Claude received zero context and fell back to `git log` / built-in `MEMORY.md`.
+
+**Fix:** If FTS5 returns 0 results but the DB has summaries, inject a **memory available hint**:
+```
+Memory hub active — N past sessions stored (projects: foo, bar).
+Call memory_recall or memory_search with project-specific keywords to retrieve relevant context.
+```
+This ensures Claude always knows to call memory tools, regardless of query language or specificity.
+
+### Improvements
+
+- `LongTermStore.countSummaries(project?)` — fast COUNT query for summary availability check
+- `LongTermStore.getRecentSummariesAll(limit)` — recent summaries without project filter (for hint project list)
+- `buildMemorySection(results, hint)` — hint shown only when no FTS5 results; real results take precedence
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/db/long-term-store.ts` | Added `countSummaries()` + `getRecentSummariesAll()` |
+| `src/capture/hook-handler.ts` | Fallback hint injection when FTS5 returns 0 results |
+| `package.json` | Version bump to 0.11.5 |
+
+---
+
 ## [0.11.4] - 2026-04-03
 
 Search quality fix — pruned garbage summaries and guided Claude to use specific keywords.
