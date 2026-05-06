@@ -3,6 +3,7 @@ var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __toESM = (mod, isNodeMode, target) => {
   target = mod != null ? __create(__getProtoOf(mod)) : {};
@@ -14,6 +15,20 @@ var __toESM = (mod, isNodeMode, target) => {
         enumerable: true
       });
   return to;
+};
+var __moduleCache = /* @__PURE__ */ new WeakMap;
+var __toCommonJS = (from) => {
+  var entry = __moduleCache.get(from), desc;
+  if (entry)
+    return entry;
+  entry = __defProp({}, "__esModule", { value: true });
+  if (from && typeof from === "object" || typeof from === "function")
+    __getOwnPropNames(from).map((key) => !__hasOwnProp.call(entry, key) && __defProp(entry, key, {
+      get: () => from[key],
+      enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable
+    }));
+  __moduleCache.set(from, entry);
+  return entry;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
 var __export = (target, all) => {
@@ -6733,6 +6748,39 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
     log.info("Migration v5 complete");
   }
+  if (currentVersion < 6) {
+    log.info("Applying migration v6: resource_descriptions + relax embeddings doc_type");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS resource_descriptions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_kind   TEXT NOT NULL CHECK(resource_kind IN ('skill','agent','command','workflow','claude_md')),
+        resource_name   TEXT NOT NULL,
+        file_path       TEXT NOT NULL,
+        embed_text      TEXT NOT NULL,
+        content_hash    TEXT NOT NULL,
+        embedded_at     INTEGER NOT NULL,
+        UNIQUE(resource_kind, resource_name)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_resource_descriptions_kind ON resource_descriptions(resource_kind)`);
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings_v6 (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note','resource')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`INSERT INTO embeddings_v6 SELECT * FROM embeddings`);
+    db.run(`DROP TABLE embeddings`);
+    db.run(`ALTER TABLE embeddings_v6 RENAME TO embeddings`);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
+    log.info("Migration v6 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -6876,6 +6924,903 @@ var init_schema = __esm(() => {
   log = createLogger("schema");
 });
 
+// src/db/session-store.ts
+class SessionStore {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  upsertSession(session) {
+    this.db.run(`INSERT INTO sessions(id, project, started_at, ended_at, user_prompt, status)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         ended_at    = excluded.ended_at,
+         user_prompt = COALESCE(excluded.user_prompt, user_prompt),
+         status      = excluded.status`, [
+      session.id,
+      session.project,
+      session.started_at,
+      session.ended_at ?? null,
+      session.user_prompt ?? null,
+      session.status
+    ]);
+  }
+  getSession(id) {
+    return this.db.query("SELECT * FROM sessions WHERE id = ?").get(id) ?? null;
+  }
+  completeSession(id) {
+    this.db.run("UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ?", [Date.now(), id]);
+  }
+  insertEntity(entity) {
+    if (entity.entity_type === "decision" || entity.entity_type === "observation") {
+      const existing = this.db.query("SELECT COUNT(*) as c FROM entities WHERE session_id = ? AND entity_type = ? AND entity_value = ?").get(entity.session_id, entity.entity_type, entity.entity_value);
+      if (existing && existing.c > 0)
+        return -1;
+    }
+    const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+      entity.session_id,
+      entity.project,
+      entity.tool_name,
+      entity.entity_type,
+      entity.entity_value,
+      entity.context ?? null,
+      entity.importance,
+      entity.created_at,
+      entity.prompt_number
+    ]);
+    return Number(result.lastInsertRowid);
+  }
+  getSessionEntities(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
+  }
+  getSessionErrors(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'error' ORDER BY importance DESC").all(session_id);
+  }
+  getSessionDecisions(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'decision' ORDER BY importance DESC").all(session_id);
+  }
+  getSessionObservations(session_id) {
+    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'observation' ORDER BY importance DESC").all(session_id);
+  }
+  getSessionFiles(session_id) {
+    return this.db.query(`SELECT DISTINCT entity_value FROM entities
+         WHERE session_id = ? AND entity_type IN ('file_read','file_modified','file_created')
+         ORDER BY importance DESC, created_at DESC`).all(session_id).map((r) => r.entity_value);
+  }
+  hasModifiedFiles(session_id) {
+    const row = this.db.query(`SELECT COUNT(*) as c FROM entities
+         WHERE session_id = ? AND entity_type IN ('file_modified','file_created') LIMIT 1`).get(session_id);
+    return (row?.c ?? 0) > 0;
+  }
+  insertNote(note) {
+    this.db.run("INSERT INTO session_notes(session_id, content, created_at) VALUES (?, ?, ?)", [note.session_id, note.content, note.created_at]);
+  }
+  getSessionNotes(session_id) {
+    return this.db.query("SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
+  }
+  insertMessage(msg) {
+    if (msg.uuid) {
+      const existing = this.db.query("SELECT COUNT(*) as c FROM messages WHERE uuid = ?").get(msg.uuid);
+      if (existing && existing.c > 0)
+        return -1;
+    }
+    const result = this.db.run(`INSERT INTO messages(session_id, project, role, content, prompt_number, timestamp, uuid, parent_uuid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
+      msg.session_id,
+      msg.project,
+      msg.role,
+      msg.content,
+      msg.prompt_number,
+      msg.timestamp,
+      msg.uuid ?? null,
+      msg.parent_uuid ?? null
+    ]);
+    return Number(result.lastInsertRowid);
+  }
+  insertMessages(msgs) {
+    let count = 0;
+    const db = this.db;
+    db.transaction(() => {
+      for (const msg of msgs) {
+        const id = this.insertMessage(msg);
+        if (id !== -1)
+          count++;
+      }
+    })();
+    return count;
+  }
+  getSessionMessages(session_id, role) {
+    if (role) {
+      return this.db.query("SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id, role);
+    }
+    return this.db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id);
+  }
+  getMessageCount(session_id, role) {
+    if (role) {
+      const row2 = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ? AND role = ?").get(session_id, role);
+      return row2?.c ?? 0;
+    }
+    const row = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ?").get(session_id);
+    return row?.c ?? 0;
+  }
+  searchMessages(query, limit = 10) {
+    if (!query.trim())
+      return [];
+    const words = query.trim().split(/\s+/).filter((w) => w.length > 1).map((w) => `"${w.replace(/["*^()]/g, "")}"`);
+    if (words.length === 0)
+      return [];
+    const ftsQuery = words.join(" ");
+    try {
+      return this.db.query(`SELECT m.*, rank FROM fts_messages
+           JOIN messages m ON m.id = fts_messages.rowid
+           WHERE fts_messages MATCH ?
+           ORDER BY rank LIMIT ?`).all(ftsQuery, limit);
+    } catch {
+      const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
+      return this.db.query("SELECT * FROM messages WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?").all(pattern, limit);
+    }
+  }
+}
+var init_session_store = __esm(() => {
+  init_schema();
+});
+
+// src/db/long-term-store.ts
+class LongTermStore {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  upsertSummary(summary) {
+    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         summary       = excluded.summary,
+         files_touched = excluded.files_touched,
+         decisions     = excluded.decisions,
+         errors_fixed  = excluded.errors_fixed,
+         token_savings = excluded.token_savings`, [
+      summary.session_id,
+      summary.project,
+      summary.summary,
+      summary.files_touched,
+      summary.decisions,
+      summary.errors_fixed,
+      summary.token_savings,
+      summary.created_at
+    ]);
+  }
+  getSummary(session_id) {
+    return this.db.query("SELECT * FROM long_term_summaries WHERE session_id = ?").get(session_id) ?? null;
+  }
+  getRecentSummaries(project, limit = 5) {
+    return this.db.query("SELECT * FROM long_term_summaries WHERE project = ? ORDER BY created_at DESC LIMIT ?").all(project, limit);
+  }
+  search(query, limit = 5) {
+    if (!query.trim())
+      return [];
+    const safeQuery = sanitizeFtsQuery(query);
+    if (!safeQuery)
+      return [];
+    try {
+      return this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
+                  lts.files_touched, lts.decisions, lts.errors_fixed,
+                  lts.created_at, rank
+           FROM fts_memories
+           JOIN long_term_summaries lts ON lts.id = fts_memories.rowid
+           WHERE fts_memories MATCH ?
+           ORDER BY rank
+           LIMIT ?`).all(safeQuery, limit);
+    } catch {
+      return this.fallbackSearch(query, limit);
+    }
+  }
+  fallbackSearch(query, limit) {
+    const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
+    return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+         FROM long_term_summaries
+         WHERE summary LIKE ? OR files_touched LIKE ? OR decisions LIKE ?
+         ORDER BY created_at DESC LIMIT ?`).all(pattern, pattern, pattern, limit);
+  }
+  countSummaries(project) {
+    if (project) {
+      const row2 = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries WHERE project = ?").get(project);
+      return row2?.c ?? 0;
+    }
+    const row = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries").get();
+    return row?.c ?? 0;
+  }
+  getRecentSummariesAll(limit = 5) {
+    return this.db.query("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ?").all(limit);
+  }
+  findByFile(filePath, limit = 10) {
+    const escaped = filePath.replace(/[%_]/g, "\\$&");
+    return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+         FROM long_term_summaries
+         WHERE files_touched LIKE ?
+         ORDER BY created_at DESC LIMIT ?`).all(`%${escaped}%`, limit);
+  }
+}
+function sanitizeFtsQuery(query) {
+  const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^()]/g, "")).filter((w) => w.length > 1);
+  if (words.length === 0)
+    return "";
+  const head = words.slice(0, -1).map((w) => `"${w}"`);
+  const last = words[words.length - 1];
+  return [...head, `"${last}"*`].join(" ");
+}
+var init_long_term_store = __esm(() => {
+  init_schema();
+});
+
+// src/context/resource-tracker.ts
+class ResourceTracker {
+  db;
+  initialized = false;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  ensureSchema() {
+    if (this.initialized)
+      return;
+    this.db.run(SCHEMA_ADDITIONS);
+    this.initialized = true;
+  }
+  trackUsage(session_id, project, resource_type, resource_name, token_cost = 0) {
+    this.ensureSchema();
+    const existing = this.db.query("SELECT id, use_count FROM resource_usage WHERE session_id = ? AND resource_name = ?").get(session_id, resource_name);
+    if (existing) {
+      this.db.run("UPDATE resource_usage SET use_count = use_count + 1 WHERE id = ?", [existing.id]);
+    } else {
+      this.db.run(`INSERT INTO resource_usage(session_id, project, resource_type, resource_name, use_count, token_cost, created_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)`, [session_id, project, resource_type, resource_name, token_cost, Date.now()]);
+    }
+  }
+  getMostUsedResources(project, resource_type, limit = 10) {
+    this.ensureSchema();
+    if (resource_type) {
+      return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+           FROM resource_usage WHERE project = ? AND resource_type = ?
+           GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, resource_type, limit);
+    }
+    return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+         FROM resource_usage WHERE project = ?
+         GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, limit);
+  }
+  getRecentlyUsedResources(project, lastNSessions = 5) {
+    this.ensureSchema();
+    return this.db.query(`SELECT resource_type, resource_name, COUNT(DISTINCT session_id) as frequency
+         FROM resource_usage
+         WHERE project = ?
+           AND session_id IN (
+             SELECT DISTINCT session_id FROM resource_usage
+             WHERE project = ?
+             ORDER BY created_at DESC
+             LIMIT ?
+           )
+         GROUP BY resource_type, resource_name
+         ORDER BY frequency DESC, resource_type`).all(project, project, lastNSessions);
+  }
+  estimateTokenBudget(project) {
+    this.ensureSchema();
+    const rows = this.db.query(`SELECT resource_type, SUM(token_cost) as total_tokens, COUNT(DISTINCT resource_name) as count
+         FROM resource_usage
+         WHERE project = ?
+         GROUP BY resource_type`).all(project);
+    const by_type = {};
+    let total = 0;
+    let count = 0;
+    for (const row of rows) {
+      by_type[row.resource_type] = row.total_tokens;
+      total += row.total_tokens;
+      count += row.count;
+    }
+    return { total_token_cost: total, resource_count: count, by_type };
+  }
+}
+var SCHEMA_ADDITIONS = `
+CREATE TABLE IF NOT EXISTS resource_usage (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  resource_type TEXT NOT NULL
+    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
+  resource_name TEXT NOT NULL,
+  use_count   INTEGER NOT NULL DEFAULT 1,
+  token_cost  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
+CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
+CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
+`;
+var init_resource_tracker = __esm(() => {
+  init_schema();
+});
+
+// src/context/resource-registry.ts
+import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
+import { join as join3, basename, relative } from "path";
+import { homedir as homedir3 } from "os";
+
+class ResourceRegistry {
+  resources = new Map;
+  lastScanAt = 0;
+  claudeDir;
+  constructor() {
+    this.claudeDir = join3(homedir3(), ".claude");
+  }
+  scan(cwd) {
+    if (Date.now() - this.lastScanAt < SCAN_TTL_MS && this.resources.size > 0)
+      return;
+    this.resources.clear();
+    try {
+      this.scanSkills(join3(this.claudeDir, "skills"), cwd);
+      this.scanFlatAgents(join3(this.claudeDir, "agents"));
+      this.scanAgentPackages(this.claudeDir);
+      this.scanCommands(join3(this.claudeDir, "commands"), cwd);
+      this.scanWorkflows(join3(this.claudeDir, "workflows"));
+      this.scanClaudeMd(cwd);
+      this.lastScanAt = Date.now();
+    } catch (err) {
+      log2.error("scan failed", { error: String(err) });
+    }
+  }
+  resolve(kind, name) {
+    this.ensureScanned();
+    return this.resources.get(`${kind}:${name}`);
+  }
+  exists(kind, name) {
+    return this.resolve(kind, name) !== undefined;
+  }
+  getAll(kind) {
+    this.ensureScanned();
+    const all = [...this.resources.values()];
+    return kind ? all.filter((r) => r.kind === kind) : all;
+  }
+  async getOverheadReport(project, lastNSessions = 10) {
+    this.ensureScanned();
+    const tracker = new ResourceTracker;
+    const recentSkills = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "skill");
+    const recentAgents = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "agent");
+    const allSkills = this.getAll("skill");
+    const allAgents = this.getAll("agent");
+    const usedSkillNames = new Set(recentSkills.map((r) => r.resource_name));
+    const usedAgentNames = new Set(recentAgents.map((r) => r.resource_name));
+    const unusedSkills = allSkills.filter((s) => !usedSkillNames.has(s.name));
+    const unusedAgents = allAgents.filter((a) => !usedAgentNames.has(a.name));
+    const skillListingTokens = allSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const agentDescTokens = allAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const commandListingTokens = this.getAll("command").reduce((sum, c) => sum + c.listing_tokens, 0);
+    const claudeMdTokens = this.getAll("claude_md").reduce((sum, c) => sum + c.full_tokens, 0);
+    const unusedSkillListingTokens = unusedSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const unusedAgentListingTokens = unusedAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const recommendations = [];
+    if (unusedSkills.length > 0) {
+      recommendations.push(`${unusedSkills.length}/${allSkills.length} skills unused in last ${lastNSessions} sessions (~${unusedSkillListingTokens} listing tokens). Consider project-local or removal.`);
+    }
+    if (unusedAgents.length > 0) {
+      recommendations.push(`${unusedAgents.length}/${allAgents.length} agents unused in last ${lastNSessions} sessions (~${unusedAgentListingTokens} listing tokens).`);
+    }
+    if (claudeMdTokens > 5000) {
+      recommendations.push(`CLAUDE.md chain is ${claudeMdTokens} tokens. Consider consolidating if >5K.`);
+    }
+    return {
+      fixed_overhead: {
+        total_tokens: skillListingTokens + agentDescTokens + commandListingTokens + claudeMdTokens,
+        skill_listings: skillListingTokens,
+        agent_descriptions: agentDescTokens,
+        command_listings: commandListingTokens,
+        claude_md: claudeMdTokens
+      },
+      usage_analysis: {
+        skills_installed: allSkills.length,
+        skills_used_recently: usedSkillNames.size,
+        skills_never_used: unusedSkills.map((s) => s.name),
+        agents_installed: allAgents.length,
+        agents_used_recently: usedAgentNames.size,
+        agents_never_used: unusedAgents.map((a) => a.name)
+      },
+      recommendations,
+      potential_savings: {
+        if_remove_unused_skills: unusedSkillListingTokens,
+        if_remove_unused_agents: unusedAgentListingTokens
+      }
+    };
+  }
+  scanSkills(globalDir, cwd) {
+    this.scanSkillDir(globalDir, "global");
+    if (cwd) {
+      const projectDir = join3(cwd, ".claude", "skills");
+      if (existsSync3(projectDir)) {
+        this.scanSkillDir(projectDir, "project");
+      }
+    }
+  }
+  scanSkillDir(dir, source) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory())
+          continue;
+        const name = entry.name;
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const skillDir = join3(dir, name);
+        const skillFile = this.findPrimaryFile(skillDir, ["SKILL.md", "README.md"]);
+        const listing = this.estimateListingFromSkillDir(skillDir);
+        const fullTokens = skillFile ? this.charsToTokens(this.readFileSize(skillFile)) : 0;
+        const totalTokens = this.estimateDirTokens(skillDir);
+        this.register({
+          kind: "skill",
+          name,
+          path: skillFile ?? skillDir,
+          allPaths: this.listMdFiles(skillDir),
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: fullTokens,
+          total_tokens: totalTokens,
+          source
+        });
+      }
+    } catch (err) {
+      log2.error(`scanSkillDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanFlatAgents(dir) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        if (entry.name === "README.md")
+          continue;
+        const filePath = join3(dir, entry.name);
+        const content = this.readFileHead(filePath, 20);
+        const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        const listing = this.estimateAgentListingTokens(content);
+        this.register({
+          kind: "agent",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log2.error(`scanFlatAgents ${dir}`, { error: String(err) });
+    }
+  }
+  scanAgentPackages(claudeDir) {
+    if (!existsSync3(claudeDir))
+      return;
+    try {
+      for (const entry of readdirSync(claudeDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith("agent_"))
+          continue;
+        const packageDir = join3(claudeDir, entry.name);
+        this.scanAgentPackageDir(packageDir);
+      }
+    } catch (err) {
+      log2.error("scanAgentPackages", { error: String(err) });
+    }
+  }
+  scanAgentPackageDir(packageDir) {
+    try {
+      for (const entry of readdirSync(packageDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const subDir = join3(packageDir, entry.name);
+          const agentFile = join3(subDir, "AGENT.md");
+          if (existsSync3(agentFile)) {
+            const content = this.readFileHead(agentFile, 20);
+            const name = this.parseFrontmatterName(content) ?? entry.name;
+            if (!SAFE_NAME_RE.test(name))
+              continue;
+            const listing = this.estimateAgentListingTokens(content);
+            const fullTokens = this.charsToTokens(this.readFileSize(agentFile));
+            const totalTokens = this.estimateDirTokens(subDir);
+            this.register({
+              kind: "agent",
+              name,
+              path: agentFile,
+              allPaths: this.listMdFiles(subDir),
+              category: "variable",
+              listing_tokens: listing,
+              full_tokens: fullTokens,
+              total_tokens: totalTokens,
+              source: "global"
+            });
+          }
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (entry.name === "README.md" || entry.name === "SKILL.md")
+            continue;
+          const filePath = join3(packageDir, entry.name);
+          const content = this.readFileHead(filePath, 20);
+          const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+          if (!SAFE_NAME_RE.test(name))
+            continue;
+          if (this.resources.has(`agent:${name}`))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          this.register({
+            kind: "agent",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateAgentListingTokens(content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source: "global"
+          });
+        }
+      }
+    } catch (err) {
+      log2.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+    }
+  }
+  scanCommands(globalDir, cwd) {
+    if (existsSync3(globalDir))
+      this.scanCommandDir(globalDir, globalDir, "global");
+    if (cwd) {
+      const projectDir = join3(cwd, ".claude", "commands");
+      if (existsSync3(projectDir))
+        this.scanCommandDir(projectDir, projectDir, "project");
+    }
+  }
+  scanCommandDir(dir, baseDir, source) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          this.scanCommandDir(join3(dir, entry.name), baseDir, source);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          const filePath = join3(dir, entry.name);
+          const name = relative(baseDir, filePath).replace(/\.md$/, "");
+          if (!SAFE_COMMAND_NAME_RE.test(name))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          const content = this.readFileHead(filePath, 3);
+          this.register({
+            kind: "command",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateCommandListingTokens(name, content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source
+          });
+        }
+      }
+    } catch (err) {
+      log2.error(`scanCommandDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanWorkflows(dir) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        const filePath = join3(dir, entry.name);
+        const name = basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        this.register({
+          kind: "workflow",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: 0,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log2.error(`scanWorkflows ${dir}`, { error: String(err) });
+    }
+  }
+  scanClaudeMd(cwd) {
+    const globalFile = join3(this.claudeDir, "CLAUDE.md");
+    if (existsSync3(globalFile)) {
+      const fileSize = this.readFileSize(globalFile);
+      this.register({
+        kind: "claude_md",
+        name: "global",
+        path: globalFile,
+        allPaths: [globalFile],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "global"
+      });
+    }
+    if (!cwd)
+      return;
+    const projectFiles = [
+      join3(cwd, "CLAUDE.md"),
+      join3(cwd, ".claude", "CLAUDE.md")
+    ];
+    for (const file of projectFiles) {
+      if (!existsSync3(file))
+        continue;
+      const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
+      const name = `project:${relPath}`;
+      const fileSize = this.readFileSize(file);
+      this.register({
+        kind: "claude_md",
+        name,
+        path: file,
+        allPaths: [file],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "project"
+      });
+    }
+  }
+  ensureScanned() {
+    if (this.resources.size === 0 || Date.now() - this.lastScanAt >= SCAN_TTL_MS) {
+      this.scan();
+    }
+  }
+  register(resource) {
+    const key = `${resource.kind}:${resource.name}`;
+    const existing = this.resources.get(key);
+    if (existing && existing.source === "global" && resource.source === "project") {
+      this.resources.set(key, resource);
+    } else if (!existing) {
+      this.resources.set(key, resource);
+    }
+  }
+  parseFrontmatterName(content) {
+    const lines = content.split(`
+`);
+    let inFrontmatter = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed === "---") {
+        if (inFrontmatter)
+          return;
+        inFrontmatter = true;
+        continue;
+      }
+      if (!inFrontmatter)
+        continue;
+      const m = trimmed.match(/^name:\s*["']?([a-zA-Z0-9_\-]+)["']?/);
+      if (m?.[1])
+        return m[1];
+    }
+    return;
+  }
+  findPrimaryFile(dir, candidates) {
+    for (const c of candidates) {
+      const p = join3(dir, c);
+      if (existsSync3(p))
+        return p;
+    }
+    return;
+  }
+  readFileHead(filePath, lines) {
+    try {
+      const content = readFileSync(filePath, "utf-8");
+      return content.split(`
+`).slice(0, lines).join(`
+`);
+    } catch {
+      return "";
+    }
+  }
+  readFileSize(filePath) {
+    try {
+      return statSync(filePath).size;
+    } catch {
+      return 0;
+    }
+  }
+  charsToTokens(chars) {
+    return Math.ceil(chars / CHARS_PER_TOKEN);
+  }
+  estimateListingFromSkillDir(dir) {
+    const skillFile = this.findPrimaryFile(dir, ["SKILL.md", "README.md"]);
+    if (!skillFile)
+      return 30;
+    const head = this.readFileHead(skillFile, 5);
+    const descLine = head.split(`
+`).find((l) => l.startsWith("description:") || l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = descLine?.slice(0, 80).length ?? 20;
+    return Math.ceil((descLen + 30) / CHARS_PER_TOKEN);
+  }
+  estimateAgentListingTokens(headContent) {
+    const lines = headContent.split(`
+`);
+    for (const line of lines) {
+      if (line.startsWith("description:")) {
+        const desc = line.slice(12).trim().slice(0, 150);
+        return Math.ceil((desc.length + 30) / CHARS_PER_TOKEN);
+      }
+    }
+    return 30;
+  }
+  estimateCommandListingTokens(name, headContent) {
+    const firstLine = headContent.split(`
+`).find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = firstLine?.slice(0, 60).length ?? 10;
+    return Math.ceil((name.length + descLen + 10) / CHARS_PER_TOKEN);
+  }
+  listMdFiles(dir) {
+    const files = [];
+    try {
+      const walk = (d, depth) => {
+        if (depth > MAX_DIR_WALK_DEPTH)
+          return;
+        for (const entry of readdirSync(d, { withFileTypes: true })) {
+          const p = join3(d, entry.name);
+          if (entry.isDirectory())
+            walk(p, depth + 1);
+          else if (entry.isFile() && entry.name.endsWith(".md"))
+            files.push(p);
+        }
+      };
+      walk(dir, 0);
+    } catch {}
+    return files;
+  }
+  estimateDirTokens(dir) {
+    return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
+  }
+}
+function getResourceRegistry() {
+  if (!_instance)
+    _instance = new ResourceRegistry;
+  return _instance;
+}
+var log2, CHARS_PER_TOKEN = 3.75, SCAN_TTL_MS, SAFE_NAME_RE, SAFE_COMMAND_NAME_RE, MAX_DIR_WALK_DEPTH = 5, _instance;
+var init_resource_registry = __esm(() => {
+  init_logger();
+  init_resource_tracker();
+  log2 = createLogger("resource-registry");
+  SCAN_TTL_MS = 5 * 60 * 1000;
+  SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
+  SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
+});
+
+// src/context/smart-resource-loader.ts
+class SmartResourceLoader {
+  tracker;
+  ltStore;
+  registry;
+  constructor(registry2) {
+    this.tracker = new ResourceTracker;
+    this.ltStore = new LongTermStore;
+    this.registry = registry2 ?? getResourceRegistry();
+  }
+  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET, cwd) {
+    this.registry.scan(cwd);
+    const recommendations = [];
+    const recent = this.tracker.getRecentlyUsedResources(project, 5);
+    for (const r of recent) {
+      const tokenCost = this.getTokenCost(r.resource_type, r.resource_name);
+      if (tokenCost === 0)
+        continue;
+      recommendations.push({
+        resource_type: r.resource_type,
+        resource_name: r.resource_name,
+        score: Math.min(100, r.frequency * 20),
+        token_cost: tokenCost,
+        reason: `used in ${r.frequency}/5 recent sessions`
+      });
+    }
+    if (userPrompt.trim()) {
+      const searchResults = this.ltStore.search(userPrompt, 3);
+      for (const result of searchResults) {
+        const files = safeJson2(result.files_touched, []);
+        for (const file of files.slice(0, 5)) {
+          const existing = recommendations.find((r) => r.resource_name === file && r.resource_type === "claude_md");
+          if (!existing) {
+            recommendations.push({
+              resource_type: "claude_md",
+              resource_name: file,
+              score: 40,
+              token_cost: this.getTokenCost("claude_md", file),
+              reason: "touched in similar past session"
+            });
+          }
+        }
+      }
+    }
+    recommendations.sort((a, b) => b.score - a.score);
+    let usedTokens = 0;
+    const included = [];
+    const skipped = [];
+    for (const r of recommendations) {
+      if (usedTokens + r.token_cost <= tokenBudget) {
+        included.push(r);
+        usedTokens += r.token_cost;
+      } else {
+        skipped.push(r);
+      }
+    }
+    return {
+      recommendations: included,
+      total_tokens: usedTokens,
+      budget_remaining: tokenBudget - usedTokens,
+      skipped
+    };
+  }
+  formatContextAdvice(plan) {
+    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
+      return "";
+    const lines = [];
+    if (plan.recommendations.length > 0) {
+      lines.push("**Frequently-used resources in this project:**");
+      for (const r of plan.recommendations.slice(0, 5)) {
+        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
+      }
+    }
+    if (plan.skipped.length > 0) {
+      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
+      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
+    }
+    return lines.join(`
+`);
+  }
+  getTokenCost(resourceType, resourceName) {
+    const kind = resourceTypeToKind(resourceType);
+    if (!kind)
+      return 500;
+    const resource = this.registry.resolve(kind, resourceName);
+    return resource?.full_tokens ?? 0;
+  }
+}
+function resourceTypeToKind(type) {
+  const mapping = {
+    skill: "skill",
+    agent: "agent",
+    command: "command",
+    workflow: "workflow",
+    claude_md: "claude_md",
+    mcp_tool: "mcp_tool",
+    hook: "hook",
+    memory: "memory"
+  };
+  return mapping[type];
+}
+function safeJson2(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+var DEFAULT_TOKEN_BUDGET = 30000;
+var init_smart_resource_loader = __esm(() => {
+  init_resource_tracker();
+  init_long_term_store();
+  init_resource_registry();
+});
+
 // src/search/embedding-model.ts
 class EmbeddingModel {
   pipeline = null;
@@ -7003,6 +7948,1303 @@ var init_semantic_search = __esm(() => {
   init_embedding_model();
   init_logger();
   log6 = createLogger("semantic-search");
+});
+
+// src/context/prompt-analyzer.ts
+var exports_prompt_analyzer = {};
+__export(exports_prompt_analyzer, {
+  analyzePrompt: () => analyzePrompt
+});
+import { existsSync as existsSync5, readdirSync as readdirSync2, statSync as statSync3 } from "fs";
+import { join as join5 } from "path";
+function analyzePrompt(prompt, cwd) {
+  const text = prompt.trim();
+  const lower = text.toLowerCase();
+  return {
+    intent: detectIntent(lower),
+    keywords: extractKeywords(text),
+    language: detectLanguage(text),
+    has_error_context: /(traceback|stack ?trace|error[: ]|exception|panic:|^\s+at\s)/im.test(text),
+    has_code_block: /```|\bfunction\b|\bclass\b|\bdef\b|=>|\bimport\b/.test(text),
+    is_command_invocation: text.startsWith("/"),
+    cwd_signals: scanCwdSignals(cwd)
+  };
+}
+function detectIntent(lower) {
+  for (const { intent, re } of INTENT_PATTERNS) {
+    if (re.test(lower))
+      return intent;
+  }
+  return "general";
+}
+function detectLanguage(text) {
+  const hasVi = VIETNAMESE_RE.test(text);
+  const hasEn = /[a-zA-Z]{4,}/.test(text);
+  if (hasVi && hasEn)
+    return "mixed";
+  if (hasVi)
+    return "vi";
+  return "en";
+}
+function extractKeywords(text) {
+  const tokens = text.toLowerCase().replace(/[^\w\u00C0-\u1EF9\-_./]+/g, " ").split(/\s+/).filter((t) => t.length >= 3 && !STOP_WORDS2.has(t));
+  return [...new Set(tokens)].slice(0, 20);
+}
+function scanCwdSignals(cwd) {
+  const cached2 = CWD_CACHE.get(cwd);
+  if (cached2 && Date.now() - cached2.ts < CWD_TTL_MS)
+    return cached2.signals;
+  const signals = {
+    has_swift: false,
+    has_kotlin: false,
+    has_react_native: false,
+    has_flutter: false,
+    has_python: false,
+    has_go: false,
+    has_rust: false,
+    has_typescript: false,
+    has_java: false,
+    has_csharp: false,
+    has_figma: false,
+    is_mobile: false,
+    primary_language: null
+  };
+  if (!cwd || !existsSync5(cwd)) {
+    CWD_CACHE.set(cwd, { signals, ts: Date.now() });
+    return signals;
+  }
+  detectFromManifest(cwd, signals);
+  detectFromExtensions(cwd, signals);
+  signals.is_mobile = signals.has_swift || signals.has_kotlin || signals.has_react_native || signals.has_flutter;
+  signals.primary_language = pickPrimary(signals);
+  CWD_CACHE.set(cwd, { signals, ts: Date.now() });
+  return signals;
+}
+function detectFromManifest(cwd, s) {
+  const has = (rel) => existsSync5(join5(cwd, rel));
+  if (has("package.json")) {
+    s.has_typescript = has("tsconfig.json") || has("tsconfig.base.json");
+    try {
+      const pkg = JSON.parse(__require("fs").readFileSync(join5(cwd, "package.json"), "utf-8"));
+      const deps = { ...pkg.dependencies ?? {}, ...pkg.devDependencies ?? {} };
+      if (deps["react-native"] || deps["expo"])
+        s.has_react_native = true;
+      if (Object.keys(deps).some((k) => k.startsWith("@figma/") || k === "figma-api"))
+        s.has_figma = true;
+    } catch {}
+  }
+  if (has("Podfile") || has("*.xcodeproj"))
+    s.has_swift = true;
+  if (has("build.gradle") || has("build.gradle.kts") || has("settings.gradle"))
+    s.has_kotlin = true;
+  if (has("pubspec.yaml"))
+    s.has_flutter = true;
+  if (has("requirements.txt") || has("pyproject.toml") || has("setup.py"))
+    s.has_python = true;
+  if (has("go.mod"))
+    s.has_go = true;
+  if (has("Cargo.toml"))
+    s.has_rust = true;
+  if (has("pom.xml") || has("build.gradle"))
+    s.has_java = true;
+  if (has("global.json") || hasGlob(cwd, /\.csproj$/))
+    s.has_csharp = true;
+}
+function detectFromExtensions(cwd, s) {
+  let entries = [];
+  try {
+    entries = readdirSync2(cwd);
+  } catch {
+    return;
+  }
+  let scanned = 0;
+  for (const name of entries) {
+    if (scanned > 100)
+      break;
+    if (name.startsWith("."))
+      continue;
+    const p = join5(cwd, name);
+    try {
+      const stat = statSync3(p);
+      if (stat.isFile()) {
+        scanned++;
+        if (name.endsWith(".swift"))
+          s.has_swift = true;
+        else if (name.endsWith(".kt") || name.endsWith(".kts"))
+          s.has_kotlin = true;
+        else if (name.endsWith(".dart"))
+          s.has_flutter = true;
+        else if (name.endsWith(".py"))
+          s.has_python = true;
+        else if (name.endsWith(".go"))
+          s.has_go = true;
+        else if (name.endsWith(".rs"))
+          s.has_rust = true;
+        else if (name.endsWith(".ts") || name.endsWith(".tsx"))
+          s.has_typescript = true;
+        else if (name.endsWith(".java"))
+          s.has_java = true;
+        else if (name.endsWith(".cs"))
+          s.has_csharp = true;
+      }
+    } catch {}
+  }
+}
+function hasGlob(cwd, re) {
+  try {
+    return readdirSync2(cwd).some((n) => re.test(n));
+  } catch {
+    return false;
+  }
+}
+function pickPrimary(s) {
+  if (s.has_swift)
+    return "swift";
+  if (s.has_kotlin)
+    return "kotlin";
+  if (s.has_flutter)
+    return "dart";
+  if (s.has_react_native)
+    return "react-native";
+  if (s.has_typescript)
+    return "typescript";
+  if (s.has_python)
+    return "python";
+  if (s.has_go)
+    return "go";
+  if (s.has_rust)
+    return "rust";
+  if (s.has_java)
+    return "java";
+  if (s.has_csharp)
+    return "csharp";
+  return null;
+}
+var INTENT_PATTERNS, VIETNAMESE_RE, STOP_WORDS2, CWD_CACHE, CWD_TTL_MS = 60000;
+var init_prompt_analyzer = __esm(() => {
+  INTENT_PATTERNS = [
+    { intent: "debug", re: /\b(bug|error|crash|fail|broken|not work|fix|debug|exception|stack ?trace|loi|s\u1EEDa|sua|hong|loi)\b/i },
+    { intent: "design", re: /\b(design|ui|ux|layout|figma|component|wireframe|mockup|style|color|theme|thiet ke|thi\u1EBFt k\u1EBF)\b/i },
+    { intent: "refactor", re: /\b(refactor|clean ?up|simplify|reorganize|rename|extract|inline|optimize|tach|toi uu|t\u1ED1i \u01B0u)\b/i },
+    { intent: "implement", re: /\b(add|create|build|implement|write|tao|t\u1EA1o|viet|vi\u1EBFt|code|l\u00E0m|lam|trien khai|tri\u1EC3n khai)\b/i },
+    { intent: "question", re: /\b(how|what|why|when|where|which|l\u00E0m sao|t\u1EA1i sao|l\u00E0 g\u00EC|la gi|lam sao|tai sao)\b|\?/i }
+  ];
+  VIETNAMESE_RE = /[\u0103\u00E2\u0111\u00EA\u00F4\u01A1\u01B0]|[\u00E1\u00E0\u1EA3\u00E3\u1EA1]|[\u00E9\u00E8\u1EBB\u1EBD\u1EB9]|[\u00ED\u00EC\u1EC9\u0129\u1ECB]|[\u00F3\u00F2\u1ECF\u00F5\u1ECD]|[\u00FA\u00F9\u1EE7\u0169\u1EE5]|[\u00FD\u1EF3\u1EF7\u1EF9\u1EF5]|[\u00C0-\u1EF9]/i;
+  STOP_WORDS2 = new Set([
+    "the",
+    "is",
+    "at",
+    "of",
+    "in",
+    "on",
+    "and",
+    "or",
+    "but",
+    "for",
+    "with",
+    "to",
+    "a",
+    "an",
+    "t\xF4i",
+    "toi",
+    "b\u1EA1n",
+    "ban",
+    "c\xF3",
+    "co",
+    "kh\xF4ng",
+    "khong",
+    "l\xE0",
+    "la",
+    "n\xE0y",
+    "nay",
+    "the",
+    "this",
+    "that",
+    "what",
+    "when",
+    "where",
+    "how",
+    "why"
+  ]);
+  CWD_CACHE = new Map;
+});
+
+// src/context/resource-embedding-search.ts
+async function searchResourcesByPrompt(prompt, options = {}) {
+  const { limit = 5, threshold = 0.3, kinds, db } = options;
+  if (!prompt.trim())
+    return [];
+  await embeddingModel.embed("warmup");
+  if (!embeddingModel.isAvailable)
+    return [];
+  const queryVec = await embeddingModel.embed(prompt);
+  if (!queryVec)
+    return [];
+  const d = db ?? getDatabase();
+  const rows = d.query(`SELECT rd.id, rd.resource_kind as kind, rd.resource_name as name, rd.file_path, e.vector
+     FROM resource_descriptions rd
+     JOIN embeddings e ON e.doc_type = 'resource' AND e.doc_id = rd.id`).all();
+  const scored = [];
+  for (const row of rows) {
+    if (kinds && !kinds.includes(row.kind))
+      continue;
+    const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
+    const score = cosineSimilarity2(queryVec, docVec);
+    if (score >= threshold) {
+      scored.push({
+        kind: row.kind,
+        name: row.name,
+        file_path: row.file_path,
+        score,
+        reason: `${(score * 100).toFixed(0)}% semantic match`
+      });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+function cosineSimilarity2(a, b) {
+  let dot = 0;
+  for (let i = 0;i < a.length; i++)
+    dot += a[i] * b[i];
+  return dot;
+}
+var init_resource_embedding_search = __esm(() => {
+  init_schema();
+  init_embedding_model();
+});
+
+// src/context/resource-matcher.ts
+var exports_resource_matcher = {};
+__export(exports_resource_matcher, {
+  matchResourcesForPrompt: () => matchResourcesForPrompt
+});
+async function matchResourcesForPrompt(prompt, analysis, opts) {
+  const t0 = Date.now();
+  const { project, threshold = 0.3, limit = 5, semantic_threshold = 0.15 } = opts;
+  const semantic = await searchResourcesByPrompt(prompt, {
+    limit: 30,
+    threshold: semantic_threshold
+  });
+  const tracker = new ResourceTracker;
+  const recent = tracker.getRecentlyUsedResources(project, 5);
+  const freqMap = new Map;
+  for (const r of recent) {
+    const key = `${r.resource_type}::${r.resource_name}`;
+    freqMap.set(key, r.frequency);
+  }
+  const recencyMap = new Map;
+  for (const r of recent) {
+    const key = `${r.resource_type}::${r.resource_name}`;
+    recencyMap.set(key, r.frequency >= 1 ? 1 : 0);
+  }
+  const seen = new Map;
+  for (const m of semantic) {
+    const key = `${m.kind}::${m.name}`;
+    seen.set(key, buildScored(m, analysis, freqMap, recencyMap));
+  }
+  const registry2 = getResourceRegistry();
+  registry2.scan();
+  for (const [key, freq] of freqMap.entries()) {
+    if (seen.has(key))
+      continue;
+    if (freq < 2)
+      continue;
+    const [kind, name] = key.split("::");
+    const reg = registry2.resolve(kind, name);
+    if (!reg)
+      continue;
+    const stub = {
+      kind,
+      name,
+      score: 0,
+      reason: "frequently used",
+      file_path: reg.path
+    };
+    seen.set(key, buildScored(stub, analysis, freqMap, recencyMap));
+  }
+  const all = [...seen.values()];
+  const filtered = all.filter((r) => r.score >= threshold);
+  filtered.sort((a, b) => {
+    if (b.score !== a.score)
+      return b.score - a.score;
+    return (KIND_ORDER[a.kind] ?? 99) - (KIND_ORDER[b.kind] ?? 99);
+  });
+  log8.info("matched resources", {
+    candidates: all.length,
+    above_threshold: filtered.length,
+    ms: Date.now() - t0
+  });
+  return filtered.slice(0, limit);
+}
+function buildScored(m, analysis, freqMap, recencyMap) {
+  const semantic = m.score;
+  const freq = computeFrequencyScore(freqMap.get(`${m.kind}::${m.name}`) ?? 0);
+  const ctx = computeProjectContextScore(m.name, analysis);
+  const rec = computeRecencyScore(recencyMap.get(`${m.kind}::${m.name}`) ?? 0);
+  const final = clamp01(0.5 * semantic + 0.2 * freq + 0.2 * ctx + 0.1 * rec);
+  return {
+    kind: m.kind,
+    name: m.name,
+    file_path: m.file_path,
+    score: final,
+    semantic_score: semantic,
+    frequency_score: freq,
+    project_context_score: ctx,
+    recency_score: rec,
+    reason: buildReason(semantic, freq, ctx)
+  };
+}
+function buildReason(semantic, freq, ctx) {
+  const parts = [];
+  if (semantic >= 0.5)
+    parts.push(`${(semantic * 100).toFixed(0)}% match`);
+  else if (semantic >= 0.3)
+    parts.push(`weak semantic match`);
+  if (freq >= 0.4)
+    parts.push(`used in this project`);
+  if (ctx >= 0.5)
+    parts.push(`fits cwd`);
+  return parts.join(", ") || "candidate";
+}
+function computeFrequencyScore(usageCount) {
+  if (usageCount === 0)
+    return 0;
+  return clamp01(0.4 + (usageCount - 1) * 0.3);
+}
+function computeProjectContextScore(name, analysis) {
+  const lname = name.toLowerCase();
+  for (const rule of CONTEXT_BOOSTS) {
+    if (!rule.when(analysis.cwd_signals))
+      continue;
+    if (rule.names.some((n) => lname === n || lname.includes(n)))
+      return 1;
+  }
+  return 0;
+}
+function computeRecencyScore(daysAgo) {
+  if (daysAgo === 0)
+    return 0;
+  if (daysAgo <= 1)
+    return 1;
+  if (daysAgo <= 7)
+    return 0.6;
+  if (daysAgo <= 30)
+    return 0.3;
+  return 0;
+}
+function clamp01(n) {
+  return Math.max(0, Math.min(1, n));
+}
+var log8, CONTEXT_BOOSTS, KIND_ORDER;
+var init_resource_matcher = __esm(() => {
+  init_resource_embedding_search();
+  init_resource_tracker();
+  init_resource_registry();
+  init_logger();
+  log8 = createLogger("resource-matcher");
+  CONTEXT_BOOSTS = [
+    { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
+    { when: (s) => s.has_kotlin, names: ["android-developer", "kotlin", "compose"] },
+    { when: (s) => s.has_react_native, names: ["react-native-developer", "expo"] },
+    { when: (s) => s.has_flutter, names: ["flutter-developer", "dart", "riverpod"] },
+    { when: (s) => s.has_typescript, names: ["web-developer", "react", "nextjs", "frontend"] },
+    { when: (s) => s.has_python, names: ["python", "fastapi", "django"] },
+    { when: (s) => s.has_figma, names: ["figma-ui-mcp", "ui-ux-pro-max", "ui-ux-designer"] },
+    { when: (s) => s.is_mobile, names: ["mobile-development", "mobile-development-skill"] }
+  ];
+  KIND_ORDER = {
+    skill: 0,
+    agent: 1,
+    command: 2,
+    workflow: 3,
+    claude_md: 4
+  };
+});
+
+// src/capture/context-enricher.ts
+function enrichEntityContext(entity, hook) {
+  const response = hook.tool_response;
+  if (!response)
+    return entity;
+  switch (entity.entity_type) {
+    case "file_read":
+      return enrichFileReadContext(entity, hook);
+    case "file_modified":
+    case "file_created":
+      return enrichFileWriteContext(entity, hook);
+    case "error":
+      return enrichErrorContext(entity, hook);
+    default:
+      return entity;
+  }
+}
+function enrichFileReadContext(entity, hook) {
+  const output = getResponseText(hook);
+  if (!output)
+    return entity;
+  const firstLines = output.split(`
+`).slice(0, 5).join(`
+`);
+  const patterns = extractCodePatterns(output);
+  const contextParts = [];
+  if (firstLines.trim()) {
+    contextParts.push(`Head: ${firstLines.slice(0, 200)}`);
+  }
+  if (patterns.length > 0) {
+    contextParts.push(`Contains: ${patterns.slice(0, 5).join(", ")}`);
+  }
+  return contextParts.length > 0 ? { ...entity, context: contextParts.join(" | ").slice(0, CONTEXT_MAX_LENGTH) } : entity;
+}
+function enrichFileWriteContext(entity, hook) {
+  const input = hook.tool_input;
+  const contextParts = [];
+  if (hook.tool_name === "Edit" || hook.tool_name === "MultiEdit") {
+    const oldStr = stringField(input, "old_string");
+    const newStr = stringField(input, "new_string");
+    if (oldStr && newStr) {
+      contextParts.push(`Changed: "${oldStr.slice(0, 80)}" \u2192 "${newStr.slice(0, 80)}"`);
+    }
+  }
+  if (hook.tool_name === "Write") {
+    const content = stringField(input, "content");
+    if (content) {
+      const lines = content.split(`
+`).length;
+      const first = content.split(`
+`).slice(0, 3).join(`
+`);
+      contextParts.push(`Wrote ${lines} lines: ${first.slice(0, 150)}`);
+    }
+  }
+  return contextParts.length > 0 ? { ...entity, context: contextParts.join(" | ").slice(0, CONTEXT_MAX_LENGTH) } : entity;
+}
+function enrichErrorContext(entity, hook) {
+  const stderr = stringField(hook.tool_response, "stderr");
+  const stdout = stringField(hook.tool_response, "stdout");
+  const cmd = stringField(hook.tool_input, "command");
+  const contextParts = [];
+  if (cmd)
+    contextParts.push(`Cmd: ${cmd.slice(0, 120)}`);
+  if (stderr)
+    contextParts.push(`Stderr: ${stderr.slice(0, 200)}`);
+  else if (stdout)
+    contextParts.push(`Output: ${stdout.slice(0, 200)}`);
+  return contextParts.length > 0 ? { ...entity, context: contextParts.join(" | ").slice(0, CONTEXT_MAX_LENGTH) } : entity;
+}
+function getResponseText(hook) {
+  const r = hook.tool_response;
+  return stringField(r, "output") ?? stringField(r, "stdout") ?? undefined;
+}
+function stringField(obj, key) {
+  if (!obj)
+    return;
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function extractCodePatterns(content) {
+  const patterns = [];
+  const lines = content.split(`
+`).slice(0, 50);
+  for (const line of lines) {
+    const defMatch = line.match(/(?:export\s+)?(?:function|class|interface|type|const|enum)\s+(\w+)/);
+    if (defMatch?.[1]) {
+      patterns.push(defMatch[1]);
+      continue;
+    }
+    const importMatch = line.match(/(?:import|from)\s+['"]([^'"]+)['"]/);
+    if (importMatch?.[1]) {
+      patterns.push(`import:${importMatch[1]}`);
+    }
+  }
+  return [...new Set(patterns)];
+}
+var CONTEXT_MAX_LENGTH = 500;
+
+// src/capture/privacy-filter.ts
+function stripPrivateTags(text) {
+  return text.replace(PRIVATE_TAG_RE, "[REDACTED]");
+}
+function redactSecrets(text) {
+  let result = text;
+  for (const pattern of SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, (match) => {
+      const prefix = match.slice(0, Math.min(12, match.length));
+      return `${prefix}[REDACTED]`;
+    });
+  }
+  return result;
+}
+function isIgnoredPath(filePath, config2 = DEFAULT_PRIVACY_CONFIG) {
+  if (!filePath)
+    return false;
+  const normalized = filePath.replace(/\\/g, "/");
+  for (const pattern of config2.ignored_paths) {
+    if (matchGlob(normalized, pattern)) {
+      log9.debug("Path ignored by privacy filter", { path: filePath, pattern });
+      return true;
+    }
+  }
+  return false;
+}
+function matchGlob(path, pattern) {
+  const pathBasename = path.split("/").pop() || "";
+  if (!pattern.includes("/") && !pattern.includes("**")) {
+    return matchSimple(pathBasename, pattern);
+  }
+  const re = globToRegex(pattern);
+  return re.test(path);
+}
+function matchSimple(name, pattern) {
+  if (name === pattern)
+    return true;
+  if (pattern.includes(".*")) {
+    const base = pattern.replace(".*", "");
+    if (name === base || name.startsWith(base + "."))
+      return true;
+  }
+  if (pattern.startsWith("*")) {
+    const ext = pattern.slice(1);
+    if (name.endsWith(ext))
+      return true;
+  }
+  return false;
+}
+function globToRegex(pattern) {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "___DOUBLESTAR___").replace(/\*/g, "[^/]*").replace(/___DOUBLESTAR___/g, ".*");
+  return new RegExp(`(?:^|/)${escaped}(?:$|/)`, "i");
+}
+function getCustomPatterns(config2) {
+  const results = [];
+  for (const p of config2.custom_patterns) {
+    let compiled = compiledCustomCache.get(p);
+    if (!compiled) {
+      try {
+        compiled = new RegExp(p, "gi");
+        compiledCustomCache.set(p, compiled);
+      } catch {
+        log9.warn("Invalid custom privacy pattern", { pattern: p });
+        continue;
+      }
+    }
+    results.push(compiled);
+  }
+  return results;
+}
+function sanitize(text, config2 = DEFAULT_PRIVACY_CONFIG) {
+  if (!text)
+    return text;
+  let result = text;
+  if (config2.tag_stripping) {
+    result = stripPrivateTags(result);
+  }
+  if (config2.auto_detect_secrets) {
+    result = redactSecrets(result);
+  }
+  const customPatterns = getCustomPatterns(config2);
+  for (const pattern of customPatterns) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, "[REDACTED]");
+  }
+  return result;
+}
+function loadPrivacyConfig() {
+  try {
+    const { existsSync: existsSync6, readFileSync: readFileSync2 } = __require("fs");
+    const { join: join6 } = __require("path");
+    const { homedir: homedir5 } = __require("os");
+    const configPath = join6(homedir5(), ".claude-memory-hub", "privacy.json");
+    if (!existsSync6(configPath))
+      return DEFAULT_PRIVACY_CONFIG;
+    const raw = JSON.parse(readFileSync2(configPath, "utf-8"));
+    return {
+      tag_stripping: raw.tag_stripping ?? DEFAULT_PRIVACY_CONFIG.tag_stripping,
+      auto_detect_secrets: raw.auto_detect_secrets ?? DEFAULT_PRIVACY_CONFIG.auto_detect_secrets,
+      ignored_paths: Array.isArray(raw.ignored_paths) ? [...DEFAULT_PRIVACY_CONFIG.ignored_paths, ...raw.ignored_paths] : DEFAULT_PRIVACY_CONFIG.ignored_paths,
+      custom_patterns: Array.isArray(raw.custom_patterns) ? raw.custom_patterns : []
+    };
+  } catch {
+    return DEFAULT_PRIVACY_CONFIG;
+  }
+}
+var log9, DEFAULT_PRIVACY_CONFIG, PRIVATE_TAG_RE, SECRET_PATTERNS, compiledCustomCache;
+var init_privacy_filter = __esm(() => {
+  init_logger();
+  log9 = createLogger("privacy-filter");
+  DEFAULT_PRIVACY_CONFIG = {
+    tag_stripping: true,
+    auto_detect_secrets: true,
+    ignored_paths: [
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "*.p12",
+      "*.pfx",
+      "*.credentials",
+      "credentials.*",
+      "**/secrets/**",
+      "**/.secrets/**",
+      "**/private/**"
+    ],
+    custom_patterns: []
+  };
+  PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
+  SECRET_PATTERNS = [
+    /(?:api[_-]?key|api[_-]?secret|access[_-]?key)\s*[:=]\s*['"]?[\w\-./+]{8,}['"]?/gi,
+    /(?:sk-|pk_|pk-|ghp_|gho_|ghr_|ghs_|ghv_|xox[bsrap]-|hf_|glpat-)[\w\-]{20,}/g,
+    /Bearer\s+[\w\-./+=]{20,}/g,
+    /(?:password|passwd|secret|token|credential)\s*[:=]\s*['"]?[^\s'"]{8,}['"]?/gi,
+    /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
+    /(?:AKIA|ASIA)[A-Z0-9]{16}/g,
+    /(?:secret|token|key|password|auth)\s*[:=]\s*['"]?[a-f0-9]{32,}['"]?/gi
+  ];
+  compiledCustomCache = new Map;
+});
+
+// src/capture/observation-extractor.ts
+function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
+  if (!output || output.length < MIN_INPUT_LENGTH)
+    return;
+  const clean = sanitize(output, loadPrivacyConfig());
+  return matchHeuristics(clean, TOOL_OUTPUT_HEURISTICS, sessionId, project, toolName, promptNumber);
+}
+function extractObservationFromPrompt(prompt, sessionId, project, promptNumber) {
+  if (!prompt || prompt.length < MIN_INPUT_LENGTH)
+    return;
+  const clean = sanitize(prompt, loadPrivacyConfig());
+  return matchHeuristics(clean, PROMPT_HEURISTICS, sessionId, project, "UserPrompt", promptNumber);
+}
+function matchHeuristics(text, heuristics, sessionId, project, toolName, promptNumber) {
+  let bestMatch;
+  for (const h of heuristics) {
+    const m = h.pattern.exec(text);
+    if (!m)
+      continue;
+    if (bestMatch && h.importance <= bestMatch.importance)
+      continue;
+    const value = extractSurroundingText(text, m.index, m[0].length);
+    bestMatch = { importance: h.importance, value, label: h.label };
+  }
+  if (!bestMatch)
+    return;
+  return {
+    session_id: sessionId,
+    project,
+    tool_name: toolName,
+    entity_type: "observation",
+    entity_value: `[${bestMatch.label}] ${bestMatch.value}`,
+    importance: bestMatch.importance,
+    created_at: Date.now(),
+    prompt_number: promptNumber
+  };
+}
+function extractSurroundingText(text, matchIndex, matchLength) {
+  const before = 50;
+  const after = 100;
+  const start = Math.max(0, matchIndex - before);
+  const end = Math.min(text.length, matchIndex + matchLength + after);
+  let snippet = text.slice(start, end).trim();
+  snippet = snippet.replace(/\s+/g, " ");
+  if (snippet.length > MAX_VALUE_LENGTH) {
+    snippet = snippet.slice(0, MAX_VALUE_LENGTH - 3) + "...";
+  }
+  return snippet;
+}
+var TOOL_OUTPUT_HEURISTICS, PROMPT_HEURISTICS, MAX_VALUE_LENGTH = 500, MIN_INPUT_LENGTH = 20;
+var init_observation_extractor = __esm(() => {
+  init_privacy_filter();
+  TOOL_OUTPUT_HEURISTICS = [
+    { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
+    { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+    { pattern: /\b(migration failed|data loss|corrupt)/i, importance: 4, label: "data-risk" },
+    { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
+    { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
+    { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+    { pattern: /\b(refactored?|migrated?|upgraded?|replaced)\b/i, importance: 3, label: "refactor" },
+    { pattern: /\b(installed|added dependency|npm install|bun add)\b/i, importance: 2, label: "dependency" },
+    { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
+    { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
+    { pattern: /\b(created|scaffolded|initialized|bootstrapped)\b/i, importance: 2, label: "creation" },
+    { pattern: /\b(tests? (?:pass|fail)|coverage|assertion)/i, importance: 2, label: "test-result" },
+    { pattern: /\b(deployed|published|released|pushed to)\b/i, importance: 2, label: "deployment" },
+    { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
+  ];
+  PROMPT_HEURISTICS = [
+    { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
+    { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
+    { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
+    { pattern: /\b(fix|debug|investigate|analyze|resolve)\b/i, importance: 2, label: "user-task" },
+    { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" },
+    { pattern: /\b(implement|build|create|add feature|integrate)\b/i, importance: 2, label: "user-feature" }
+  ];
+});
+
+// src/capture/entity-extractor.ts
+function extractEntities(hook, promptNumber = 0) {
+  const { tool_name, tool_input, tool_response, session_id } = hook;
+  const project = deriveProject(hook);
+  const now = Date.now();
+  const raw = [];
+  const privacyConfig = loadPrivacyConfig();
+  switch (tool_name) {
+    case "Read": {
+      const path = stringField2(tool_input, "file_path");
+      if (path && !isIgnoredPath(path, privacyConfig)) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_read", path, 1, now, promptNumber));
+      }
+      break;
+    }
+    case "Write": {
+      const path = stringField2(tool_input, "file_path");
+      if (path && !isIgnoredPath(path, privacyConfig)) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_created", path, 4, now, promptNumber));
+      }
+      break;
+    }
+    case "Edit":
+    case "MultiEdit": {
+      const path = stringField2(tool_input, "file_path");
+      if (path && !isIgnoredPath(path, privacyConfig)) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_modified", path, 4, now, promptNumber));
+      }
+      break;
+    }
+    case "Bash": {
+      const cmd = stringField2(tool_input, "command") ?? "";
+      const exitCode = tool_response?.exit_code;
+      const stdout = stringField2(tool_response, "stdout") ?? "";
+      const stderr = stringField2(tool_response, "stderr") ?? "";
+      if (typeof exitCode === "number" && exitCode !== 0) {
+        const errorCtx = [stderr, stdout].filter(Boolean).join(`
+`).slice(0, 300);
+        raw.push(makeEntity(session_id, project, tool_name, "error", `[exit ${exitCode}] ${cmd.slice(0, 120)}`, exitCode > 0 ? 3 : 5, now, promptNumber, errorCtx || undefined));
+      }
+      const writtenFile = extractFileFromBashCmd(cmd);
+      if (writtenFile && (exitCode === 0 || exitCode === undefined)) {
+        raw.push(makeEntity(session_id, project, tool_name, "file_modified", writtenFile, 2, now, promptNumber));
+      }
+      break;
+    }
+    case "TodoWrite": {
+      const todos = tool_input["todos"];
+      if (Array.isArray(todos) && todos.length > 0) {
+        const summary = todos.slice(0, 3).map((t) => typeof t === "object" && t !== null ? String(t["content"] ?? "") : "").filter(Boolean).join("; ");
+        if (summary) {
+          raw.push(makeEntity(session_id, project, tool_name, "decision", summary, 3, now, promptNumber));
+        }
+      }
+      break;
+    }
+    case "Agent": {
+      const subagentType = stringField2(tool_input, "subagent_type") ?? "general-purpose";
+      const prompt = stringField2(tool_input, "prompt") ?? "";
+      const agentResult = extractAgentResult(tool_response);
+      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
+      break;
+    }
+    case "Skill": {
+      const skillName = stringField2(tool_input, "skill") ?? "unknown";
+      const args = stringField2(tool_input, "args") ?? "";
+      const skillResult = extractAgentResult(tool_response);
+      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
+      break;
+    }
+    default:
+      break;
+  }
+  const enriched = raw.map((e) => enrichEntityContext(e, hook));
+  const output = getResponseText2(tool_response);
+  if (output) {
+    const obs = extractObservationFromOutput(output, session_id, project, tool_name, promptNumber);
+    if (obs)
+      enriched.push(obs);
+  }
+  for (const e of enriched) {
+    e.entity_value = sanitize(e.entity_value, privacyConfig);
+    if (e.context)
+      e.context = sanitize(e.context, privacyConfig);
+  }
+  return enriched;
+}
+function makeEntity(session_id, project, tool_name, entity_type, entity_value, importance, created_at, prompt_number, context) {
+  const base = { session_id, project, tool_name, entity_type, entity_value, importance, created_at, prompt_number };
+  return context !== undefined ? { ...base, context } : base;
+}
+function getResponseText2(response) {
+  return stringField2(response, "output") ?? stringField2(response, "stdout") ?? undefined;
+}
+function stringField2(obj, key) {
+  if (!obj)
+    return;
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function deriveProject(hook) {
+  return "unknown";
+}
+function extractAgentResult(response) {
+  if (!response)
+    return;
+  const r = response;
+  const text = typeof r === "string" ? r : stringField2(r, "result") ?? stringField2(r, "output") ?? stringField2(r, "content") ?? stringField2(r, "text");
+  if (!text)
+    return;
+  return text.length > 800 ? text.slice(0, 797) + "..." : text;
+}
+function extractFileFromBashCmd(cmd) {
+  const patterns = [
+    /(?:cp|mv)\s+\S+\s+(\S+\.[\w]+)/,
+    /(?:touch|truncate)\s+(\S+\.[\w]+)/,
+    />\s*(\S+\.[\w]+)/
+  ];
+  for (const re of patterns) {
+    const m = cmd.match(re);
+    if (m?.[1] && !m[1].startsWith("-"))
+      return m[1] ?? undefined;
+  }
+  return;
+}
+var init_entity_extractor = __esm(() => {
+  init_observation_extractor();
+  init_privacy_filter();
+});
+
+// src/context/injection-validator.ts
+class InjectionValidator {
+  registry;
+  constructor(registry2) {
+    this.registry = registry2;
+  }
+  validate(rawContext, recommendations) {
+    try {
+      if (!rawContext)
+        return "";
+      let text = rawContext;
+      text = text.replace(/<!--[\s\S]*?-->/g, "");
+      text = text.replace(/<\/?system-reminder>/gi, "");
+      text = text.replace(/<\/?instructions>/gi, "");
+      text = text.trim();
+      if (text.length > MAX_CHARS) {
+        text = text.slice(0, MAX_CHARS) + `
+[...truncated for token efficiency]`;
+      }
+      return text;
+    } catch (err) {
+      log10.error("validation failed, returning empty", { error: String(err) });
+      return "";
+    }
+  }
+  filterAliveRecommendations(recommendations) {
+    return recommendations.filter((r) => {
+      const kind = mapResourceTypeToKind(r.resource_type);
+      if (!kind)
+        return true;
+      const alive = this.registry.exists(kind, r.resource_name);
+      if (!alive) {
+        log10.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
+      }
+      return alive;
+    });
+  }
+}
+function mapResourceTypeToKind(type) {
+  const mapping = {
+    skill: "skill",
+    agent: "agent",
+    command: "command",
+    workflow: "workflow",
+    claude_md: "claude_md",
+    mcp_tool: "mcp_tool",
+    hook: "hook",
+    memory: "memory"
+  };
+  return mapping[type];
+}
+var log10, MAX_CHARS = 8000;
+var init_injection_validator = __esm(() => {
+  init_logger();
+  log10 = createLogger("injection-validator");
+});
+
+// src/context/claude-md-tracker.ts
+import { existsSync as existsSync6, readFileSync as readFileSync2 } from "fs";
+import { join as join6, dirname, basename as basename2 } from "path";
+
+class ClaudeMdTracker {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  scanAndUpdate(cwd, project) {
+    const paths = this.walkToRoot(cwd);
+    const entries = [];
+    for (const filePath of paths) {
+      try {
+        const content = readFileSync2(filePath, "utf-8");
+        const hash = this.computeHash(content);
+        const existing = this.db.query("SELECT content_hash, sections_json, token_cost FROM claude_md_registry WHERE path = ?").get(filePath);
+        if (existing && existing.content_hash === hash) {
+          this.db.run("UPDATE claude_md_registry SET last_seen = ? WHERE path = ?", [Date.now(), filePath]);
+          entries.push({
+            path: filePath,
+            project,
+            contentHash: hash,
+            sections: safeJson3(existing.sections_json, []),
+            tokenCost: existing.token_cost
+          });
+        } else {
+          const sections = this.extractSections(content);
+          const tokenCost = Math.ceil(content.length / CHARS_PER_TOKEN2);
+          const sectionsJson = JSON.stringify(sections);
+          this.db.run(`INSERT INTO claude_md_registry(path, project, content_hash, sections_json, last_seen, token_cost)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(path) DO UPDATE SET
+               project = excluded.project,
+               content_hash = excluded.content_hash,
+               sections_json = excluded.sections_json,
+               last_seen = excluded.last_seen,
+               token_cost = excluded.token_cost`, [filePath, project, hash, sectionsJson, Date.now(), tokenCost]);
+          entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
+        }
+      } catch (err) {
+        log11.error(`Failed to process ${filePath}`, { error: String(err) });
+      }
+    }
+    return entries;
+  }
+  getRegistryForProject(project) {
+    const cutoff = Date.now() - STALE_THRESHOLD_MS;
+    const rows = this.db.query("SELECT path, project, content_hash, sections_json, token_cost FROM claude_md_registry WHERE project = ? AND last_seen > ?").all(project, cutoff);
+    return rows.map((r) => ({
+      path: r.path,
+      project: r.project,
+      contentHash: r.content_hash,
+      sections: safeJson3(r.sections_json, []),
+      tokenCost: r.token_cost
+    }));
+  }
+  formatForInjection(entries, maxChars) {
+    if (entries.length === 0)
+      return "";
+    const minimal = `CLAUDE.md: ${entries.map((e) => basename2(dirname(e.path)) + "/" + basename2(e.path)).join(", ")}`;
+    if (maxChars !== undefined && maxChars < 200)
+      return minimal;
+    const compactLines = ["**Active CLAUDE.md rules:**"];
+    for (const e of entries) {
+      compactLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok)`);
+    }
+    const compact = compactLines.join(`
+`);
+    if (maxChars !== undefined && maxChars < 500)
+      return compact;
+    const fullLines = ["**Active CLAUDE.md rules:**"];
+    for (const e of entries) {
+      const headings = e.sections.map((s) => s.heading).join(", ");
+      fullLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok): ${headings || "no sections"}`);
+    }
+    return fullLines.join(`
+`);
+  }
+  computeHash(content) {
+    const hasher = new Bun.CryptoHasher("md5");
+    hasher.update(content);
+    return hasher.digest("hex");
+  }
+  extractSections(content) {
+    const sections = [];
+    const lines = content.split(`
+`);
+    let currentHeading;
+    let currentBody = [];
+    const flush = () => {
+      if (currentHeading) {
+        const body = currentBody.join(`
+`).trim().slice(0, 200);
+        sections.push({ heading: currentHeading, preview: body });
+      }
+    };
+    for (const line of lines) {
+      const m = line.match(/^## (.+)$/);
+      if (m) {
+        flush();
+        currentHeading = m[1].trim();
+        currentBody = [];
+      } else if (currentHeading) {
+        currentBody.push(line);
+      }
+    }
+    flush();
+    return sections;
+  }
+  walkToRoot(startDir) {
+    const paths = [];
+    let current = startDir;
+    let depth = 0;
+    while (depth < MAX_WALK_DEPTH) {
+      const file = join6(current, "CLAUDE.md");
+      if (existsSync6(file))
+        paths.push(file);
+      const dotClaudeFile = join6(current, ".claude", "CLAUDE.md");
+      if (existsSync6(dotClaudeFile))
+        paths.push(dotClaudeFile);
+      const parent = dirname(current);
+      if (parent === current)
+        break;
+      current = parent;
+      depth++;
+    }
+    return paths;
+  }
+}
+function safeJson3(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+var log11, MAX_WALK_DEPTH = 20, CHARS_PER_TOKEN2 = 3.75, STALE_THRESHOLD_MS;
+var init_claude_md_tracker = __esm(() => {
+  init_schema();
+  init_logger();
+  log11 = createLogger("claude-md-tracker");
+  STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+});
+
+// src/capture/hook-handler.ts
+var exports_hook_handler = {};
+__export(exports_hook_handler, {
+  projectFromCwd: () => projectFromCwd,
+  handleUserPromptSubmit: () => handleUserPromptSubmit,
+  handleSessionEnd: () => handleSessionEnd,
+  handlePostToolUse: () => handlePostToolUse
+});
+import { basename as basename3 } from "path";
+function stripIdeTags(prompt) {
+  return prompt.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
+}
+async function handlePostToolUse(hook, project) {
+  const store = new SessionStore;
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    status: "active"
+  });
+  const entities = extractEntities(hook);
+  for (const entity of entities) {
+    store.insertEntity({ ...entity, project });
+  }
+  const tracker = new ResourceTracker;
+  const registry2 = getResourceRegistry();
+  if (hook.tool_name === "Skill") {
+    const skillName = stringField3(hook.tool_input, "skill");
+    if (skillName) {
+      const resource = registry2.resolve("skill", skillName);
+      tracker.trackUsage(hook.session_id, project, "skill", skillName, resource?.full_tokens ?? 0);
+    }
+  }
+  if (hook.tool_name === "Agent") {
+    const agentType = stringField3(hook.tool_input, "subagent_type");
+    if (agentType) {
+      const resource = registry2.resolve("agent", agentType);
+      tracker.trackUsage(hook.session_id, project, "agent", agentType, resource?.full_tokens ?? 0);
+    }
+  }
+  if (hook.tool_name.startsWith("mcp__")) {
+    tracker.trackUsage(hook.session_id, project, "mcp_tool", hook.tool_name);
+  }
+}
+async function handleUserPromptSubmit(hook, project) {
+  const store = new SessionStore;
+  const ltStore = new LongTermStore;
+  const privacyConfig = loadPrivacyConfig();
+  const cleanPrompt = sanitize(stripIdeTags(hook.prompt), privacyConfig);
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    user_prompt: cleanPrompt.slice(0, 500) || hook.prompt.slice(0, 500),
+    status: "active"
+  });
+  const promptText = cleanPrompt || hook.prompt;
+  if (promptText.length > 5) {
+    const promptNum = store.getMessageCount(hook.session_id, "user");
+    store.insertMessage({
+      session_id: hook.session_id,
+      project,
+      role: "user",
+      content: promptText.slice(0, 2000),
+      prompt_number: promptNum,
+      timestamp: Date.now()
+    });
+  }
+  const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
+  if (promptObs)
+    store.insertEntity({ ...promptObs, project });
+  let results = ltStore.search(hook.prompt, 3);
+  let memoryHint = "";
+  if (results.length === 0) {
+    const recent = ltStore.getRecentSummariesAll(3);
+    if (recent.length > 0) {
+      results = recent.map((r) => ({
+        session_id: r.session_id,
+        project: r.project,
+        summary: r.summary,
+        files_touched: r.files_touched,
+        decisions: r.decisions,
+        errors_fixed: r.errors_fixed,
+        created_at: r.created_at,
+        rank: 0
+      }));
+      const total = ltStore.countSummaries();
+      memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+    }
+  }
+  const registry2 = getResourceRegistry();
+  registry2.scan(hook.cwd);
+  const validator = new InjectionValidator(registry2);
+  const loader = new SmartResourceLoader(registry2);
+  const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
+  plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+  plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+  const advice = loader.formatContextAdvice(plan);
+  let mdSummary = "";
+  if (hook.cwd) {
+    try {
+      const mdTracker = new ClaudeMdTracker;
+      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+      mdSummary = mdTracker.formatForInjection(mdEntries);
+      const tracker = new ResourceTracker;
+      for (const entry of mdEntries) {
+        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      }
+    } catch {}
+  }
+  let smartMatchSection = "";
+  try {
+    const analysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
+    if (!analysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
+      const matches = await matchResourcesForPrompt(hook.prompt ?? "", analysis, {
+        project,
+        threshold: 0.3,
+        limit: 5
+      });
+      if (matches.length > 0)
+        smartMatchSection = formatSmartMatch(matches);
+    }
+  } catch {}
+  let overheadWarning = "";
+  try {
+    const overhead = await registry2.getOverheadReport(project);
+    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+    if (unusedTokens > 1e4) {
+      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
+    }
+  } catch {}
+  const memorySection = buildMemorySection(results, memoryHint);
+  const safeContext = validator.validate(fitWithinBudget(memorySection, mdSummary, smartMatchSection, advice, overheadWarning));
+  return { additionalContext: safeContext };
+}
+function formatSmartMatch(matches) {
+  const lines = ["**Suggested resources for this prompt:**"];
+  for (const m of matches) {
+    const pct = (m.score * 100).toFixed(0);
+    const kind = m.kind === "claude_md" ? "CLAUDE.md" : m.kind;
+    lines.push(`  - ${kind}: \`${m.name}\` (${pct}% \u2014 ${m.reason})`);
+  }
+  lines.push("Invoke or reference the most relevant ones if applicable.");
+  return lines.join(`
+`);
+}
+function fitWithinBudget(memoryText, mdText, smartMatchText, adviceText, overheadText) {
+  const MAX_CHARS2 = 8000;
+  const sections = [
+    { text: memoryText || "", priority: 1, minChars: 500 },
+    { text: smartMatchText || "", priority: 2, minChars: 100 },
+    { text: mdText || "", priority: 3, minChars: 200 },
+    { text: adviceText || "", priority: 4, minChars: 0 },
+    { text: overheadText || "", priority: 5, minChars: 0 }
+  ].filter((s) => s.text.length > 0);
+  const totalNeeded = sections.reduce((sum, s) => sum + s.text.length, 0);
+  if (totalNeeded <= MAX_CHARS2) {
+    return sections.map((s) => s.text).join(`
+
+`);
+  }
+  let remaining = MAX_CHARS2;
+  const allocated = [];
+  sections.sort((a, b) => a.priority - b.priority);
+  for (const section of sections) {
+    if (remaining <= 0)
+      break;
+    if (section.text.length <= remaining) {
+      allocated.push(section.text);
+      remaining -= section.text.length + 2;
+    } else if (remaining >= section.minChars) {
+      allocated.push(section.text.slice(0, remaining));
+      remaining = 0;
+    }
+  }
+  return allocated.join(`
+
+`);
+}
+function buildMemorySection(results, hint = "") {
+  if (results.length === 0)
+    return "";
+  const lines = ["**Past session context:**"];
+  for (const r of results) {
+    const date4 = new Date(r.created_at).toLocaleDateString();
+    const files = safeJson4(r.files_touched, []);
+    lines.push(`- [${date4}, ${r.project}] ${r.summary.slice(0, 400)}`);
+    if (files.length > 0)
+      lines.push(`  Files: ${files.slice(0, 5).join(", ")}`);
+  }
+  if (hint)
+    lines.push(`
+_${hint}_`);
+  return lines.join(`
+`);
+}
+async function handleSessionEnd(hook, _project) {
+  const store = new SessionStore;
+  store.completeSession(hook.session_id);
+}
+function stringField3(obj, key) {
+  if (!obj)
+    return;
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function safeJson4(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+function projectFromCwd(cwd) {
+  if (!cwd)
+    return "unknown";
+  return basename3(cwd);
+}
+var init_hook_handler = __esm(() => {
+  init_session_store();
+  init_long_term_store();
+  init_entity_extractor();
+  init_resource_tracker();
+  init_smart_resource_loader();
+  init_resource_registry();
+  init_injection_validator();
+  init_observation_extractor();
+  init_claude_md_tracker();
+  init_prompt_analyzer();
+  init_resource_matcher();
+  init_privacy_filter();
 });
 
 // node_modules/zod/v4/core/core.js
@@ -14153,235 +16395,13 @@ class StdioServerTransport {
   }
 }
 
-// src/db/session-store.ts
-init_schema();
-
-class SessionStore {
-  db;
-  constructor(db) {
-    this.db = db ?? getDatabase();
-  }
-  upsertSession(session) {
-    this.db.run(`INSERT INTO sessions(id, project, started_at, ended_at, user_prompt, status)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         ended_at    = excluded.ended_at,
-         user_prompt = COALESCE(excluded.user_prompt, user_prompt),
-         status      = excluded.status`, [
-      session.id,
-      session.project,
-      session.started_at,
-      session.ended_at ?? null,
-      session.user_prompt ?? null,
-      session.status
-    ]);
-  }
-  getSession(id) {
-    return this.db.query("SELECT * FROM sessions WHERE id = ?").get(id) ?? null;
-  }
-  completeSession(id) {
-    this.db.run("UPDATE sessions SET status = 'completed', ended_at = ? WHERE id = ?", [Date.now(), id]);
-  }
-  insertEntity(entity) {
-    if (entity.entity_type === "decision" || entity.entity_type === "observation") {
-      const existing = this.db.query("SELECT COUNT(*) as c FROM entities WHERE session_id = ? AND entity_type = ? AND entity_value = ?").get(entity.session_id, entity.entity_type, entity.entity_value);
-      if (existing && existing.c > 0)
-        return -1;
-    }
-    const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-      entity.session_id,
-      entity.project,
-      entity.tool_name,
-      entity.entity_type,
-      entity.entity_value,
-      entity.context ?? null,
-      entity.importance,
-      entity.created_at,
-      entity.prompt_number
-    ]);
-    return Number(result.lastInsertRowid);
-  }
-  getSessionEntities(session_id) {
-    return this.db.query("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
-  }
-  getSessionErrors(session_id) {
-    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'error' ORDER BY importance DESC").all(session_id);
-  }
-  getSessionDecisions(session_id) {
-    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'decision' ORDER BY importance DESC").all(session_id);
-  }
-  getSessionObservations(session_id) {
-    return this.db.query("SELECT * FROM entities WHERE session_id = ? AND entity_type = 'observation' ORDER BY importance DESC").all(session_id);
-  }
-  getSessionFiles(session_id) {
-    return this.db.query(`SELECT DISTINCT entity_value FROM entities
-         WHERE session_id = ? AND entity_type IN ('file_read','file_modified','file_created')
-         ORDER BY importance DESC, created_at DESC`).all(session_id).map((r) => r.entity_value);
-  }
-  hasModifiedFiles(session_id) {
-    const row = this.db.query(`SELECT COUNT(*) as c FROM entities
-         WHERE session_id = ? AND entity_type IN ('file_modified','file_created') LIMIT 1`).get(session_id);
-    return (row?.c ?? 0) > 0;
-  }
-  insertNote(note) {
-    this.db.run("INSERT INTO session_notes(session_id, content, created_at) VALUES (?, ?, ?)", [note.session_id, note.content, note.created_at]);
-  }
-  getSessionNotes(session_id) {
-    return this.db.query("SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at ASC").all(session_id);
-  }
-  insertMessage(msg) {
-    if (msg.uuid) {
-      const existing = this.db.query("SELECT COUNT(*) as c FROM messages WHERE uuid = ?").get(msg.uuid);
-      if (existing && existing.c > 0)
-        return -1;
-    }
-    const result = this.db.run(`INSERT INTO messages(session_id, project, role, content, prompt_number, timestamp, uuid, parent_uuid)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
-      msg.session_id,
-      msg.project,
-      msg.role,
-      msg.content,
-      msg.prompt_number,
-      msg.timestamp,
-      msg.uuid ?? null,
-      msg.parent_uuid ?? null
-    ]);
-    return Number(result.lastInsertRowid);
-  }
-  insertMessages(msgs) {
-    let count = 0;
-    const db = this.db;
-    db.transaction(() => {
-      for (const msg of msgs) {
-        const id = this.insertMessage(msg);
-        if (id !== -1)
-          count++;
-      }
-    })();
-    return count;
-  }
-  getSessionMessages(session_id, role) {
-    if (role) {
-      return this.db.query("SELECT * FROM messages WHERE session_id = ? AND role = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id, role);
-    }
-    return this.db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY prompt_number ASC, timestamp ASC").all(session_id);
-  }
-  getMessageCount(session_id, role) {
-    if (role) {
-      const row2 = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ? AND role = ?").get(session_id, role);
-      return row2?.c ?? 0;
-    }
-    const row = this.db.query("SELECT COUNT(*) as c FROM messages WHERE session_id = ?").get(session_id);
-    return row?.c ?? 0;
-  }
-  searchMessages(query, limit = 10) {
-    if (!query.trim())
-      return [];
-    const words = query.trim().split(/\s+/).filter((w) => w.length > 1).map((w) => `"${w.replace(/["*^()]/g, "")}"`);
-    if (words.length === 0)
-      return [];
-    const ftsQuery = words.join(" ");
-    try {
-      return this.db.query(`SELECT m.*, rank FROM fts_messages
-           JOIN messages m ON m.id = fts_messages.rowid
-           WHERE fts_messages MATCH ?
-           ORDER BY rank LIMIT ?`).all(ftsQuery, limit);
-    } catch {
-      const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
-      return this.db.query("SELECT * FROM messages WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?").all(pattern, limit);
-    }
-  }
-}
-
-// src/db/long-term-store.ts
-init_schema();
-
-class LongTermStore {
-  db;
-  constructor(db) {
-    this.db = db ?? getDatabase();
-  }
-  upsertSummary(summary) {
-    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(session_id) DO UPDATE SET
-         summary       = excluded.summary,
-         files_touched = excluded.files_touched,
-         decisions     = excluded.decisions,
-         errors_fixed  = excluded.errors_fixed,
-         token_savings = excluded.token_savings`, [
-      summary.session_id,
-      summary.project,
-      summary.summary,
-      summary.files_touched,
-      summary.decisions,
-      summary.errors_fixed,
-      summary.token_savings,
-      summary.created_at
-    ]);
-  }
-  getSummary(session_id) {
-    return this.db.query("SELECT * FROM long_term_summaries WHERE session_id = ?").get(session_id) ?? null;
-  }
-  getRecentSummaries(project, limit = 5) {
-    return this.db.query("SELECT * FROM long_term_summaries WHERE project = ? ORDER BY created_at DESC LIMIT ?").all(project, limit);
-  }
-  search(query, limit = 5) {
-    if (!query.trim())
-      return [];
-    const safeQuery = sanitizeFtsQuery(query);
-    if (!safeQuery)
-      return [];
-    try {
-      return this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
-                  lts.files_touched, lts.decisions, lts.errors_fixed,
-                  lts.created_at, rank
-           FROM fts_memories
-           JOIN long_term_summaries lts ON lts.id = fts_memories.rowid
-           WHERE fts_memories MATCH ?
-           ORDER BY rank
-           LIMIT ?`).all(safeQuery, limit);
-    } catch {
-      return this.fallbackSearch(query, limit);
-    }
-  }
-  fallbackSearch(query, limit) {
-    const pattern = `%${query.replace(/[%_]/g, "\\$&")}%`;
-    return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
-         FROM long_term_summaries
-         WHERE summary LIKE ? OR files_touched LIKE ? OR decisions LIKE ?
-         ORDER BY created_at DESC LIMIT ?`).all(pattern, pattern, pattern, limit);
-  }
-  countSummaries(project) {
-    if (project) {
-      const row2 = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries WHERE project = ?").get(project);
-      return row2?.c ?? 0;
-    }
-    const row = this.db.query("SELECT COUNT(*) as c FROM long_term_summaries").get();
-    return row?.c ?? 0;
-  }
-  getRecentSummariesAll(limit = 5) {
-    return this.db.query("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ?").all(limit);
-  }
-  findByFile(filePath, limit = 10) {
-    const escaped = filePath.replace(/[%_]/g, "\\$&");
-    return this.db.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
-         FROM long_term_summaries
-         WHERE files_touched LIKE ?
-         ORDER BY created_at DESC LIMIT ?`).all(`%${escaped}%`, limit);
-  }
-}
-function sanitizeFtsQuery(query) {
-  const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^()]/g, "")).filter((w) => w.length > 1);
-  if (words.length === 0)
-    return "";
-  const head = words.slice(0, -1).map((w) => `"${w}"`);
-  const last = words[words.length - 1];
-  return [...head, `"${last}"*`].join(" ");
-}
+// src/mcp/tool-handlers.ts
+init_session_store();
 
 // src/retrieval/context-builder.ts
+init_long_term_store();
+init_session_store();
+
 class ContextBuilder {
   ltStore;
   sessionStore;
@@ -14484,668 +16504,13 @@ function estimateTokens(text) {
   return Math.ceil(text.length / 4);
 }
 
-// src/context/resource-tracker.ts
-init_schema();
-var SCHEMA_ADDITIONS = `
-CREATE TABLE IF NOT EXISTS resource_usage (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL,
-  project     TEXT NOT NULL,
-  resource_type TEXT NOT NULL
-    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
-  resource_name TEXT NOT NULL,
-  use_count   INTEGER NOT NULL DEFAULT 1,
-  token_cost  INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
-CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
-CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
-CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
-`;
-
-class ResourceTracker {
-  db;
-  initialized = false;
-  constructor(db) {
-    this.db = db ?? getDatabase();
-  }
-  ensureSchema() {
-    if (this.initialized)
-      return;
-    this.db.run(SCHEMA_ADDITIONS);
-    this.initialized = true;
-  }
-  trackUsage(session_id, project, resource_type, resource_name, token_cost = 0) {
-    this.ensureSchema();
-    const existing = this.db.query("SELECT id, use_count FROM resource_usage WHERE session_id = ? AND resource_name = ?").get(session_id, resource_name);
-    if (existing) {
-      this.db.run("UPDATE resource_usage SET use_count = use_count + 1 WHERE id = ?", [existing.id]);
-    } else {
-      this.db.run(`INSERT INTO resource_usage(session_id, project, resource_type, resource_name, use_count, token_cost, created_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?)`, [session_id, project, resource_type, resource_name, token_cost, Date.now()]);
-    }
-  }
-  getMostUsedResources(project, resource_type, limit = 10) {
-    this.ensureSchema();
-    if (resource_type) {
-      return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
-           FROM resource_usage WHERE project = ? AND resource_type = ?
-           GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, resource_type, limit);
-    }
-    return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
-         FROM resource_usage WHERE project = ?
-         GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, limit);
-  }
-  getRecentlyUsedResources(project, lastNSessions = 5) {
-    this.ensureSchema();
-    return this.db.query(`SELECT resource_type, resource_name, COUNT(DISTINCT session_id) as frequency
-         FROM resource_usage
-         WHERE project = ?
-           AND session_id IN (
-             SELECT DISTINCT session_id FROM resource_usage
-             WHERE project = ?
-             ORDER BY created_at DESC
-             LIMIT ?
-           )
-         GROUP BY resource_type, resource_name
-         ORDER BY frequency DESC, resource_type`).all(project, project, lastNSessions);
-  }
-  estimateTokenBudget(project) {
-    this.ensureSchema();
-    const rows = this.db.query(`SELECT resource_type, SUM(token_cost) as total_tokens, COUNT(DISTINCT resource_name) as count
-         FROM resource_usage
-         WHERE project = ?
-         GROUP BY resource_type`).all(project);
-    const by_type = {};
-    let total = 0;
-    let count = 0;
-    for (const row of rows) {
-      by_type[row.resource_type] = row.total_tokens;
-      total += row.total_tokens;
-      count += row.count;
-    }
-    return { total_token_cost: total, resource_count: count, by_type };
-  }
-}
-
-// src/context/resource-registry.ts
-init_logger();
-import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
-import { join as join3, basename, relative } from "path";
-import { homedir as homedir3 } from "os";
-var log2 = createLogger("resource-registry");
-var CHARS_PER_TOKEN = 3.75;
-var SCAN_TTL_MS = 5 * 60 * 1000;
-var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
-var SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
-var MAX_DIR_WALK_DEPTH = 5;
-
-class ResourceRegistry {
-  resources = new Map;
-  lastScanAt = 0;
-  claudeDir;
-  constructor() {
-    this.claudeDir = join3(homedir3(), ".claude");
-  }
-  scan(cwd) {
-    if (Date.now() - this.lastScanAt < SCAN_TTL_MS && this.resources.size > 0)
-      return;
-    this.resources.clear();
-    try {
-      this.scanSkills(join3(this.claudeDir, "skills"), cwd);
-      this.scanFlatAgents(join3(this.claudeDir, "agents"));
-      this.scanAgentPackages(this.claudeDir);
-      this.scanCommands(join3(this.claudeDir, "commands"), cwd);
-      this.scanWorkflows(join3(this.claudeDir, "workflows"));
-      this.scanClaudeMd(cwd);
-      this.lastScanAt = Date.now();
-    } catch (err) {
-      log2.error("scan failed", { error: String(err) });
-    }
-  }
-  resolve(kind, name) {
-    this.ensureScanned();
-    return this.resources.get(`${kind}:${name}`);
-  }
-  exists(kind, name) {
-    return this.resolve(kind, name) !== undefined;
-  }
-  getAll(kind) {
-    this.ensureScanned();
-    const all = [...this.resources.values()];
-    return kind ? all.filter((r) => r.kind === kind) : all;
-  }
-  async getOverheadReport(project, lastNSessions = 10) {
-    this.ensureScanned();
-    const tracker = new ResourceTracker;
-    const recentSkills = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "skill");
-    const recentAgents = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "agent");
-    const allSkills = this.getAll("skill");
-    const allAgents = this.getAll("agent");
-    const usedSkillNames = new Set(recentSkills.map((r) => r.resource_name));
-    const usedAgentNames = new Set(recentAgents.map((r) => r.resource_name));
-    const unusedSkills = allSkills.filter((s) => !usedSkillNames.has(s.name));
-    const unusedAgents = allAgents.filter((a) => !usedAgentNames.has(a.name));
-    const skillListingTokens = allSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
-    const agentDescTokens = allAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
-    const commandListingTokens = this.getAll("command").reduce((sum, c) => sum + c.listing_tokens, 0);
-    const claudeMdTokens = this.getAll("claude_md").reduce((sum, c) => sum + c.full_tokens, 0);
-    const unusedSkillListingTokens = unusedSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
-    const unusedAgentListingTokens = unusedAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
-    const recommendations = [];
-    if (unusedSkills.length > 0) {
-      recommendations.push(`${unusedSkills.length}/${allSkills.length} skills unused in last ${lastNSessions} sessions (~${unusedSkillListingTokens} listing tokens). Consider project-local or removal.`);
-    }
-    if (unusedAgents.length > 0) {
-      recommendations.push(`${unusedAgents.length}/${allAgents.length} agents unused in last ${lastNSessions} sessions (~${unusedAgentListingTokens} listing tokens).`);
-    }
-    if (claudeMdTokens > 5000) {
-      recommendations.push(`CLAUDE.md chain is ${claudeMdTokens} tokens. Consider consolidating if >5K.`);
-    }
-    return {
-      fixed_overhead: {
-        total_tokens: skillListingTokens + agentDescTokens + commandListingTokens + claudeMdTokens,
-        skill_listings: skillListingTokens,
-        agent_descriptions: agentDescTokens,
-        command_listings: commandListingTokens,
-        claude_md: claudeMdTokens
-      },
-      usage_analysis: {
-        skills_installed: allSkills.length,
-        skills_used_recently: usedSkillNames.size,
-        skills_never_used: unusedSkills.map((s) => s.name),
-        agents_installed: allAgents.length,
-        agents_used_recently: usedAgentNames.size,
-        agents_never_used: unusedAgents.map((a) => a.name)
-      },
-      recommendations,
-      potential_savings: {
-        if_remove_unused_skills: unusedSkillListingTokens,
-        if_remove_unused_agents: unusedAgentListingTokens
-      }
-    };
-  }
-  scanSkills(globalDir, cwd) {
-    this.scanSkillDir(globalDir, "global");
-    if (cwd) {
-      const projectDir = join3(cwd, ".claude", "skills");
-      if (existsSync3(projectDir)) {
-        this.scanSkillDir(projectDir, "project");
-      }
-    }
-  }
-  scanSkillDir(dir, source) {
-    if (!existsSync3(dir))
-      return;
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isDirectory())
-          continue;
-        const name = entry.name;
-        if (!SAFE_NAME_RE.test(name))
-          continue;
-        const skillDir = join3(dir, name);
-        const skillFile = this.findPrimaryFile(skillDir, ["SKILL.md", "README.md"]);
-        const listing = this.estimateListingFromSkillDir(skillDir);
-        const fullTokens = skillFile ? this.charsToTokens(this.readFileSize(skillFile)) : 0;
-        const totalTokens = this.estimateDirTokens(skillDir);
-        this.register({
-          kind: "skill",
-          name,
-          path: skillFile ?? skillDir,
-          allPaths: this.listMdFiles(skillDir),
-          category: "variable",
-          listing_tokens: listing,
-          full_tokens: fullTokens,
-          total_tokens: totalTokens,
-          source
-        });
-      }
-    } catch (err) {
-      log2.error(`scanSkillDir ${dir}`, { error: String(err) });
-    }
-  }
-  scanFlatAgents(dir) {
-    if (!existsSync3(dir))
-      return;
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".md"))
-          continue;
-        if (entry.name === "README.md")
-          continue;
-        const filePath = join3(dir, entry.name);
-        const content = this.readFileHead(filePath, 20);
-        const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
-        if (!SAFE_NAME_RE.test(name))
-          continue;
-        const fileSize = this.readFileSize(filePath);
-        const listing = this.estimateAgentListingTokens(content);
-        this.register({
-          kind: "agent",
-          name,
-          path: filePath,
-          allPaths: [filePath],
-          category: "variable",
-          listing_tokens: listing,
-          full_tokens: this.charsToTokens(fileSize),
-          total_tokens: this.charsToTokens(fileSize),
-          source: "global"
-        });
-      }
-    } catch (err) {
-      log2.error(`scanFlatAgents ${dir}`, { error: String(err) });
-    }
-  }
-  scanAgentPackages(claudeDir) {
-    if (!existsSync3(claudeDir))
-      return;
-    try {
-      for (const entry of readdirSync(claudeDir, { withFileTypes: true })) {
-        if (!entry.isDirectory() || !entry.name.startsWith("agent_"))
-          continue;
-        const packageDir = join3(claudeDir, entry.name);
-        this.scanAgentPackageDir(packageDir);
-      }
-    } catch (err) {
-      log2.error("scanAgentPackages", { error: String(err) });
-    }
-  }
-  scanAgentPackageDir(packageDir) {
-    try {
-      for (const entry of readdirSync(packageDir, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          const subDir = join3(packageDir, entry.name);
-          const agentFile = join3(subDir, "AGENT.md");
-          if (existsSync3(agentFile)) {
-            const content = this.readFileHead(agentFile, 20);
-            const name = this.parseFrontmatterName(content) ?? entry.name;
-            if (!SAFE_NAME_RE.test(name))
-              continue;
-            const listing = this.estimateAgentListingTokens(content);
-            const fullTokens = this.charsToTokens(this.readFileSize(agentFile));
-            const totalTokens = this.estimateDirTokens(subDir);
-            this.register({
-              kind: "agent",
-              name,
-              path: agentFile,
-              allPaths: this.listMdFiles(subDir),
-              category: "variable",
-              listing_tokens: listing,
-              full_tokens: fullTokens,
-              total_tokens: totalTokens,
-              source: "global"
-            });
-          }
-        } else if (entry.isFile() && entry.name.endsWith(".md")) {
-          if (entry.name === "README.md" || entry.name === "SKILL.md")
-            continue;
-          const filePath = join3(packageDir, entry.name);
-          const content = this.readFileHead(filePath, 20);
-          const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
-          if (!SAFE_NAME_RE.test(name))
-            continue;
-          if (this.resources.has(`agent:${name}`))
-            continue;
-          const fileSize = this.readFileSize(filePath);
-          this.register({
-            kind: "agent",
-            name,
-            path: filePath,
-            allPaths: [filePath],
-            category: "variable",
-            listing_tokens: this.estimateAgentListingTokens(content),
-            full_tokens: this.charsToTokens(fileSize),
-            total_tokens: this.charsToTokens(fileSize),
-            source: "global"
-          });
-        }
-      }
-    } catch (err) {
-      log2.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
-    }
-  }
-  scanCommands(globalDir, cwd) {
-    if (existsSync3(globalDir))
-      this.scanCommandDir(globalDir, globalDir, "global");
-    if (cwd) {
-      const projectDir = join3(cwd, ".claude", "commands");
-      if (existsSync3(projectDir))
-        this.scanCommandDir(projectDir, projectDir, "project");
-    }
-  }
-  scanCommandDir(dir, baseDir, source) {
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          this.scanCommandDir(join3(dir, entry.name), baseDir, source);
-        } else if (entry.isFile() && entry.name.endsWith(".md")) {
-          const filePath = join3(dir, entry.name);
-          const name = relative(baseDir, filePath).replace(/\.md$/, "");
-          if (!SAFE_COMMAND_NAME_RE.test(name))
-            continue;
-          const fileSize = this.readFileSize(filePath);
-          const content = this.readFileHead(filePath, 3);
-          this.register({
-            kind: "command",
-            name,
-            path: filePath,
-            allPaths: [filePath],
-            category: "variable",
-            listing_tokens: this.estimateCommandListingTokens(name, content),
-            full_tokens: this.charsToTokens(fileSize),
-            total_tokens: this.charsToTokens(fileSize),
-            source
-          });
-        }
-      }
-    } catch (err) {
-      log2.error(`scanCommandDir ${dir}`, { error: String(err) });
-    }
-  }
-  scanWorkflows(dir) {
-    if (!existsSync3(dir))
-      return;
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".md"))
-          continue;
-        const filePath = join3(dir, entry.name);
-        const name = basename(entry.name, ".md");
-        if (!SAFE_NAME_RE.test(name))
-          continue;
-        const fileSize = this.readFileSize(filePath);
-        this.register({
-          kind: "workflow",
-          name,
-          path: filePath,
-          allPaths: [filePath],
-          category: "variable",
-          listing_tokens: 0,
-          full_tokens: this.charsToTokens(fileSize),
-          total_tokens: this.charsToTokens(fileSize),
-          source: "global"
-        });
-      }
-    } catch (err) {
-      log2.error(`scanWorkflows ${dir}`, { error: String(err) });
-    }
-  }
-  scanClaudeMd(cwd) {
-    const globalFile = join3(this.claudeDir, "CLAUDE.md");
-    if (existsSync3(globalFile)) {
-      const fileSize = this.readFileSize(globalFile);
-      this.register({
-        kind: "claude_md",
-        name: "global",
-        path: globalFile,
-        allPaths: [globalFile],
-        category: "fixed",
-        listing_tokens: 0,
-        full_tokens: this.charsToTokens(fileSize),
-        total_tokens: this.charsToTokens(fileSize),
-        source: "global"
-      });
-    }
-    if (!cwd)
-      return;
-    const projectFiles = [
-      join3(cwd, "CLAUDE.md"),
-      join3(cwd, ".claude", "CLAUDE.md")
-    ];
-    for (const file of projectFiles) {
-      if (!existsSync3(file))
-        continue;
-      const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
-      if (!SAFE_COMMAND_NAME_RE.test(relPath))
-        continue;
-      const name = `project:${relPath}`;
-      const fileSize = this.readFileSize(file);
-      this.register({
-        kind: "claude_md",
-        name,
-        path: file,
-        allPaths: [file],
-        category: "fixed",
-        listing_tokens: 0,
-        full_tokens: this.charsToTokens(fileSize),
-        total_tokens: this.charsToTokens(fileSize),
-        source: "project"
-      });
-    }
-  }
-  ensureScanned() {
-    if (this.resources.size === 0 || Date.now() - this.lastScanAt >= SCAN_TTL_MS) {
-      this.scan();
-    }
-  }
-  register(resource) {
-    const key = `${resource.kind}:${resource.name}`;
-    const existing = this.resources.get(key);
-    if (existing && existing.source === "global" && resource.source === "project") {
-      this.resources.set(key, resource);
-    } else if (!existing) {
-      this.resources.set(key, resource);
-    }
-  }
-  parseFrontmatterName(content) {
-    const lines = content.split(`
-`);
-    let inFrontmatter = false;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed === "---") {
-        if (inFrontmatter)
-          return;
-        inFrontmatter = true;
-        continue;
-      }
-      if (!inFrontmatter)
-        continue;
-      const m = trimmed.match(/^name:\s*["']?([a-zA-Z0-9_\-]+)["']?/);
-      if (m?.[1])
-        return m[1];
-    }
-    return;
-  }
-  findPrimaryFile(dir, candidates) {
-    for (const c of candidates) {
-      const p = join3(dir, c);
-      if (existsSync3(p))
-        return p;
-    }
-    return;
-  }
-  readFileHead(filePath, lines) {
-    try {
-      const content = readFileSync(filePath, "utf-8");
-      return content.split(`
-`).slice(0, lines).join(`
-`);
-    } catch {
-      return "";
-    }
-  }
-  readFileSize(filePath) {
-    try {
-      return statSync(filePath).size;
-    } catch {
-      return 0;
-    }
-  }
-  charsToTokens(chars) {
-    return Math.ceil(chars / CHARS_PER_TOKEN);
-  }
-  estimateListingFromSkillDir(dir) {
-    const skillFile = this.findPrimaryFile(dir, ["SKILL.md", "README.md"]);
-    if (!skillFile)
-      return 30;
-    const head = this.readFileHead(skillFile, 5);
-    const descLine = head.split(`
-`).find((l) => l.startsWith("description:") || l.trim() && !l.startsWith("#") && !l.startsWith("---"));
-    const descLen = descLine?.slice(0, 80).length ?? 20;
-    return Math.ceil((descLen + 30) / CHARS_PER_TOKEN);
-  }
-  estimateAgentListingTokens(headContent) {
-    const lines = headContent.split(`
-`);
-    for (const line of lines) {
-      if (line.startsWith("description:")) {
-        const desc = line.slice(12).trim().slice(0, 150);
-        return Math.ceil((desc.length + 30) / CHARS_PER_TOKEN);
-      }
-    }
-    return 30;
-  }
-  estimateCommandListingTokens(name, headContent) {
-    const firstLine = headContent.split(`
-`).find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
-    const descLen = firstLine?.slice(0, 60).length ?? 10;
-    return Math.ceil((name.length + descLen + 10) / CHARS_PER_TOKEN);
-  }
-  listMdFiles(dir) {
-    const files = [];
-    try {
-      const walk = (d, depth) => {
-        if (depth > MAX_DIR_WALK_DEPTH)
-          return;
-        for (const entry of readdirSync(d, { withFileTypes: true })) {
-          const p = join3(d, entry.name);
-          if (entry.isDirectory())
-            walk(p, depth + 1);
-          else if (entry.isFile() && entry.name.endsWith(".md"))
-            files.push(p);
-        }
-      };
-      walk(dir, 0);
-    } catch {}
-    return files;
-  }
-  estimateDirTokens(dir) {
-    return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
-  }
-}
-var _instance;
-function getResourceRegistry() {
-  if (!_instance)
-    _instance = new ResourceRegistry;
-  return _instance;
-}
-
-// src/context/smart-resource-loader.ts
-var DEFAULT_TOKEN_BUDGET = 30000;
-
-class SmartResourceLoader {
-  tracker;
-  ltStore;
-  registry;
-  constructor(registry2) {
-    this.tracker = new ResourceTracker;
-    this.ltStore = new LongTermStore;
-    this.registry = registry2 ?? getResourceRegistry();
-  }
-  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET, cwd) {
-    this.registry.scan(cwd);
-    const recommendations = [];
-    const recent = this.tracker.getRecentlyUsedResources(project, 5);
-    for (const r of recent) {
-      const tokenCost = this.getTokenCost(r.resource_type, r.resource_name);
-      if (tokenCost === 0)
-        continue;
-      recommendations.push({
-        resource_type: r.resource_type,
-        resource_name: r.resource_name,
-        score: Math.min(100, r.frequency * 20),
-        token_cost: tokenCost,
-        reason: `used in ${r.frequency}/5 recent sessions`
-      });
-    }
-    if (userPrompt.trim()) {
-      const searchResults = this.ltStore.search(userPrompt, 3);
-      for (const result of searchResults) {
-        const files = safeJson2(result.files_touched, []);
-        for (const file of files.slice(0, 5)) {
-          const existing = recommendations.find((r) => r.resource_name === file && r.resource_type === "claude_md");
-          if (!existing) {
-            recommendations.push({
-              resource_type: "claude_md",
-              resource_name: file,
-              score: 40,
-              token_cost: this.getTokenCost("claude_md", file),
-              reason: "touched in similar past session"
-            });
-          }
-        }
-      }
-    }
-    recommendations.sort((a, b) => b.score - a.score);
-    let usedTokens = 0;
-    const included = [];
-    const skipped = [];
-    for (const r of recommendations) {
-      if (usedTokens + r.token_cost <= tokenBudget) {
-        included.push(r);
-        usedTokens += r.token_cost;
-      } else {
-        skipped.push(r);
-      }
-    }
-    return {
-      recommendations: included,
-      total_tokens: usedTokens,
-      budget_remaining: tokenBudget - usedTokens,
-      skipped
-    };
-  }
-  formatContextAdvice(plan) {
-    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
-      return "";
-    const lines = [];
-    if (plan.recommendations.length > 0) {
-      lines.push("**Frequently-used resources in this project:**");
-      for (const r of plan.recommendations.slice(0, 5)) {
-        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
-      }
-    }
-    if (plan.skipped.length > 0) {
-      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
-      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
-    }
-    return lines.join(`
-`);
-  }
-  getTokenCost(resourceType, resourceName) {
-    const kind = resourceTypeToKind(resourceType);
-    if (!kind)
-      return 500;
-    const resource = this.registry.resolve(kind, resourceName);
-    return resource?.full_tokens ?? 0;
-  }
-}
-function resourceTypeToKind(type) {
-  const mapping = {
-    skill: "skill",
-    agent: "agent",
-    command: "command",
-    workflow: "workflow",
-    claude_md: "claude_md",
-    mcp_tool: "mcp_tool",
-    hook: "hook",
-    memory: "memory"
-  };
-  return mapping[type];
-}
-function safeJson2(text, fallback) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return fallback;
-  }
-}
+// src/mcp/tool-handlers.ts
+init_smart_resource_loader();
+init_resource_tracker();
+init_resource_registry();
 
 // src/memory/working-memory.ts
+init_session_store();
 var CACHE_TTL_MS = 5 * 60 * 1000;
 var MAX_ENTRIES_PER_SESSION = 50;
 
@@ -16010,6 +17375,42 @@ ${tag} [${date4}] **${m.role}** #${m.prompt_number}`);
   return lines.join(`
 `);
 }
+async function handleMemoryResourcesForPrompt(args) {
+  if (!args?.prompt?.trim())
+    return "Error: prompt is required.";
+  const { analyzePrompt: analyzePrompt2 } = (init_prompt_analyzer(), __toCommonJS(exports_prompt_analyzer));
+  const { matchResourcesForPrompt: matchResourcesForPrompt2 } = (init_resource_matcher(), __toCommonJS(exports_resource_matcher));
+  const cwd = process.env["CLAUDE_CWD"] ?? process.cwd();
+  const project = (init_hook_handler(), __toCommonJS(exports_hook_handler)).projectFromCwd(cwd);
+  const analysis = analyzePrompt2(args.prompt, cwd);
+  const matches = await matchResourcesForPrompt2(args.prompt, analysis, {
+    project,
+    threshold: args.threshold ?? 0.35,
+    limit: args.limit ?? 5
+  });
+  if (args.kinds?.length) {
+    for (let i = matches.length - 1;i >= 0; i--) {
+      if (!args.kinds.includes(matches[i].kind))
+        matches.splice(i, 1);
+    }
+  }
+  if (matches.length === 0) {
+    return `No resources matched prompt with threshold ${args.threshold ?? 0.35}. ` + `Try lowering threshold, or run \`claude-memory-hub doctor --fix --backfill\` if embeddings are missing.`;
+  }
+  const lines = [
+    `Top ${matches.length} resources for prompt:`,
+    `  intent: ${analysis.intent}, language: ${analysis.language}, primary: ${analysis.cwd_signals.primary_language ?? "n/a"}`,
+    ""
+  ];
+  for (const m of matches) {
+    lines.push(`- **${m.kind}**: \`${m.name}\``);
+    lines.push(`    score=${m.score.toFixed(2)} (semantic=${m.semantic_score.toFixed(2)}, ` + `freq=${m.frequency_score.toFixed(2)}, ctx=${m.project_context_score.toFixed(2)})`);
+    lines.push(`    reason: ${m.reason}`);
+    lines.push(`    file: ${m.file_path}`);
+  }
+  return lines.join(`
+`);
+}
 
 // src/mcp/tool-definitions.ts
 var TOOL_DEFINITIONS = [
@@ -16143,6 +17544,24 @@ var TOOL_DEFINITIONS = [
       type: "object",
       properties: {}
     }
+  },
+  {
+    name: "memory_resources_for_prompt",
+    description: "Find the most relevant skills, agents, commands, or CLAUDE.md files for a given prompt or task. " + "Combines semantic match (prompt \u2194 resource description) with usage frequency and project-context signals. " + "Use proactively when starting a new task to discover which agents/skills are designed for it \u2014 " + "even ones the user has not invoked recently.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "The user prompt or task description" },
+        limit: { type: "number", description: "Max matches (default 5)" },
+        kinds: {
+          type: "array",
+          items: { type: "string", enum: ["skill", "agent", "command", "workflow", "claude_md"] },
+          description: "Optional filter by resource kind"
+        },
+        threshold: { type: "number", description: "Score threshold 0..1 (default 0.35)" }
+      },
+      required: ["prompt"]
+    }
   }
 ];
 async function dispatchTool(name, args) {
@@ -16168,6 +17587,8 @@ async function dispatchTool(name, args) {
         return await handleMemoryConversation(args);
       case "memory_health":
         return await handleMemoryHealth();
+      case "memory_resources_for_prompt":
+        return await handleMemoryResourcesForPrompt(args);
       default:
         return `Unknown tool: ${name}`;
     }

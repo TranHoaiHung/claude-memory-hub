@@ -380,6 +380,39 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
     log.info("Migration v5 complete");
   }
+  if (currentVersion < 6) {
+    log.info("Applying migration v6: resource_descriptions + relax embeddings doc_type");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS resource_descriptions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_kind   TEXT NOT NULL CHECK(resource_kind IN ('skill','agent','command','workflow','claude_md')),
+        resource_name   TEXT NOT NULL,
+        file_path       TEXT NOT NULL,
+        embed_text      TEXT NOT NULL,
+        content_hash    TEXT NOT NULL,
+        embedded_at     INTEGER NOT NULL,
+        UNIQUE(resource_kind, resource_name)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_resource_descriptions_kind ON resource_descriptions(resource_kind)`);
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings_v6 (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note','resource')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`INSERT INTO embeddings_v6 SELECT * FROM embeddings`);
+    db.run(`DROP TABLE embeddings`);
+    db.run(`ALTER TABLE embeddings_v6 RENAME TO embeddings`);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
+    log.info("Migration v6 complete");
+  }
 }
 var _db = null;
 function getDatabase() {
@@ -2234,6 +2267,480 @@ function safeJson2(text, fallback) {
   }
 }
 
+// src/context/prompt-analyzer.ts
+import { existsSync as existsSync5, readdirSync as readdirSync2, statSync as statSync2 } from "fs";
+import { join as join5 } from "path";
+var INTENT_PATTERNS = [
+  { intent: "debug", re: /\b(bug|error|crash|fail|broken|not work|fix|debug|exception|stack ?trace|loi|s\u1EEDa|sua|hong|loi)\b/i },
+  { intent: "design", re: /\b(design|ui|ux|layout|figma|component|wireframe|mockup|style|color|theme|thiet ke|thi\u1EBFt k\u1EBF)\b/i },
+  { intent: "refactor", re: /\b(refactor|clean ?up|simplify|reorganize|rename|extract|inline|optimize|tach|toi uu|t\u1ED1i \u01B0u)\b/i },
+  { intent: "implement", re: /\b(add|create|build|implement|write|tao|t\u1EA1o|viet|vi\u1EBFt|code|l\u00E0m|lam|trien khai|tri\u1EC3n khai)\b/i },
+  { intent: "question", re: /\b(how|what|why|when|where|which|l\u00E0m sao|t\u1EA1i sao|l\u00E0 g\u00EC|la gi|lam sao|tai sao)\b|\?/i }
+];
+var VIETNAMESE_RE = /[\u0103\u00E2\u0111\u00EA\u00F4\u01A1\u01B0]|[\u00E1\u00E0\u1EA3\u00E3\u1EA1]|[\u00E9\u00E8\u1EBB\u1EBD\u1EB9]|[\u00ED\u00EC\u1EC9\u0129\u1ECB]|[\u00F3\u00F2\u1ECF\u00F5\u1ECD]|[\u00FA\u00F9\u1EE7\u0169\u1EE5]|[\u00FD\u1EF3\u1EF7\u1EF9\u1EF5]|[\u00C0-\u1EF9]/i;
+var STOP_WORDS = new Set([
+  "the",
+  "is",
+  "at",
+  "of",
+  "in",
+  "on",
+  "and",
+  "or",
+  "but",
+  "for",
+  "with",
+  "to",
+  "a",
+  "an",
+  "t\xF4i",
+  "toi",
+  "b\u1EA1n",
+  "ban",
+  "c\xF3",
+  "co",
+  "kh\xF4ng",
+  "khong",
+  "l\xE0",
+  "la",
+  "n\xE0y",
+  "nay",
+  "the",
+  "this",
+  "that",
+  "what",
+  "when",
+  "where",
+  "how",
+  "why"
+]);
+function analyzePrompt(prompt, cwd) {
+  const text = prompt.trim();
+  const lower = text.toLowerCase();
+  return {
+    intent: detectIntent(lower),
+    keywords: extractKeywords(text),
+    language: detectLanguage(text),
+    has_error_context: /(traceback|stack ?trace|error[: ]|exception|panic:|^\s+at\s)/im.test(text),
+    has_code_block: /```|\bfunction\b|\bclass\b|\bdef\b|=>|\bimport\b/.test(text),
+    is_command_invocation: text.startsWith("/"),
+    cwd_signals: scanCwdSignals(cwd)
+  };
+}
+function detectIntent(lower) {
+  for (const { intent, re } of INTENT_PATTERNS) {
+    if (re.test(lower))
+      return intent;
+  }
+  return "general";
+}
+function detectLanguage(text) {
+  const hasVi = VIETNAMESE_RE.test(text);
+  const hasEn = /[a-zA-Z]{4,}/.test(text);
+  if (hasVi && hasEn)
+    return "mixed";
+  if (hasVi)
+    return "vi";
+  return "en";
+}
+function extractKeywords(text) {
+  const tokens = text.toLowerCase().replace(/[^\w\u00C0-\u1EF9\-_./]+/g, " ").split(/\s+/).filter((t) => t.length >= 3 && !STOP_WORDS.has(t));
+  return [...new Set(tokens)].slice(0, 20);
+}
+var CWD_CACHE = new Map;
+var CWD_TTL_MS = 60000;
+function scanCwdSignals(cwd) {
+  const cached = CWD_CACHE.get(cwd);
+  if (cached && Date.now() - cached.ts < CWD_TTL_MS)
+    return cached.signals;
+  const signals = {
+    has_swift: false,
+    has_kotlin: false,
+    has_react_native: false,
+    has_flutter: false,
+    has_python: false,
+    has_go: false,
+    has_rust: false,
+    has_typescript: false,
+    has_java: false,
+    has_csharp: false,
+    has_figma: false,
+    is_mobile: false,
+    primary_language: null
+  };
+  if (!cwd || !existsSync5(cwd)) {
+    CWD_CACHE.set(cwd, { signals, ts: Date.now() });
+    return signals;
+  }
+  detectFromManifest(cwd, signals);
+  detectFromExtensions(cwd, signals);
+  signals.is_mobile = signals.has_swift || signals.has_kotlin || signals.has_react_native || signals.has_flutter;
+  signals.primary_language = pickPrimary(signals);
+  CWD_CACHE.set(cwd, { signals, ts: Date.now() });
+  return signals;
+}
+function detectFromManifest(cwd, s) {
+  const has = (rel) => existsSync5(join5(cwd, rel));
+  if (has("package.json")) {
+    s.has_typescript = has("tsconfig.json") || has("tsconfig.base.json");
+    try {
+      const pkg = JSON.parse(__require("fs").readFileSync(join5(cwd, "package.json"), "utf-8"));
+      const deps = { ...pkg.dependencies ?? {}, ...pkg.devDependencies ?? {} };
+      if (deps["react-native"] || deps["expo"])
+        s.has_react_native = true;
+      if (Object.keys(deps).some((k) => k.startsWith("@figma/") || k === "figma-api"))
+        s.has_figma = true;
+    } catch {}
+  }
+  if (has("Podfile") || has("*.xcodeproj"))
+    s.has_swift = true;
+  if (has("build.gradle") || has("build.gradle.kts") || has("settings.gradle"))
+    s.has_kotlin = true;
+  if (has("pubspec.yaml"))
+    s.has_flutter = true;
+  if (has("requirements.txt") || has("pyproject.toml") || has("setup.py"))
+    s.has_python = true;
+  if (has("go.mod"))
+    s.has_go = true;
+  if (has("Cargo.toml"))
+    s.has_rust = true;
+  if (has("pom.xml") || has("build.gradle"))
+    s.has_java = true;
+  if (has("global.json") || hasGlob(cwd, /\.csproj$/))
+    s.has_csharp = true;
+}
+function detectFromExtensions(cwd, s) {
+  let entries = [];
+  try {
+    entries = readdirSync2(cwd);
+  } catch {
+    return;
+  }
+  let scanned = 0;
+  for (const name of entries) {
+    if (scanned > 100)
+      break;
+    if (name.startsWith("."))
+      continue;
+    const p = join5(cwd, name);
+    try {
+      const stat = statSync2(p);
+      if (stat.isFile()) {
+        scanned++;
+        if (name.endsWith(".swift"))
+          s.has_swift = true;
+        else if (name.endsWith(".kt") || name.endsWith(".kts"))
+          s.has_kotlin = true;
+        else if (name.endsWith(".dart"))
+          s.has_flutter = true;
+        else if (name.endsWith(".py"))
+          s.has_python = true;
+        else if (name.endsWith(".go"))
+          s.has_go = true;
+        else if (name.endsWith(".rs"))
+          s.has_rust = true;
+        else if (name.endsWith(".ts") || name.endsWith(".tsx"))
+          s.has_typescript = true;
+        else if (name.endsWith(".java"))
+          s.has_java = true;
+        else if (name.endsWith(".cs"))
+          s.has_csharp = true;
+      }
+    } catch {}
+  }
+}
+function hasGlob(cwd, re) {
+  try {
+    return readdirSync2(cwd).some((n) => re.test(n));
+  } catch {
+    return false;
+  }
+}
+function pickPrimary(s) {
+  if (s.has_swift)
+    return "swift";
+  if (s.has_kotlin)
+    return "kotlin";
+  if (s.has_flutter)
+    return "dart";
+  if (s.has_react_native)
+    return "react-native";
+  if (s.has_typescript)
+    return "typescript";
+  if (s.has_python)
+    return "python";
+  if (s.has_go)
+    return "go";
+  if (s.has_rust)
+    return "rust";
+  if (s.has_java)
+    return "java";
+  if (s.has_csharp)
+    return "csharp";
+  return null;
+}
+
+// src/search/embedding-model.ts
+var log8 = createLogger("embedding-model");
+var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
+var EMBEDDING_DIM = 384;
+class EmbeddingModel {
+  pipeline = null;
+  loading = null;
+  available = true;
+  async embed(text) {
+    if (!this.available)
+      return null;
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return null;
+    try {
+      const result = await this.pipeline(text, { pooling: "mean", normalize: true });
+      return new Float32Array(result.data);
+    } catch (err) {
+      log8.error("embed failed", { error: String(err) });
+      return null;
+    }
+  }
+  async embedBatch(texts, chunkSize = 8) {
+    if (!this.available || texts.length === 0)
+      return texts.map(() => null);
+    await this.ensureLoaded();
+    if (!this.pipeline)
+      return texts.map(() => null);
+    const results = [];
+    for (let i = 0;i < texts.length; i += chunkSize) {
+      const chunk = texts.slice(i, i + chunkSize);
+      try {
+        const result = await this.pipeline(chunk, { pooling: "mean", normalize: true });
+        for (let j = 0;j < chunk.length; j++) {
+          const offset = j * 384;
+          results.push(new Float32Array(result.data.slice(offset, offset + 384)));
+        }
+      } catch {
+        for (const text of chunk) {
+          try {
+            const r = await this.pipeline(text, { pooling: "mean", normalize: true });
+            results.push(new Float32Array(r.data));
+          } catch {
+            results.push(null);
+          }
+        }
+      }
+    }
+    return results;
+  }
+  get isAvailable() {
+    return this.available && this.pipeline !== null;
+  }
+  get isLoadAttempted() {
+    return this.loading !== null;
+  }
+  async ensureLoaded() {
+    if (this.pipeline || !this.available)
+      return;
+    if (!this.loading)
+      this.loading = this.loadModel();
+    await this.loading;
+  }
+  async loadModel() {
+    if (process.env["CLAUDE_MEMORY_HUB_EMBEDDINGS"] === "disabled") {
+      this.available = false;
+      return;
+    }
+    try {
+      const { pipeline, env } = await import("@huggingface/transformers");
+      env.allowLocalModels = true;
+      env.allowRemoteModels = true;
+      const t0 = Date.now();
+      this.pipeline = await pipeline("feature-extraction", MODEL_NAME, { dtype: "fp32" });
+      log8.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+    } catch (err) {
+      log8.warn("Embedding model unavailable", { error: String(err) });
+      this.available = false;
+    }
+  }
+}
+var embeddingModel = new EmbeddingModel;
+
+// src/context/resource-embedding-search.ts
+async function searchResourcesByPrompt(prompt, options = {}) {
+  const { limit = 5, threshold = 0.3, kinds, db } = options;
+  if (!prompt.trim())
+    return [];
+  await embeddingModel.embed("warmup");
+  if (!embeddingModel.isAvailable)
+    return [];
+  const queryVec = await embeddingModel.embed(prompt);
+  if (!queryVec)
+    return [];
+  const d = db ?? getDatabase();
+  const rows = d.query(`SELECT rd.id, rd.resource_kind as kind, rd.resource_name as name, rd.file_path, e.vector
+     FROM resource_descriptions rd
+     JOIN embeddings e ON e.doc_type = 'resource' AND e.doc_id = rd.id`).all();
+  const scored = [];
+  for (const row of rows) {
+    if (kinds && !kinds.includes(row.kind))
+      continue;
+    const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
+    const score = cosineSimilarity(queryVec, docVec);
+    if (score >= threshold) {
+      scored.push({
+        kind: row.kind,
+        name: row.name,
+        file_path: row.file_path,
+        score,
+        reason: `${(score * 100).toFixed(0)}% semantic match`
+      });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+function cosineSimilarity(a, b) {
+  let dot = 0;
+  for (let i = 0;i < a.length; i++)
+    dot += a[i] * b[i];
+  return dot;
+}
+
+// src/context/resource-matcher.ts
+var log9 = createLogger("resource-matcher");
+var CONTEXT_BOOSTS = [
+  { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
+  { when: (s) => s.has_kotlin, names: ["android-developer", "kotlin", "compose"] },
+  { when: (s) => s.has_react_native, names: ["react-native-developer", "expo"] },
+  { when: (s) => s.has_flutter, names: ["flutter-developer", "dart", "riverpod"] },
+  { when: (s) => s.has_typescript, names: ["web-developer", "react", "nextjs", "frontend"] },
+  { when: (s) => s.has_python, names: ["python", "fastapi", "django"] },
+  { when: (s) => s.has_figma, names: ["figma-ui-mcp", "ui-ux-pro-max", "ui-ux-designer"] },
+  { when: (s) => s.is_mobile, names: ["mobile-development", "mobile-development-skill"] }
+];
+var KIND_ORDER = {
+  skill: 0,
+  agent: 1,
+  command: 2,
+  workflow: 3,
+  claude_md: 4
+};
+async function matchResourcesForPrompt(prompt, analysis, opts) {
+  const t0 = Date.now();
+  const { project, threshold = 0.3, limit = 5, semantic_threshold = 0.15 } = opts;
+  const semantic = await searchResourcesByPrompt(prompt, {
+    limit: 30,
+    threshold: semantic_threshold
+  });
+  const tracker = new ResourceTracker;
+  const recent = tracker.getRecentlyUsedResources(project, 5);
+  const freqMap = new Map;
+  for (const r of recent) {
+    const key = `${r.resource_type}::${r.resource_name}`;
+    freqMap.set(key, r.frequency);
+  }
+  const recencyMap = new Map;
+  for (const r of recent) {
+    const key = `${r.resource_type}::${r.resource_name}`;
+    recencyMap.set(key, r.frequency >= 1 ? 1 : 0);
+  }
+  const seen = new Map;
+  for (const m of semantic) {
+    const key = `${m.kind}::${m.name}`;
+    seen.set(key, buildScored(m, analysis, freqMap, recencyMap));
+  }
+  const registry = getResourceRegistry();
+  registry.scan();
+  for (const [key, freq] of freqMap.entries()) {
+    if (seen.has(key))
+      continue;
+    if (freq < 2)
+      continue;
+    const [kind, name] = key.split("::");
+    const reg = registry.resolve(kind, name);
+    if (!reg)
+      continue;
+    const stub = {
+      kind,
+      name,
+      score: 0,
+      reason: "frequently used",
+      file_path: reg.path
+    };
+    seen.set(key, buildScored(stub, analysis, freqMap, recencyMap));
+  }
+  const all = [...seen.values()];
+  const filtered = all.filter((r) => r.score >= threshold);
+  filtered.sort((a, b) => {
+    if (b.score !== a.score)
+      return b.score - a.score;
+    return (KIND_ORDER[a.kind] ?? 99) - (KIND_ORDER[b.kind] ?? 99);
+  });
+  log9.info("matched resources", {
+    candidates: all.length,
+    above_threshold: filtered.length,
+    ms: Date.now() - t0
+  });
+  return filtered.slice(0, limit);
+}
+function buildScored(m, analysis, freqMap, recencyMap) {
+  const semantic = m.score;
+  const freq = computeFrequencyScore(freqMap.get(`${m.kind}::${m.name}`) ?? 0);
+  const ctx = computeProjectContextScore(m.name, analysis);
+  const rec = computeRecencyScore(recencyMap.get(`${m.kind}::${m.name}`) ?? 0);
+  const final = clamp01(0.5 * semantic + 0.2 * freq + 0.2 * ctx + 0.1 * rec);
+  return {
+    kind: m.kind,
+    name: m.name,
+    file_path: m.file_path,
+    score: final,
+    semantic_score: semantic,
+    frequency_score: freq,
+    project_context_score: ctx,
+    recency_score: rec,
+    reason: buildReason(semantic, freq, ctx)
+  };
+}
+function buildReason(semantic, freq, ctx) {
+  const parts = [];
+  if (semantic >= 0.5)
+    parts.push(`${(semantic * 100).toFixed(0)}% match`);
+  else if (semantic >= 0.3)
+    parts.push(`weak semantic match`);
+  if (freq >= 0.4)
+    parts.push(`used in this project`);
+  if (ctx >= 0.5)
+    parts.push(`fits cwd`);
+  return parts.join(", ") || "candidate";
+}
+function computeFrequencyScore(usageCount) {
+  if (usageCount === 0)
+    return 0;
+  return clamp01(0.4 + (usageCount - 1) * 0.3);
+}
+function computeProjectContextScore(name, analysis) {
+  const lname = name.toLowerCase();
+  for (const rule of CONTEXT_BOOSTS) {
+    if (!rule.when(analysis.cwd_signals))
+      continue;
+    if (rule.names.some((n) => lname === n || lname.includes(n)))
+      return 1;
+  }
+  return 0;
+}
+function computeRecencyScore(daysAgo) {
+  if (daysAgo === 0)
+    return 0;
+  if (daysAgo <= 1)
+    return 1;
+  if (daysAgo <= 7)
+    return 0.6;
+  if (daysAgo <= 30)
+    return 0.3;
+  return 0;
+}
+function clamp01(n) {
+  return Math.max(0, Math.min(1, n));
+}
+
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
@@ -2337,6 +2844,19 @@ async function handleUserPromptSubmit(hook, project) {
       }
     } catch {}
   }
+  let smartMatchSection = "";
+  try {
+    const analysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
+    if (!analysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
+      const matches = await matchResourcesForPrompt(hook.prompt ?? "", analysis, {
+        project,
+        threshold: 0.3,
+        limit: 5
+      });
+      if (matches.length > 0)
+        smartMatchSection = formatSmartMatch(matches);
+    }
+  } catch {}
   let overheadWarning = "";
   try {
     const overhead = await registry.getOverheadReport(project);
@@ -2347,16 +2867,28 @@ async function handleUserPromptSubmit(hook, project) {
     }
   } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
-  const safeContext = validator.validate(fitWithinBudget(memorySection, mdSummary, advice, overheadWarning));
+  const safeContext = validator.validate(fitWithinBudget(memorySection, mdSummary, smartMatchSection, advice, overheadWarning));
   return { additionalContext: safeContext };
 }
-function fitWithinBudget(memoryText, mdText, adviceText, overheadText) {
+function formatSmartMatch(matches) {
+  const lines = ["**Suggested resources for this prompt:**"];
+  for (const m of matches) {
+    const pct = (m.score * 100).toFixed(0);
+    const kind = m.kind === "claude_md" ? "CLAUDE.md" : m.kind;
+    lines.push(`  - ${kind}: \`${m.name}\` (${pct}% \u2014 ${m.reason})`);
+  }
+  lines.push("Invoke or reference the most relevant ones if applicable.");
+  return lines.join(`
+`);
+}
+function fitWithinBudget(memoryText, mdText, smartMatchText, adviceText, overheadText) {
   const MAX_CHARS2 = 8000;
   const sections = [
     { text: memoryText || "", priority: 1, minChars: 500 },
-    { text: mdText || "", priority: 2, minChars: 200 },
-    { text: adviceText || "", priority: 3, minChars: 0 },
-    { text: overheadText || "", priority: 4, minChars: 0 }
+    { text: smartMatchText || "", priority: 2, minChars: 100 },
+    { text: mdText || "", priority: 3, minChars: 200 },
+    { text: adviceText || "", priority: 4, minChars: 0 },
+    { text: overheadText || "", priority: 5, minChars: 0 }
   ].filter((s) => s.text.length > 0);
   const totalNeeded = sections.reduce((sum, s) => sum + s.text.length, 0);
   if (totalNeeded <= MAX_CHARS2) {

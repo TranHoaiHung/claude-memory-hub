@@ -283,6 +283,39 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
     log.info("Migration v5 complete");
   }
+  if (currentVersion < 6) {
+    log.info("Applying migration v6: resource_descriptions + relax embeddings doc_type");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS resource_descriptions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_kind   TEXT NOT NULL CHECK(resource_kind IN ('skill','agent','command','workflow','claude_md')),
+        resource_name   TEXT NOT NULL,
+        file_path       TEXT NOT NULL,
+        embed_text      TEXT NOT NULL,
+        content_hash    TEXT NOT NULL,
+        embedded_at     INTEGER NOT NULL,
+        UNIQUE(resource_kind, resource_name)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_resource_descriptions_kind ON resource_descriptions(resource_kind)`);
+    db.run(`
+      CREATE TABLE IF NOT EXISTS embeddings_v6 (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note','resource')),
+        doc_id     INTEGER NOT NULL,
+        model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+        vector     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.run(`INSERT INTO embeddings_v6 SELECT * FROM embeddings`);
+    db.run(`DROP TABLE embeddings`);
+    db.run(`ALTER TABLE embeddings_v6 RENAME TO embeddings`);
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
+    log.info("Migration v6 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -666,6 +699,13 @@ var init_monitor = __esm(() => {
 });
 
 // src/search/embedding-model.ts
+var exports_embedding_model = {};
+__export(exports_embedding_model, {
+  embeddingModel: () => embeddingModel,
+  EmbeddingModel: () => EmbeddingModel,
+  EMBEDDING_DIM: () => EMBEDDING_DIM
+});
+
 class EmbeddingModel {
   pipeline = null;
   loading = null;
@@ -1819,14 +1859,24 @@ var init_importer = __esm(() => {
   log9 = createLogger("importer");
 });
 
-// src/cli/doctor.ts
-var exports_doctor = {};
-__export(exports_doctor, {
-  runDoctor: () => runDoctor
-});
-import { existsSync as existsSync5, readFileSync, statSync as statSync2 } from "fs";
+// src/cli/doctor-types.ts
 import { homedir as homedir5 } from "os";
 import { join as join5 } from "path";
+var STABLE_DIR, DB_PATH, SETTINGS_PATH, ICON;
+var init_doctor_types = __esm(() => {
+  STABLE_DIR = join5(homedir5(), ".claude-memory-hub");
+  DB_PATH = join5(STABLE_DIR, "memory.db");
+  SETTINGS_PATH = join5(homedir5(), ".claude", "settings.json");
+  ICON = {
+    ok: "[OK]  ",
+    warn: "[WARN]",
+    fail: "[FAIL]"
+  };
+});
+
+// src/cli/doctor-checks.ts
+import { existsSync as existsSync5, readFileSync, statSync as statSync2 } from "fs";
+import { join as join6 } from "path";
 import { spawnSync } from "child_process";
 function checkDatabase2() {
   if (!existsSync5(DB_PATH)) {
@@ -1859,14 +1909,14 @@ function checkEmbeddings() {
   if (process.env["CLAUDE_MEMORY_HUB_EMBEDDINGS"] === "disabled") {
     return { name: "embeddings", status: "warn", detail: "explicitly disabled via CLAUDE_MEMORY_HUB_EMBEDDINGS=disabled" };
   }
-  const localTransformers = join5(STABLE_DIR, "node_modules", "@huggingface", "transformers", "package.json");
-  const localSharp = join5(STABLE_DIR, "node_modules", "sharp", "package.json");
+  const localTransformers = join6(STABLE_DIR, "node_modules", "@huggingface", "transformers", "package.json");
+  const localSharp = join6(STABLE_DIR, "node_modules", "sharp", "package.json");
   if (!existsSync5(localTransformers)) {
     return {
       name: "embeddings",
       status: "warn",
       detail: "@huggingface/transformers not installed (semantic search disabled, FTS5 keyword still works)",
-      fix: "Run: claude-memory-hub doctor --fix  (or: cd ~/.claude-memory-hub && npm install @huggingface/transformers sharp)"
+      fix: "Run: claude-memory-hub doctor --fix  (or: cd ~/.claude-memory-hub && npm install)"
     };
   }
   if (!existsSync5(localSharp)) {
@@ -1877,7 +1927,7 @@ function checkEmbeddings() {
       fix: "Run: claude-memory-hub doctor --fix"
     };
   }
-  const libvipsDir = join5(STABLE_DIR, "node_modules", "@img", "sharp-libvips-darwin-arm64", "lib");
+  const libvipsDir = join6(STABLE_DIR, "node_modules", "@img", "sharp-libvips-darwin-arm64", "lib");
   if (process.platform === "darwin" && process.arch === "arm64" && !existsSync5(libvipsDir)) {
     return {
       name: "embeddings",
@@ -1930,7 +1980,7 @@ function checkHooks() {
   }
 }
 function checkDistFiles() {
-  const distDir = join5(STABLE_DIR, "dist");
+  const distDir = join6(STABLE_DIR, "dist");
   const required = [
     "index.js",
     "cli.js",
@@ -1940,7 +1990,7 @@ function checkDistFiles() {
     "hooks/pre-compact.js",
     "hooks/post-compact.js"
   ];
-  const missing = required.filter((f) => !existsSync5(join5(distDir, f)));
+  const missing = required.filter((f) => !existsSync5(join6(distDir, f)));
   if (missing.length > 0) {
     return {
       name: "dist files",
@@ -1964,11 +2014,818 @@ function checkBunPath() {
   }
   return { name: "bun runtime", status: "ok", detail: path };
 }
+var init_doctor_checks = __esm(() => {
+  init_doctor_types();
+});
+
+// src/context/resource-tracker.ts
+class ResourceTracker {
+  db;
+  initialized = false;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  ensureSchema() {
+    if (this.initialized)
+      return;
+    this.db.run(SCHEMA_ADDITIONS);
+    this.initialized = true;
+  }
+  trackUsage(session_id, project, resource_type, resource_name, token_cost = 0) {
+    this.ensureSchema();
+    const existing = this.db.query("SELECT id, use_count FROM resource_usage WHERE session_id = ? AND resource_name = ?").get(session_id, resource_name);
+    if (existing) {
+      this.db.run("UPDATE resource_usage SET use_count = use_count + 1 WHERE id = ?", [existing.id]);
+    } else {
+      this.db.run(`INSERT INTO resource_usage(session_id, project, resource_type, resource_name, use_count, token_cost, created_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)`, [session_id, project, resource_type, resource_name, token_cost, Date.now()]);
+    }
+  }
+  getMostUsedResources(project, resource_type, limit = 10) {
+    this.ensureSchema();
+    if (resource_type) {
+      return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+           FROM resource_usage WHERE project = ? AND resource_type = ?
+           GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, resource_type, limit);
+    }
+    return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+         FROM resource_usage WHERE project = ?
+         GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, limit);
+  }
+  getRecentlyUsedResources(project, lastNSessions = 5) {
+    this.ensureSchema();
+    return this.db.query(`SELECT resource_type, resource_name, COUNT(DISTINCT session_id) as frequency
+         FROM resource_usage
+         WHERE project = ?
+           AND session_id IN (
+             SELECT DISTINCT session_id FROM resource_usage
+             WHERE project = ?
+             ORDER BY created_at DESC
+             LIMIT ?
+           )
+         GROUP BY resource_type, resource_name
+         ORDER BY frequency DESC, resource_type`).all(project, project, lastNSessions);
+  }
+  estimateTokenBudget(project) {
+    this.ensureSchema();
+    const rows = this.db.query(`SELECT resource_type, SUM(token_cost) as total_tokens, COUNT(DISTINCT resource_name) as count
+         FROM resource_usage
+         WHERE project = ?
+         GROUP BY resource_type`).all(project);
+    const by_type = {};
+    let total = 0;
+    let count = 0;
+    for (const row of rows) {
+      by_type[row.resource_type] = row.total_tokens;
+      total += row.total_tokens;
+      count += row.count;
+    }
+    return { total_token_cost: total, resource_count: count, by_type };
+  }
+}
+var SCHEMA_ADDITIONS = `
+CREATE TABLE IF NOT EXISTS resource_usage (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  resource_type TEXT NOT NULL
+    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
+  resource_name TEXT NOT NULL,
+  use_count   INTEGER NOT NULL DEFAULT 1,
+  token_cost  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
+CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
+CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
+`;
+var init_resource_tracker = __esm(() => {
+  init_schema();
+});
+
+// src/context/resource-registry.ts
+import { existsSync as existsSync6, readdirSync, statSync as statSync3, readFileSync as readFileSync2 } from "fs";
+import { join as join7, basename, relative } from "path";
+import { homedir as homedir6 } from "os";
+
+class ResourceRegistry {
+  resources = new Map;
+  lastScanAt = 0;
+  claudeDir;
+  constructor() {
+    this.claudeDir = join7(homedir6(), ".claude");
+  }
+  scan(cwd) {
+    if (Date.now() - this.lastScanAt < SCAN_TTL_MS && this.resources.size > 0)
+      return;
+    this.resources.clear();
+    try {
+      this.scanSkills(join7(this.claudeDir, "skills"), cwd);
+      this.scanFlatAgents(join7(this.claudeDir, "agents"));
+      this.scanAgentPackages(this.claudeDir);
+      this.scanCommands(join7(this.claudeDir, "commands"), cwd);
+      this.scanWorkflows(join7(this.claudeDir, "workflows"));
+      this.scanClaudeMd(cwd);
+      this.lastScanAt = Date.now();
+    } catch (err) {
+      log10.error("scan failed", { error: String(err) });
+    }
+  }
+  resolve(kind, name) {
+    this.ensureScanned();
+    return this.resources.get(`${kind}:${name}`);
+  }
+  exists(kind, name) {
+    return this.resolve(kind, name) !== undefined;
+  }
+  getAll(kind) {
+    this.ensureScanned();
+    const all = [...this.resources.values()];
+    return kind ? all.filter((r) => r.kind === kind) : all;
+  }
+  async getOverheadReport(project, lastNSessions = 10) {
+    this.ensureScanned();
+    const tracker = new ResourceTracker;
+    const recentSkills = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "skill");
+    const recentAgents = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "agent");
+    const allSkills = this.getAll("skill");
+    const allAgents = this.getAll("agent");
+    const usedSkillNames = new Set(recentSkills.map((r) => r.resource_name));
+    const usedAgentNames = new Set(recentAgents.map((r) => r.resource_name));
+    const unusedSkills = allSkills.filter((s) => !usedSkillNames.has(s.name));
+    const unusedAgents = allAgents.filter((a) => !usedAgentNames.has(a.name));
+    const skillListingTokens = allSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const agentDescTokens = allAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const commandListingTokens = this.getAll("command").reduce((sum, c) => sum + c.listing_tokens, 0);
+    const claudeMdTokens = this.getAll("claude_md").reduce((sum, c) => sum + c.full_tokens, 0);
+    const unusedSkillListingTokens = unusedSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const unusedAgentListingTokens = unusedAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const recommendations = [];
+    if (unusedSkills.length > 0) {
+      recommendations.push(`${unusedSkills.length}/${allSkills.length} skills unused in last ${lastNSessions} sessions (~${unusedSkillListingTokens} listing tokens). Consider project-local or removal.`);
+    }
+    if (unusedAgents.length > 0) {
+      recommendations.push(`${unusedAgents.length}/${allAgents.length} agents unused in last ${lastNSessions} sessions (~${unusedAgentListingTokens} listing tokens).`);
+    }
+    if (claudeMdTokens > 5000) {
+      recommendations.push(`CLAUDE.md chain is ${claudeMdTokens} tokens. Consider consolidating if >5K.`);
+    }
+    return {
+      fixed_overhead: {
+        total_tokens: skillListingTokens + agentDescTokens + commandListingTokens + claudeMdTokens,
+        skill_listings: skillListingTokens,
+        agent_descriptions: agentDescTokens,
+        command_listings: commandListingTokens,
+        claude_md: claudeMdTokens
+      },
+      usage_analysis: {
+        skills_installed: allSkills.length,
+        skills_used_recently: usedSkillNames.size,
+        skills_never_used: unusedSkills.map((s) => s.name),
+        agents_installed: allAgents.length,
+        agents_used_recently: usedAgentNames.size,
+        agents_never_used: unusedAgents.map((a) => a.name)
+      },
+      recommendations,
+      potential_savings: {
+        if_remove_unused_skills: unusedSkillListingTokens,
+        if_remove_unused_agents: unusedAgentListingTokens
+      }
+    };
+  }
+  scanSkills(globalDir, cwd) {
+    this.scanSkillDir(globalDir, "global");
+    if (cwd) {
+      const projectDir = join7(cwd, ".claude", "skills");
+      if (existsSync6(projectDir)) {
+        this.scanSkillDir(projectDir, "project");
+      }
+    }
+  }
+  scanSkillDir(dir, source) {
+    if (!existsSync6(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory())
+          continue;
+        const name = entry.name;
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const skillDir = join7(dir, name);
+        const skillFile = this.findPrimaryFile(skillDir, ["SKILL.md", "README.md"]);
+        const listing = this.estimateListingFromSkillDir(skillDir);
+        const fullTokens = skillFile ? this.charsToTokens(this.readFileSize(skillFile)) : 0;
+        const totalTokens = this.estimateDirTokens(skillDir);
+        this.register({
+          kind: "skill",
+          name,
+          path: skillFile ?? skillDir,
+          allPaths: this.listMdFiles(skillDir),
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: fullTokens,
+          total_tokens: totalTokens,
+          source
+        });
+      }
+    } catch (err) {
+      log10.error(`scanSkillDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanFlatAgents(dir) {
+    if (!existsSync6(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        if (entry.name === "README.md")
+          continue;
+        const filePath = join7(dir, entry.name);
+        const content = this.readFileHead(filePath, 20);
+        const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        const listing = this.estimateAgentListingTokens(content);
+        this.register({
+          kind: "agent",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log10.error(`scanFlatAgents ${dir}`, { error: String(err) });
+    }
+  }
+  scanAgentPackages(claudeDir) {
+    if (!existsSync6(claudeDir))
+      return;
+    try {
+      for (const entry of readdirSync(claudeDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith("agent_"))
+          continue;
+        const packageDir = join7(claudeDir, entry.name);
+        this.scanAgentPackageDir(packageDir);
+      }
+    } catch (err) {
+      log10.error("scanAgentPackages", { error: String(err) });
+    }
+  }
+  scanAgentPackageDir(packageDir) {
+    try {
+      for (const entry of readdirSync(packageDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const subDir = join7(packageDir, entry.name);
+          const agentFile = join7(subDir, "AGENT.md");
+          if (existsSync6(agentFile)) {
+            const content = this.readFileHead(agentFile, 20);
+            const name = this.parseFrontmatterName(content) ?? entry.name;
+            if (!SAFE_NAME_RE.test(name))
+              continue;
+            const listing = this.estimateAgentListingTokens(content);
+            const fullTokens = this.charsToTokens(this.readFileSize(agentFile));
+            const totalTokens = this.estimateDirTokens(subDir);
+            this.register({
+              kind: "agent",
+              name,
+              path: agentFile,
+              allPaths: this.listMdFiles(subDir),
+              category: "variable",
+              listing_tokens: listing,
+              full_tokens: fullTokens,
+              total_tokens: totalTokens,
+              source: "global"
+            });
+          }
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (entry.name === "README.md" || entry.name === "SKILL.md")
+            continue;
+          const filePath = join7(packageDir, entry.name);
+          const content = this.readFileHead(filePath, 20);
+          const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+          if (!SAFE_NAME_RE.test(name))
+            continue;
+          if (this.resources.has(`agent:${name}`))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          this.register({
+            kind: "agent",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateAgentListingTokens(content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source: "global"
+          });
+        }
+      }
+    } catch (err) {
+      log10.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+    }
+  }
+  scanCommands(globalDir, cwd) {
+    if (existsSync6(globalDir))
+      this.scanCommandDir(globalDir, globalDir, "global");
+    if (cwd) {
+      const projectDir = join7(cwd, ".claude", "commands");
+      if (existsSync6(projectDir))
+        this.scanCommandDir(projectDir, projectDir, "project");
+    }
+  }
+  scanCommandDir(dir, baseDir, source) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          this.scanCommandDir(join7(dir, entry.name), baseDir, source);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          const filePath = join7(dir, entry.name);
+          const name = relative(baseDir, filePath).replace(/\.md$/, "");
+          if (!SAFE_COMMAND_NAME_RE.test(name))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          const content = this.readFileHead(filePath, 3);
+          this.register({
+            kind: "command",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateCommandListingTokens(name, content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source
+          });
+        }
+      }
+    } catch (err) {
+      log10.error(`scanCommandDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanWorkflows(dir) {
+    if (!existsSync6(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        const filePath = join7(dir, entry.name);
+        const name = basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        this.register({
+          kind: "workflow",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: 0,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log10.error(`scanWorkflows ${dir}`, { error: String(err) });
+    }
+  }
+  scanClaudeMd(cwd) {
+    const globalFile = join7(this.claudeDir, "CLAUDE.md");
+    if (existsSync6(globalFile)) {
+      const fileSize = this.readFileSize(globalFile);
+      this.register({
+        kind: "claude_md",
+        name: "global",
+        path: globalFile,
+        allPaths: [globalFile],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "global"
+      });
+    }
+    if (!cwd)
+      return;
+    const projectFiles = [
+      join7(cwd, "CLAUDE.md"),
+      join7(cwd, ".claude", "CLAUDE.md")
+    ];
+    for (const file of projectFiles) {
+      if (!existsSync6(file))
+        continue;
+      const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
+      const name = `project:${relPath}`;
+      const fileSize = this.readFileSize(file);
+      this.register({
+        kind: "claude_md",
+        name,
+        path: file,
+        allPaths: [file],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "project"
+      });
+    }
+  }
+  ensureScanned() {
+    if (this.resources.size === 0 || Date.now() - this.lastScanAt >= SCAN_TTL_MS) {
+      this.scan();
+    }
+  }
+  register(resource) {
+    const key = `${resource.kind}:${resource.name}`;
+    const existing = this.resources.get(key);
+    if (existing && existing.source === "global" && resource.source === "project") {
+      this.resources.set(key, resource);
+    } else if (!existing) {
+      this.resources.set(key, resource);
+    }
+  }
+  parseFrontmatterName(content) {
+    const lines = content.split(`
+`);
+    let inFrontmatter = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed === "---") {
+        if (inFrontmatter)
+          return;
+        inFrontmatter = true;
+        continue;
+      }
+      if (!inFrontmatter)
+        continue;
+      const m = trimmed.match(/^name:\s*["']?([a-zA-Z0-9_\-]+)["']?/);
+      if (m?.[1])
+        return m[1];
+    }
+    return;
+  }
+  findPrimaryFile(dir, candidates) {
+    for (const c of candidates) {
+      const p = join7(dir, c);
+      if (existsSync6(p))
+        return p;
+    }
+    return;
+  }
+  readFileHead(filePath, lines) {
+    try {
+      const content = readFileSync2(filePath, "utf-8");
+      return content.split(`
+`).slice(0, lines).join(`
+`);
+    } catch {
+      return "";
+    }
+  }
+  readFileSize(filePath) {
+    try {
+      return statSync3(filePath).size;
+    } catch {
+      return 0;
+    }
+  }
+  charsToTokens(chars) {
+    return Math.ceil(chars / CHARS_PER_TOKEN);
+  }
+  estimateListingFromSkillDir(dir) {
+    const skillFile = this.findPrimaryFile(dir, ["SKILL.md", "README.md"]);
+    if (!skillFile)
+      return 30;
+    const head = this.readFileHead(skillFile, 5);
+    const descLine = head.split(`
+`).find((l) => l.startsWith("description:") || l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = descLine?.slice(0, 80).length ?? 20;
+    return Math.ceil((descLen + 30) / CHARS_PER_TOKEN);
+  }
+  estimateAgentListingTokens(headContent) {
+    const lines = headContent.split(`
+`);
+    for (const line of lines) {
+      if (line.startsWith("description:")) {
+        const desc = line.slice(12).trim().slice(0, 150);
+        return Math.ceil((desc.length + 30) / CHARS_PER_TOKEN);
+      }
+    }
+    return 30;
+  }
+  estimateCommandListingTokens(name, headContent) {
+    const firstLine = headContent.split(`
+`).find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = firstLine?.slice(0, 60).length ?? 10;
+    return Math.ceil((name.length + descLen + 10) / CHARS_PER_TOKEN);
+  }
+  listMdFiles(dir) {
+    const files = [];
+    try {
+      const walk = (d, depth) => {
+        if (depth > MAX_DIR_WALK_DEPTH)
+          return;
+        for (const entry of readdirSync(d, { withFileTypes: true })) {
+          const p = join7(d, entry.name);
+          if (entry.isDirectory())
+            walk(p, depth + 1);
+          else if (entry.isFile() && entry.name.endsWith(".md"))
+            files.push(p);
+        }
+      };
+      walk(dir, 0);
+    } catch {}
+    return files;
+  }
+  estimateDirTokens(dir) {
+    return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
+  }
+}
+function getResourceRegistry() {
+  if (!_instance)
+    _instance = new ResourceRegistry;
+  return _instance;
+}
+var log10, CHARS_PER_TOKEN = 3.75, SCAN_TTL_MS, SAFE_NAME_RE, SAFE_COMMAND_NAME_RE, MAX_DIR_WALK_DEPTH = 5, _instance;
+var init_resource_registry = __esm(() => {
+  init_logger();
+  init_resource_tracker();
+  log10 = createLogger("resource-registry");
+  SCAN_TTL_MS = 5 * 60 * 1000;
+  SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
+  SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
+});
+
+// src/context/resource-description.ts
+import { readFileSync as readFileSync3, existsSync as existsSync7, statSync as statSync4 } from "fs";
+import { join as join8 } from "path";
+function extractDescription(filePath, name) {
+  if (!existsSync7(filePath))
+    return null;
+  let content;
+  try {
+    content = readFileSync3(filePath, "utf-8").slice(0, MAX_BODY_PEEK);
+  } catch {
+    return null;
+  }
+  const fmDesc = parseFrontmatterDescription(content);
+  const bodySummary = parseBodyOpening(content);
+  const parts = [name];
+  if (fmDesc)
+    parts.push(fmDesc);
+  if (bodySummary && bodySummary !== fmDesc)
+    parts.push(bodySummary);
+  const embedText = parts.join(". ").slice(0, MAX_DESC_CHARS);
+  if (embedText.length < name.length + 5)
+    return null;
+  return {
+    name,
+    frontmatter_description: fmDesc,
+    body_summary: bodySummary,
+    embed_text: embedText,
+    content_hash: hashContent(content)
+  };
+}
+function parseFrontmatterDescription(content) {
+  const lines = content.split(`
+`);
+  let inFrontmatter = false;
+  let collecting = false;
+  const parts = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "---") {
+      if (inFrontmatter)
+        break;
+      inFrontmatter = true;
+      continue;
+    }
+    if (!inFrontmatter)
+      continue;
+    if (collecting && /^[a-zA-Z_][a-zA-Z0-9_\-]*:\s*/.test(trimmed) && !trimmed.startsWith("description:")) {
+      break;
+    }
+    if (trimmed.startsWith("description:")) {
+      const inline = trimmed.slice("description:".length).trim();
+      if (inline)
+        parts.push(inline.replace(/^["']|["']$/g, ""));
+      collecting = true;
+      continue;
+    }
+    if (collecting && trimmed) {
+      parts.push(trimmed);
+    }
+  }
+  return parts.join(" ").slice(0, MAX_DESC_CHARS);
+}
+function parseBodyOpening(content) {
+  let body = content;
+  const fmMatch = content.match(/^---[\s\S]*?\n---\n/);
+  if (fmMatch)
+    body = content.slice(fmMatch[0].length);
+  const paragraph = [];
+  for (const rawLine of body.split(`
+`)) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (paragraph.length > 0)
+        break;
+      continue;
+    }
+    if (line.startsWith("#")) {
+      if (paragraph.length > 0)
+        break;
+      continue;
+    }
+    if (line.startsWith("```"))
+      break;
+    paragraph.push(line);
+    if (paragraph.join(" ").length >= MAX_DESC_CHARS)
+      break;
+  }
+  return paragraph.join(" ").slice(0, MAX_DESC_CHARS);
+}
+function hashContent(s) {
+  let h = 5381;
+  for (let i = 0;i < s.length; i++)
+    h = h * 33 ^ s.charCodeAt(i);
+  return (h >>> 0).toString(16);
+}
+function extractFromDir(dir, name) {
+  const candidates = ["SKILL.md", "AGENT.md", "README.md", `${name}.md`];
+  for (const c of candidates) {
+    const p = join8(dir, c);
+    if (existsSync7(p))
+      return extractDescription(p, name);
+  }
+  return null;
+}
+var MAX_DESC_CHARS = 2000, MAX_BODY_PEEK = 4000;
+var init_resource_description = () => {};
+
+// src/context/resource-embedding-search.ts
+async function searchResourcesByPrompt(prompt, options = {}) {
+  const { limit = 5, threshold = 0.3, kinds, db } = options;
+  if (!prompt.trim())
+    return [];
+  await embeddingModel.embed("warmup");
+  if (!embeddingModel.isAvailable)
+    return [];
+  const queryVec = await embeddingModel.embed(prompt);
+  if (!queryVec)
+    return [];
+  const d = db ?? getDatabase();
+  const rows = d.query(`SELECT rd.id, rd.resource_kind as kind, rd.resource_name as name, rd.file_path, e.vector
+     FROM resource_descriptions rd
+     JOIN embeddings e ON e.doc_type = 'resource' AND e.doc_id = rd.id`).all();
+  const scored = [];
+  for (const row of rows) {
+    if (kinds && !kinds.includes(row.kind))
+      continue;
+    const docVec = new Float32Array(row.vector.buffer, row.vector.byteOffset, EMBEDDING_DIM);
+    const score = cosineSimilarity2(queryVec, docVec);
+    if (score >= threshold) {
+      scored.push({
+        kind: row.kind,
+        name: row.name,
+        file_path: row.file_path,
+        score,
+        reason: `${(score * 100).toFixed(0)}% semantic match`
+      });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit);
+}
+function cosineSimilarity2(a, b) {
+  let dot = 0;
+  for (let i = 0;i < a.length; i++)
+    dot += a[i] * b[i];
+  return dot;
+}
+var init_resource_embedding_search = __esm(() => {
+  init_schema();
+  init_embedding_model();
+});
+
+// src/context/resource-embeddings.ts
+var exports_resource_embeddings = {};
+__export(exports_resource_embeddings, {
+  searchResourcesByPrompt: () => searchResourcesByPrompt,
+  backfillResourceEmbeddings: () => backfillResourceEmbeddings
+});
+import { statSync as statSync5 } from "fs";
+async function backfillResourceEmbeddings(db) {
+  const t0 = Date.now();
+  const d = db ?? getDatabase();
+  const stats = { scanned: 0, embedded: 0, unchanged: 0, failed: 0, ms: 0 };
+  await embeddingModel.embed("warmup");
+  if (!embeddingModel.isAvailable) {
+    log11.warn("Embedding model unavailable \u2014 skipping resource backfill");
+    stats.ms = Date.now() - t0;
+    return stats;
+  }
+  const registry = getResourceRegistry();
+  registry.scan();
+  const resources = registry.getAll();
+  const toEmbed = [];
+  for (const r of resources) {
+    if (!["skill", "agent", "command", "workflow", "claude_md"].includes(r.kind))
+      continue;
+    stats.scanned++;
+    const desc = extractResource(r.path, r.name, r.kind);
+    if (!desc) {
+      stats.failed++;
+      continue;
+    }
+    const existing = d.query(`SELECT id, resource_kind, resource_name, file_path, content_hash
+       FROM resource_descriptions WHERE resource_kind = ? AND resource_name = ?`).get(r.kind, r.name);
+    if (existing && existing.content_hash === desc.content_hash) {
+      stats.unchanged++;
+      continue;
+    }
+    toEmbed.push({ desc, kind: r.kind, filePath: r.path });
+  }
+  if (toEmbed.length === 0) {
+    log11.info("Resource backfill: nothing to do", { ...stats });
+    stats.ms = Date.now() - t0;
+    return stats;
+  }
+  const texts = toEmbed.map((t) => t.desc.embed_text);
+  const vectors = await embeddingModel.embedBatch(texts, 8);
+  for (let i = 0;i < toEmbed.length; i++) {
+    const { desc, kind, filePath } = toEmbed[i];
+    const vector = vectors[i];
+    if (!vector) {
+      stats.failed++;
+      continue;
+    }
+    d.run(`INSERT INTO resource_descriptions(resource_kind, resource_name, file_path, embed_text, content_hash, embedded_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(resource_kind, resource_name)
+       DO UPDATE SET file_path = excluded.file_path,
+                     embed_text = excluded.embed_text,
+                     content_hash = excluded.content_hash,
+                     embedded_at = excluded.embedded_at`, [kind, desc.name, filePath, desc.embed_text, desc.content_hash, Date.now()]);
+    const row = d.query(`SELECT id FROM resource_descriptions WHERE resource_kind = ? AND resource_name = ?`).get(kind, desc.name);
+    if (!row) {
+      stats.failed++;
+      continue;
+    }
+    const blob = Buffer.from(vector.buffer);
+    d.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+       VALUES ('resource', ?, 'all-MiniLM-L6-v2', ?, ?)
+       ON CONFLICT(doc_type, doc_id) DO UPDATE SET vector = excluded.vector, created_at = excluded.created_at`, [row.id, blob, Date.now()]);
+    stats.embedded++;
+  }
+  stats.ms = Date.now() - t0;
+  log11.info("Resource backfill complete", { ...stats });
+  return stats;
+}
+function extractResource(path, name, kind) {
+  try {
+    const stat = statSync5(path);
+    if (stat.isDirectory())
+      return extractFromDir(path, name);
+    return extractDescription(path, name);
+  } catch {
+    return null;
+  }
+}
+var log11;
+var init_resource_embeddings = __esm(() => {
+  init_schema();
+  init_embedding_model();
+  init_resource_registry();
+  init_resource_description();
+  init_logger();
+  init_resource_embedding_search();
+  log11 = createLogger("resource-embeddings");
+});
+
+// src/cli/doctor-actions.ts
+import { existsSync as existsSync8, writeFileSync } from "fs";
+import { join as join9 } from "path";
+import { spawnSync as spawnSync2 } from "child_process";
 function attemptFix() {
   console.log(`
 --- Attempting auto-fix ---`);
-  const pkgPath = join5(STABLE_DIR, "package.json");
-  if (!existsSync5(pkgPath)) {
+  const pkgPath = join9(STABLE_DIR, "package.json");
+  if (!existsSync8(pkgPath)) {
     console.log("Creating package.json for runtime deps...");
     const pkg = {
       name: "claude-memory-hub-runtime",
@@ -1979,16 +2836,16 @@ function attemptFix() {
         "@huggingface/transformers": "^3.0.0"
       }
     };
-    __require("fs").writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
   }
   console.log("Installing sharp + @huggingface/transformers (this may take a minute)...");
-  const bunResult = spawnSync("bun", ["install", "--no-save"], {
+  const bunResult = spawnSync2("bun", ["install", "--no-save"], {
     cwd: STABLE_DIR,
     stdio: "inherit"
   });
   if (bunResult.status !== 0) {
     console.log("bun install failed, trying npm...");
-    const npmResult = spawnSync("npm", ["install"], {
+    const npmResult = spawnSync2("npm", ["install"], {
       cwd: STABLE_DIR,
       stdio: "inherit"
     });
@@ -2002,8 +2859,45 @@ function attemptFix() {
 [OK] Runtime deps installed.`);
   return true;
 }
-function runDoctor(args) {
+async function runBackfill() {
+  console.log(`
+--- Backfilling embeddings ---`);
+  try {
+    const { reindexAllEmbeddings: reindexAllEmbeddings2 } = (init_semantic_search(), __toCommonJS(exports_semantic_search));
+    const { backfillResourceEmbeddings: backfillResourceEmbeddings2 } = (init_resource_embeddings(), __toCommonJS(exports_resource_embeddings));
+    const { embeddingModel: embeddingModel2 } = (init_embedding_model(), __toCommonJS(exports_embedding_model));
+    await embeddingModel2.embed("warmup");
+    if (!embeddingModel2.isAvailable) {
+      console.log("[FAIL] Embedding model unavailable. Run --fix first to install deps.");
+      return;
+    }
+    const t0 = Date.now();
+    console.log("  > Summaries + entities ...");
+    await reindexAllEmbeddings2();
+    console.log("  > Skills + agents + commands (resource descriptions) ...");
+    const resourceStats = await backfillResourceEmbeddings2();
+    console.log(`    scanned: ${resourceStats.scanned}, embedded: ${resourceStats.embedded}, ` + `unchanged: ${resourceStats.unchanged}, failed: ${resourceStats.failed}`);
+    const ms = Date.now() - t0;
+    const { getDatabase: getDatabase2 } = (init_schema(), __toCommonJS(exports_schema));
+    const db = getDatabase2();
+    const count = db.query("SELECT COUNT(*) as n FROM embeddings").get().n;
+    console.log(`[OK] Backfill complete in ${ms}ms \u2014 ${count} embeddings stored total.`);
+  } catch (err) {
+    console.log(`[FAIL] Backfill error: ${String(err).slice(0, 300)}`);
+  }
+}
+var init_doctor_actions = __esm(() => {
+  init_doctor_types();
+});
+
+// src/cli/doctor.ts
+var exports_doctor = {};
+__export(exports_doctor, {
+  runDoctor: () => runDoctor
+});
+async function runDoctor(args) {
   const shouldFix = args.includes("--fix");
+  const shouldBackfill = args.includes("--backfill");
   console.log(`claude-memory-hub doctor \u2014 installation health check
 `);
   const checks = [
@@ -2023,16 +2917,30 @@ function runDoctor(args) {
   const hasWarnings = checks.some((c) => c.status === "warn");
   const fixableEmbeddings = checks.find((c) => c.name === "embeddings" && c.status !== "ok");
   console.log("");
-  if (!hasFailures && !hasWarnings) {
-    console.log("All checks passed. Memory hub is healthy.");
+  let didFix = false;
+  if (shouldFix && fixableEmbeddings) {
+    didFix = attemptFix();
+    if (didFix)
+      console.log(`
+Deps installed.`);
+    else
+      process.exitCode = 1;
+  }
+  if (shouldBackfill) {
+    if (fixableEmbeddings && !didFix) {
+      console.log("[SKIP] Backfill requires embedding deps. Re-run with `--fix --backfill`.");
+      process.exitCode = 1;
+    } else {
+      await runBackfill();
+    }
     return;
   }
-  if (shouldFix && fixableEmbeddings) {
-    const ok = attemptFix();
-    if (ok) {
-      console.log("\nRe-run `claude-memory-hub doctor` to verify.");
-    }
-    process.exitCode = ok ? 0 : 1;
+  if (didFix) {
+    console.log("Re-run `claude-memory-hub doctor --backfill` to embed existing data.");
+    return;
+  }
+  if (!hasFailures && !hasWarnings) {
+    console.log("All checks passed. Memory hub is healthy.");
     return;
   }
   if (hasFailures) {
@@ -2040,20 +2948,93 @@ function runDoctor(args) {
     process.exitCode = 1;
   } else {
     console.log("Warnings present. Re-run with --fix to install optional embedding deps.");
+    console.log("After install, run `--backfill` to embed existing summaries.");
   }
 }
-var STABLE_DIR, DB_PATH, SETTINGS_PATH, ICON;
 var init_doctor = __esm(() => {
-  STABLE_DIR = join5(homedir5(), ".claude-memory-hub");
-  DB_PATH = join5(STABLE_DIR, "memory.db");
-  SETTINGS_PATH = join5(homedir5(), ".claude", "settings.json");
-  ICON = { ok: "[OK]  ", warn: "[WARN]", fail: "[FAIL]" };
+  init_doctor_types();
+  init_doctor_checks();
+  init_doctor_actions();
+});
+
+// src/cli/stats.ts
+var exports_stats = {};
+__export(exports_stats, {
+  runStats: () => runStats
+});
+function runStats() {
+  const db = getDatabase();
+  const since = Date.now() - 30 * DAY_MS;
+  console.log("Memory Health Report \u2014 last 30 days");
+  console.log("\u2500".repeat(48));
+  const sessions = db.query("SELECT COUNT(*) n FROM sessions WHERE started_at > ?").get(since)?.n ?? 0;
+  const summaries = db.query("SELECT COUNT(*) n FROM long_term_summaries WHERE created_at > ?").get(since)?.n ?? 0;
+  const totalEmbeds = db.query("SELECT COUNT(*) n FROM embeddings").get()?.n ?? 0;
+  const resourceEmbeds = db.query("SELECT COUNT(*) n FROM embeddings WHERE doc_type='resource'").get()?.n ?? 0;
+  const totalSummaries = db.query("SELECT COUNT(*) n FROM long_term_summaries").get()?.n ?? 0;
+  const avgPerDay = (sessions / 30).toFixed(1);
+  console.log(`Sessions:            ${sessions}  (avg ${avgPerDay}/day)`);
+  console.log(`Summaries (30d):     ${summaries}`);
+  console.log(`Summaries (total):   ${totalSummaries}`);
+  console.log(`Embeddings:          ${totalEmbeds}  (${resourceEmbeds} for skills/agents)`);
+  console.log("");
+  const projects = db.query("SELECT project, COUNT(*) cnt FROM long_term_summaries WHERE created_at > ? GROUP BY project ORDER BY cnt DESC LIMIT 5").all(since);
+  if (projects.length > 0) {
+    console.log("Top projects:");
+    for (const p of projects)
+      console.log(`  ${p.project.padEnd(30)} ${p.cnt} summaries`);
+    console.log("");
+  }
+  const hotFiles = db.query(`SELECT entity_value, COUNT(*) cnt FROM entities
+     WHERE entity_type IN ('file_modified','file_read') AND created_at > ?
+     GROUP BY entity_value ORDER BY cnt DESC LIMIT 5`).all(since);
+  if (hotFiles.length > 0) {
+    console.log("Most-edited files:");
+    for (const f of hotFiles) {
+      const short = f.entity_value.length > 70 ? "\u2026" + f.entity_value.slice(-65) : f.entity_value;
+      console.log(`  ${short.padEnd(70)} ${f.cnt} touches`);
+    }
+    console.log("");
+  }
+  const decisions = db.query(`SELECT entity_value, COUNT(*) cnt FROM entities
+     WHERE entity_type='decision' AND created_at > ?
+     GROUP BY entity_value ORDER BY cnt DESC LIMIT 5`).all(since);
+  if (decisions.length > 0) {
+    console.log("Most-referenced decisions:");
+    for (const d of decisions) {
+      const short = d.entity_value.length > 70 ? d.entity_value.slice(0, 67) + "\u2026" : d.entity_value;
+      console.log(`  "${short}" (\xD7${d.cnt})`);
+    }
+    console.log("");
+  }
+  const warnings = [];
+  const lowQuality = db.query(`SELECT COUNT(*) n FROM long_term_summaries
+     WHERE length(summary) < 50 OR summary LIKE '%Session worked on%'`).get()?.n ?? 0;
+  if (lowQuality > 0)
+    warnings.push(`${lowQuality} low-quality summaries \u2014 run \`claude-memory-hub prune\``);
+  const summaryEmbeds = db.query("SELECT COUNT(*) n FROM embeddings WHERE doc_type='summary'").get()?.n ?? 0;
+  const missingEmbeds = totalSummaries - summaryEmbeds;
+  if (missingEmbeds > 0)
+    warnings.push(`${missingEmbeds} summaries lack embeddings \u2014 run \`claude-memory-hub doctor --backfill\``);
+  if (resourceEmbeds === 0)
+    warnings.push(`No resource embeddings (skill/agent semantic match disabled) \u2014 run \`claude-memory-hub doctor --fix --backfill\``);
+  if (warnings.length > 0) {
+    console.log("Issues detected:");
+    for (const w of warnings)
+      console.log(`  ! ${w}`);
+  } else {
+    console.log("No issues detected.");
+  }
+}
+var DAY_MS = 86400000;
+var init_stats = __esm(() => {
+  init_schema();
 });
 
 // src/cli/main.ts
-import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync, readdirSync, unlinkSync } from "fs";
-import { homedir as homedir6 } from "os";
-import { join as join6, resolve, dirname } from "path";
+import { existsSync as existsSync9, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync2, readdirSync as readdirSync2, unlinkSync } from "fs";
+import { homedir as homedir7 } from "os";
+import { join as join10, resolve, dirname } from "path";
 
 // src/migration/claude-mem-migrator.ts
 init_schema();
@@ -2345,102 +3326,102 @@ function buildSummaryText(s) {
 }
 
 // src/cli/main.ts
-import { spawnSync as spawnSync2 } from "child_process";
-var CLAUDE_DIR = join6(homedir6(), ".claude");
-var SETTINGS_PATH2 = join6(CLAUDE_DIR, "settings.json");
-var COMMANDS_DIR = join6(CLAUDE_DIR, "commands");
+import { spawnSync as spawnSync3 } from "child_process";
+var CLAUDE_DIR = join10(homedir7(), ".claude");
+var SETTINGS_PATH2 = join10(CLAUDE_DIR, "settings.json");
+var COMMANDS_DIR = join10(CLAUDE_DIR, "commands");
 var PKG_DIR = resolve(dirname(import.meta.dir));
-var STABLE_DIR2 = join6(homedir6(), ".claude-memory-hub");
+var STABLE_DIR2 = join10(homedir7(), ".claude-memory-hub");
 function shellPath(p) {
   const normalized = p.replace(/\\/g, "/");
   return normalized.includes(" ") ? `"${normalized}"` : normalized;
 }
 function getBunPath() {
-  const result = spawnSync2(process.platform === "win32" ? "where" : "which", ["bun"], {
+  const result = spawnSync3(process.platform === "win32" ? "where" : "which", ["bun"], {
     encoding: "utf-8"
   });
   const resolved = result.stdout?.trim().split(/\r?\n/)[0]?.trim();
-  if (resolved && existsSync6(resolved))
+  if (resolved && existsSync9(resolved))
     return shellPath(resolved);
   const candidates = [
-    join6(homedir6(), ".bun", "bin", "bun"),
-    join6(homedir6(), ".bun", "bin", "bun.exe")
+    join10(homedir7(), ".bun", "bin", "bun"),
+    join10(homedir7(), ".bun", "bin", "bun.exe")
   ];
   for (const c of candidates) {
-    if (existsSync6(c))
+    if (existsSync9(c))
       return shellPath(c);
   }
   return "bun";
 }
 function copyDistToStableDir() {
-  const srcDist = join6(PKG_DIR, "dist");
-  const destDist = join6(STABLE_DIR2, "dist");
-  if (!existsSync6(srcDist)) {
+  const srcDist = join10(PKG_DIR, "dist");
+  const destDist = join10(STABLE_DIR2, "dist");
+  if (!existsSync9(srcDist)) {
     throw new Error(`dist/ not found at ${srcDist}. Run 'bun run build:all' first.`);
   }
-  const destHooks = join6(destDist, "hooks");
+  const destHooks = join10(destDist, "hooks");
   mkdirSync3(destHooks, { recursive: true });
-  for (const file of readdirSync(srcDist)) {
+  for (const file of readdirSync2(srcDist)) {
     if (file.endsWith(".js")) {
-      const src = join6(srcDist, file);
-      const dest = join6(destDist, file);
-      writeFileSync(dest, readFileSync2(src));
+      const src = join10(srcDist, file);
+      const dest = join10(destDist, file);
+      writeFileSync2(dest, readFileSync4(src));
     }
   }
-  const srcHooks = join6(srcDist, "hooks");
-  if (existsSync6(srcHooks)) {
-    for (const file of readdirSync(srcHooks)) {
+  const srcHooks = join10(srcDist, "hooks");
+  if (existsSync9(srcHooks)) {
+    for (const file of readdirSync2(srcHooks)) {
       if (file.endsWith(".js")) {
-        const src = join6(srcHooks, file);
-        const dest = join6(destHooks, file);
-        writeFileSync(dest, readFileSync2(src));
+        const src = join10(srcHooks, file);
+        const dest = join10(destHooks, file);
+        writeFileSync2(dest, readFileSync4(src));
       }
     }
   }
-  const srcCmds = join6(PKG_DIR, "commands");
-  if (existsSync6(srcCmds)) {
-    const destCmds = join6(STABLE_DIR2, "commands");
+  const srcCmds = join10(PKG_DIR, "commands");
+  if (existsSync9(srcCmds)) {
+    const destCmds = join10(STABLE_DIR2, "commands");
     mkdirSync3(destCmds, { recursive: true });
-    for (const file of readdirSync(srcCmds)) {
+    for (const file of readdirSync2(srcCmds)) {
       if (file.endsWith(".md")) {
-        writeFileSync(join6(destCmds, file), readFileSync2(join6(srcCmds, file)));
+        writeFileSync2(join10(destCmds, file), readFileSync4(join10(srcCmds, file)));
       }
     }
   }
 }
 function getHookPath(hookName) {
-  return shellPath(join6(STABLE_DIR2, "dist", "hooks", `${hookName}.js`));
+  return shellPath(join10(STABLE_DIR2, "dist", "hooks", `${hookName}.js`));
 }
 function getMcpServerPath() {
-  return shellPath(join6(STABLE_DIR2, "dist", "index.js"));
+  return shellPath(join10(STABLE_DIR2, "dist", "index.js"));
 }
 function loadSettings() {
-  if (!existsSync6(SETTINGS_PATH2))
+  if (!existsSync9(SETTINGS_PATH2))
     return {};
   try {
-    return JSON.parse(readFileSync2(SETTINGS_PATH2, "utf-8"));
+    return JSON.parse(readFileSync4(SETTINGS_PATH2, "utf-8"));
   } catch {
     return {};
   }
 }
 function saveSettings(settings) {
-  if (!existsSync6(CLAUDE_DIR))
+  if (!existsSync9(CLAUDE_DIR))
     mkdirSync3(CLAUDE_DIR, { recursive: true });
-  writeFileSync(SETTINGS_PATH2, JSON.stringify(settings, null, 2) + `
+  writeFileSync2(SETTINGS_PATH2, JSON.stringify(settings, null, 2) + `
 `);
 }
-var CLAUDE_JSON_PATH = join6(homedir6(), ".claude.json");
+var CLAUDE_JSON_PATH = join10(homedir7(), ".claude.json");
 function loadClaudeJson() {
-  if (!existsSync6(CLAUDE_JSON_PATH))
+  if (!existsSync9(CLAUDE_JSON_PATH))
     return {};
   try {
-    return JSON.parse(readFileSync2(CLAUDE_JSON_PATH, "utf-8"));
+    return JSON.parse(readFileSync4(CLAUDE_JSON_PATH, "utf-8"));
   } catch {
     return {};
   }
 }
 function saveClaudeJson(data) {
-  writeFileSync(CLAUDE_JSON_PATH, JSON.stringify(data, null, 2) + `
+  writeFileSync2(CLAUDE_JSON_PATH, JSON.stringify(data, null, 2) + `
 `);
 }
 function registerMcpInClaudeJson(bunBin, mcpPath) {
@@ -2469,19 +3450,19 @@ function unregisterMcpFromClaudeJson() {
   } catch {}
 }
 function installCommands() {
-  let srcCommands = join6(PKG_DIR, "commands");
-  if (!existsSync6(srcCommands))
-    srcCommands = join6(STABLE_DIR2, "commands");
-  if (!existsSync6(srcCommands))
+  let srcCommands = join10(PKG_DIR, "commands");
+  if (!existsSync9(srcCommands))
+    srcCommands = join10(STABLE_DIR2, "commands");
+  if (!existsSync9(srcCommands))
     return 0;
   mkdirSync3(COMMANDS_DIR, { recursive: true });
   let count = 0;
-  for (const file of readdirSync(srcCommands)) {
+  for (const file of readdirSync2(srcCommands)) {
     if (!file.endsWith(".md"))
       continue;
-    const src = join6(srcCommands, file);
-    const dest = join6(COMMANDS_DIR, file);
-    writeFileSync(dest, readFileSync2(src));
+    const src = join10(srcCommands, file);
+    const dest = join10(COMMANDS_DIR, file);
+    writeFileSync2(dest, readFileSync4(src));
     count++;
   }
   return count;
@@ -2489,9 +3470,9 @@ function installCommands() {
 function uninstallCommands() {
   const memCommands = ["mem-search.md", "mem-status.md", "mem-save.md"];
   for (const file of memCommands) {
-    const p = join6(COMMANDS_DIR, file);
+    const p = join10(COMMANDS_DIR, file);
     try {
-      if (existsSync6(p))
+      if (existsSync9(p))
         unlinkSync(p);
     } catch {}
   }
@@ -2511,7 +3492,7 @@ function install() {
 1. Registering MCP server...`);
   const mcpPath = getMcpServerPath();
   const bunBin = getBunPath();
-  const result = spawnSync2("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
+  const result = spawnSync3("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
     stdio: "inherit"
   });
   if (result.status !== 0) {
@@ -2550,8 +3531,8 @@ function install() {
   }
   saveSettings(settings);
   console.log(`   ${registered} hook(s) registered. (${5 - registered} already existed)`);
-  const dataDir = join6(homedir6(), ".claude-memory-hub");
-  if (!existsSync6(dataDir)) {
+  const dataDir = join10(homedir7(), ".claude-memory-hub");
+  if (!existsSync9(dataDir)) {
     mkdirSync3(dataDir, { recursive: true, mode: 448 });
     console.log(`
 3. Created data directory: ${dataDir}`);
@@ -2597,7 +3578,7 @@ function uninstall() {
   uninstallCommands();
   console.log("Removed slash commands from ~/.claude/commands/");
   unregisterMcpFromClaudeJson();
-  spawnSync2("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
+  spawnSync3("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
     stdio: "inherit"
   });
   const settings = loadSettings();
@@ -2622,14 +3603,14 @@ function status() {
   const settings = loadSettings();
   const hasMcp = !!settings.mcpServers?.["claude-memory-hub"];
   const hookCount = Object.values(settings.hooks ?? {}).flat().filter((e) => JSON.stringify(e).includes("claude-memory-hub")).length;
-  const dataDir = join6(homedir6(), ".claude-memory-hub");
-  const hasData = existsSync6(join6(dataDir, "memory.db"));
+  const dataDir = join10(homedir7(), ".claude-memory-hub");
+  const hasData = existsSync9(join10(dataDir, "memory.db"));
   console.log(`  MCP server:  ${hasMcp ? "registered" : "not registered"}`);
   console.log(`  Hooks:       ${hookCount}/5 registered`);
   console.log(`  Database:    ${hasData ? "exists" : "not created yet"}`);
   if (hasData) {
-    const { statSync: statSync3 } = __require("fs");
-    const stats = statSync3(join6(dataDir, "memory.db"));
+    const { statSync: statSync6 } = __require("fs");
+    const stats = statSync6(join10(dataDir, "memory.db"));
     console.log(`  DB size:     ${(stats.size / 1024).toFixed(1)} KB`);
   }
   if (!hasMcp || hookCount < 5) {
@@ -2744,7 +3725,12 @@ switch (command) {
   }
   case "doctor": {
     const { runDoctor: runDoctor2 } = (init_doctor(), __toCommonJS(exports_doctor));
-    runDoctor2(process.argv.slice(3));
+    await runDoctor2(process.argv.slice(3));
+    break;
+  }
+  case "stats": {
+    const { runStats: runStats2 } = (init_stats(), __toCommonJS(exports_stats));
+    runStats2();
     break;
   }
   case "prune": {
@@ -2793,7 +3779,8 @@ switch (command) {
     console.log("  migrate     Import data from claude-mem");
     console.log("  viewer      Open browser UI at localhost:37888");
     console.log("  health      Run health check");
-    console.log("  doctor      Diagnose installation + auto-fix embeddings (--fix)");
+    console.log("  doctor      Diagnose installation + auto-fix embeddings (--fix --backfill)");
+    console.log("  stats       Memory health report (sessions, top projects, hot files)");
     console.log("  reindex     Rebuild TF-IDF search index");
     console.log("  export      Export data as JSONL (--since T, --table T)");
     console.log("  import      Import JSONL from stdin (--dry-run)");

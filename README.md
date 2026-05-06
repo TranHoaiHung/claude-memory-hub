@@ -459,6 +459,44 @@ To disable semantic search at runtime: `export CLAUDE_MEMORY_HUB_EMBEDDINGS=disa
 
 ---
 
+## Smart resource matching (v0.13.0+)
+
+Memory hub does not just remember past sessions — it also matches your **prompts to the right skill, agent, or CLAUDE.md** by meaning, not just by name or recency.
+
+Each prompt triggers an injection like:
+
+```
+**Suggested resources for this prompt:**
+  - skill: `veo3-prompt-expert` (68% — 68% match)
+  - agent: `ios-developer` (52% — fits cwd)
+  - skill: `mobile-development-skill` (41% — used in this project)
+```
+
+The score combines four signals:
+
+| Signal | Weight | What it captures |
+|---|---|---|
+| Semantic match | 50% | Prompt embedding ↔ resource description embedding |
+| Frequency | 20% | How often this resource was used in this project recently |
+| Project context | 20% | cwd has `.swift` → boost `ios-developer`, `pubspec.yaml` → boost `flutter-developer`, etc. |
+| Recency | 10% | Used at all recently |
+
+To enable, run **once**:
+
+```bash
+claude-memory-hub doctor --fix --backfill
+```
+
+This installs the embedding model + indexes all your skills/agents/CLAUDE.md files. After that, every prompt automatically gets the right resources surfaced.
+
+For ad-hoc lookup from inside a Claude session:
+
+```
+/mcp call memory_resources_for_prompt prompt="design a landing page for SaaS"
+```
+
+---
+
 ## Migrating from claude-mem
 
 ```bash

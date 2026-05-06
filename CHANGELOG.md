@@ -5,6 +5,61 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.13.0] - 2026-05-06
+
+**Second brain for Claude** — every prompt now triggers a semantic match against your skills, agents, and CLAUDE.md files so Claude knows which resource is right for the task, not just which one was used most recently.
+
+### New: Prompt-aware resource matching
+
+A new `UserPromptSubmit` injection section, `Suggested resources for this prompt:`, ranks skills/agents/commands by combining four signals:
+
+```
+final_score = 0.5 × semantic_match     (prompt embedding ↔ resource description)
+            + 0.2 × frequency          (used in this project recently)
+            + 0.2 × project_context    (cwd has .swift → ios-developer boost)
+            + 0.1 × recency            (recently used at all)
+```
+
+Example — typing "tôi muốn tạo prompt video tiktok cho veo 3" now surfaces `veo3-prompt-expert` (68% semantic) even when you have not invoked that skill recently. Typing "fix bug crash khi login" inside an iOS project surfaces `mobile-development-skill` via cwd-context boost.
+
+### New: `memory_resources_for_prompt` MCP tool
+
+Lets Claude proactively query "given this prompt, which skills/agents are designed for it?" without waiting for the next UserPromptSubmit. Returns kind, name, score breakdown, and reason per match.
+
+### New: `claude-memory-hub stats`
+
+A 30-day report — sessions/day, top projects, hottest files, most-referenced decisions, and data-quality warnings (low-quality summaries, missing embeddings, missing resource embeddings).
+
+### New: `doctor --backfill`
+
+Reindex everything in one shot — summaries, entities, AND skill/agent descriptions. Required once after upgrading from <0.13.0 so the resource matcher has embeddings to search.
+
+```bash
+claude-memory-hub doctor --fix --backfill   # install deps + embed everything
+claude-memory-hub doctor --backfill         # re-embed (deps already present)
+```
+
+### Architecture
+
+- `src/context/prompt-analyzer.ts` (new) — extract intent, language, cwd signals (Swift/Kotlin/Flutter/RN/TS/Python/Go/Rust/Java/C#/Figma) with 60s cache
+- `src/context/resource-description.ts` (new) — extract embeddable text from frontmatter + body of skill/agent files
+- `src/context/resource-embeddings.ts` (new) — backfill resource embeddings; idempotent via content hash
+- `src/context/resource-embedding-search.ts` (new) — cosine similarity search across embedded resources
+- `src/context/resource-matcher.ts` (new) — compose semantic + frequency + cwd + recency into a final score
+- `src/cli/doctor.ts` split into `doctor-types.ts`, `doctor-checks.ts`, `doctor-actions.ts` for clarity
+- `src/cli/stats.ts` (new) — 30-day report
+- `src/db/schema.ts` — migration v6: `resource_descriptions` table + relax `embeddings.doc_type` CHECK to include `'resource'`
+
+### Database
+
+Schema bumped to v6. Migration auto-runs on first launch — no user action required. Existing embeddings preserved.
+
+### Files Changed
+
+15 files. New: 7. Modified: 8. Tests: +2 cases for v6 schema. 157 tests pass.
+
+---
+
 ## [0.12.0] - 2026-05-06
 
 `doctor` command — diagnose installation health and auto-install optional embedding deps with one command. Larger transcript capture (10MB → 50MB).
