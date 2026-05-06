@@ -5,6 +5,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.13.2] - 2026-05-06
+
+**Quality improvements** discovered during a self-review of v0.13.1 — both fixes target token efficiency and search accuracy with zero new features.
+
+### Fix 1: Smart message truncation (no more mid-word cuts)
+
+**Before:** `content.slice(0, 2000)` chopped messages mid-token. Search-indexed content like `"...Embedd"` instead of `"...Embedding model loaded"`. ~7.5% of captured messages were affected.
+
+**After:** New `smartTruncate()` utility prefers the last paragraph (`\n\n`) → line (`\n`) → sentence (`. `) boundary inside the upper-20% zone of the cap, falling back to word boundary, never to mid-word. Always appends `[truncated]` marker so consumers detect partial content.
+
+Per-role caps replace the uniform 2000-char limit:
+
+| Role | Cap |
+|---|---|
+| user | 2000 chars |
+| assistant | 4000 chars (assistant content is typically longer — code, tables, explanations) |
+
+### Fix 2: CLAUDE.md overlap detection (~150 tokens saved per prompt)
+
+**Before:** Every UserPromptSubmit injection included a `**Active CLAUDE.md rules:**` section listing **all** discovered CLAUDE.md files — including `~/.claude/CLAUDE.md` and the project-root CLAUDE.md, which Claude Code already auto-loads into the system prompt. Result: ~150 tokens/prompt of redundant section headings.
+
+**After:** New `ClaudeMdTracker.filterNonRedundant(entries, cwd)` excludes:
+1. `~/.claude/CLAUDE.md` (Claude Code always auto-loads)
+2. The closest-ancestor CLAUDE.md to cwd (Claude Code's project-root rule)
+
+Intermediate CLAUDE.md files (e.g. monorepo-root CLAUDE.md when working in monorepo-root/packages/foo) are **kept** — Claude Code only auto-loads one project-root file, so these are still novel to inject.
+
+For a typical user with global + user + project CLAUDE.md (3 files), injection drops from 3 entries to 1 (~150 token savings/prompt × 100 prompts/day = ~15K tokens/day).
+
+### Impact for existing users
+
+No DB migration. No breaking changes. Just upgrade and the next session benefits.
+
+```bash
+bunx claude-memory-hub@latest install
+```
+
+### Files Changed
+
+- `src/capture/smart-truncate.ts` (new) — boundary-aware truncation utility + per-role caps
+- `src/capture/transcript-parser.ts` — use `smartTruncate` instead of `slice(0, 2000)`
+- `src/capture/hook-handler.ts` — use `smartTruncate` for user prompts + filter CLAUDE.md before injection
+- `src/context/claude-md-tracker.ts` — new `filterNonRedundant()` method, `homedir` import
+- `src/mcp/tool-handlers.ts` — use `smartTruncate` for `memory_store` notes
+- `tests/unit/smart-truncate.test.ts` (new) — 9 cases covering boundary preference + regression
+- `tests/unit/claude-md-tracker-filter.test.ts` (new) — 6 cases covering filter logic across cwd shapes
+
+175 tests pass (added 15).
+
+---
+
 ## [0.13.1] - 2026-05-06
 
 **Hotfix** — UserPromptSubmit was silently failing for users with v0.5+ databases. Discovered during a v0.13.0 review session; affects every release since v0.11.x.

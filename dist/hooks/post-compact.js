@@ -2158,6 +2158,7 @@ function mapResourceTypeToKind(type) {
 
 // src/context/claude-md-tracker.ts
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
+import { homedir as homedir4 } from "os";
 import { join as join4, dirname, basename as basename2 } from "path";
 var log7 = createLogger("claude-md-tracker");
 var MAX_WALK_DEPTH = 20;
@@ -2216,6 +2217,31 @@ class ClaudeMdTracker {
       sections: safeJson2(r.sections_json, []),
       tokenCost: r.token_cost
     }));
+  }
+  filterNonRedundant(entries, cwd) {
+    if (entries.length === 0 || !cwd)
+      return entries;
+    const homeClaudeMd = join4(homedir4(), ".claude", "CLAUDE.md");
+    let projectRootClaudeMd;
+    let dir = cwd;
+    while (true) {
+      const candidate = entries.find((e) => dirname(e.path) === dir);
+      if (candidate) {
+        projectRootClaudeMd = candidate.path;
+        break;
+      }
+      const parent = dirname(dir);
+      if (parent === dir)
+        break;
+      dir = parent;
+    }
+    return entries.filter((e) => {
+      if (e.path === homeClaudeMd)
+        return false;
+      if (e.path === projectRootClaudeMd)
+        return false;
+      return true;
+    });
   }
   formatForInjection(entries, maxChars) {
     if (entries.length === 0)
@@ -2772,6 +2798,45 @@ function clamp01(n) {
   return Math.max(0, Math.min(1, n));
 }
 
+// src/capture/smart-truncate.ts
+var MIN_USEFUL_RATIO = 0.8;
+var MARKER = `
+[truncated]`;
+function smartTruncate(text, maxChars) {
+  if (text.length <= maxChars)
+    return text;
+  const reserveForMarker = MARKER.length;
+  const sliceLimit = maxChars - reserveForMarker;
+  const slice = text.slice(0, sliceLimit);
+  const minBoundary = Math.floor(sliceLimit * MIN_USEFUL_RATIO);
+  const candidates = [
+    slice.lastIndexOf(`
+
+`),
+    slice.lastIndexOf(`
+`),
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("? "),
+    slice.lastIndexOf("! ")
+  ];
+  const cutAt = Math.max(...candidates);
+  if (cutAt >= minBoundary) {
+    return slice.slice(0, cutAt + 1) + MARKER;
+  }
+  const lastSpace = slice.lastIndexOf(" ");
+  if (lastSpace >= minBoundary) {
+    return slice.slice(0, lastSpace) + MARKER;
+  }
+  return slice + MARKER;
+}
+var ROLE_CAPS = {
+  user: 2000,
+  assistant: 4000
+};
+function capForRole(role) {
+  return ROLE_CAPS[role];
+}
+
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
@@ -2828,7 +2893,7 @@ async function handleUserPromptSubmit(hook, project) {
       session_id: hook.session_id,
       project,
       role: "user",
-      content: promptText.slice(0, 2000),
+      content: smartTruncate(promptText, capForRole("user")),
       prompt_number: promptNum,
       timestamp: Date.now()
     });
@@ -2868,11 +2933,12 @@ async function handleUserPromptSubmit(hook, project) {
     try {
       const mdTracker = new ClaudeMdTracker;
       const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      mdSummary = mdTracker.formatForInjection(mdEntries);
       const tracker = new ResourceTracker;
       for (const entry of mdEntries) {
         tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
       }
+      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+      mdSummary = mdTracker.formatForInjection(injectableEntries);
     } catch {}
   }
   let smartMatchSection = "";

@@ -7097,6 +7097,46 @@ var init_session_store = __esm(() => {
   init_schema();
 });
 
+// src/capture/smart-truncate.ts
+function smartTruncate(text, maxChars) {
+  if (text.length <= maxChars)
+    return text;
+  const reserveForMarker = MARKER.length;
+  const sliceLimit = maxChars - reserveForMarker;
+  const slice = text.slice(0, sliceLimit);
+  const minBoundary = Math.floor(sliceLimit * MIN_USEFUL_RATIO);
+  const candidates = [
+    slice.lastIndexOf(`
+
+`),
+    slice.lastIndexOf(`
+`),
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("? "),
+    slice.lastIndexOf("! ")
+  ];
+  const cutAt = Math.max(...candidates);
+  if (cutAt >= minBoundary) {
+    return slice.slice(0, cutAt + 1) + MARKER;
+  }
+  const lastSpace = slice.lastIndexOf(" ");
+  if (lastSpace >= minBoundary) {
+    return slice.slice(0, lastSpace) + MARKER;
+  }
+  return slice + MARKER;
+}
+function capForRole(role) {
+  return ROLE_CAPS[role];
+}
+var MIN_USEFUL_RATIO = 0.8, MARKER = `
+[truncated]`, ROLE_CAPS;
+var init_smart_truncate = __esm(() => {
+  ROLE_CAPS = {
+    user: 2000,
+    assistant: 4000
+  };
+});
+
 // src/db/long-term-store.ts
 class LongTermStore {
   db;
@@ -8901,6 +8941,7 @@ var init_injection_validator = __esm(() => {
 
 // src/context/claude-md-tracker.ts
 import { existsSync as existsSync6, readFileSync as readFileSync2 } from "fs";
+import { homedir as homedir5 } from "os";
 import { join as join6, dirname, basename as basename2 } from "path";
 
 class ClaudeMdTracker {
@@ -8955,6 +8996,31 @@ class ClaudeMdTracker {
       sections: safeJson3(r.sections_json, []),
       tokenCost: r.token_cost
     }));
+  }
+  filterNonRedundant(entries, cwd) {
+    if (entries.length === 0 || !cwd)
+      return entries;
+    const homeClaudeMd = join6(homedir5(), ".claude", "CLAUDE.md");
+    let projectRootClaudeMd;
+    let dir = cwd;
+    while (true) {
+      const candidate = entries.find((e) => dirname(e.path) === dir);
+      if (candidate) {
+        projectRootClaudeMd = candidate.path;
+        break;
+      }
+      const parent = dirname(dir);
+      if (parent === dir)
+        break;
+      dir = parent;
+    }
+    return entries.filter((e) => {
+      if (e.path === homeClaudeMd)
+        return false;
+      if (e.path === projectRootClaudeMd)
+        return false;
+      return true;
+    });
   }
   formatForInjection(entries, maxChars) {
     if (entries.length === 0)
@@ -9107,7 +9173,7 @@ async function handleUserPromptSubmit(hook, project) {
       session_id: hook.session_id,
       project,
       role: "user",
-      content: promptText.slice(0, 2000),
+      content: smartTruncate(promptText, capForRole("user")),
       prompt_number: promptNum,
       timestamp: Date.now()
     });
@@ -9147,11 +9213,12 @@ async function handleUserPromptSubmit(hook, project) {
     try {
       const mdTracker = new ClaudeMdTracker;
       const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      mdSummary = mdTracker.formatForInjection(mdEntries);
       const tracker = new ResourceTracker;
       for (const entry of mdEntries) {
         tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
       }
+      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+      mdSummary = mdTracker.formatForInjection(injectableEntries);
     } catch {}
   }
   let smartMatchSection = "";
@@ -9275,6 +9342,7 @@ var init_hook_handler = __esm(() => {
   init_claude_md_tracker();
   init_prompt_analyzer();
   init_resource_matcher();
+  init_smart_truncate();
   init_privacy_filter();
 });
 
@@ -16428,6 +16496,7 @@ class StdioServerTransport {
 
 // src/mcp/tool-handlers.ts
 init_session_store();
+init_smart_truncate();
 
 // src/retrieval/context-builder.ts
 init_long_term_store();
@@ -17283,7 +17352,7 @@ async function handleMemoryStore(args) {
   if (!store.getSession(session_id)) {
     store.upsertSession({ id: session_id, project: "unknown", started_at: Date.now(), status: "active" });
   }
-  store.insertNote({ session_id, content: note.slice(0, 2000), created_at: Date.now() });
+  store.insertNote({ session_id, content: smartTruncate(note, 2000), created_at: Date.now() });
   return `Note saved to session ${session_id}.`;
 }
 async function handleMemorySearch(args) {

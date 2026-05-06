@@ -1834,6 +1834,7 @@ function mapResourceTypeToKind(type) {
 
 // src/context/claude-md-tracker.ts
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
+import { homedir as homedir4 } from "os";
 import { join as join4, dirname, basename as basename2 } from "path";
 var log5 = createLogger("claude-md-tracker");
 var MAX_WALK_DEPTH = 20;
@@ -1892,6 +1893,31 @@ class ClaudeMdTracker {
       sections: safeJson2(r.sections_json, []),
       tokenCost: r.token_cost
     }));
+  }
+  filterNonRedundant(entries, cwd) {
+    if (entries.length === 0 || !cwd)
+      return entries;
+    const homeClaudeMd = join4(homedir4(), ".claude", "CLAUDE.md");
+    let projectRootClaudeMd;
+    let dir = cwd;
+    while (true) {
+      const candidate = entries.find((e) => dirname(e.path) === dir);
+      if (candidate) {
+        projectRootClaudeMd = candidate.path;
+        break;
+      }
+      const parent = dirname(dir);
+      if (parent === dir)
+        break;
+      dir = parent;
+    }
+    return entries.filter((e) => {
+      if (e.path === homeClaudeMd)
+        return false;
+      if (e.path === projectRootClaudeMd)
+        return false;
+      return true;
+    });
   }
   formatForInjection(entries, maxChars) {
     if (entries.length === 0)
@@ -2448,6 +2474,45 @@ function clamp01(n) {
   return Math.max(0, Math.min(1, n));
 }
 
+// src/capture/smart-truncate.ts
+var MIN_USEFUL_RATIO = 0.8;
+var MARKER = `
+[truncated]`;
+function smartTruncate(text, maxChars) {
+  if (text.length <= maxChars)
+    return text;
+  const reserveForMarker = MARKER.length;
+  const sliceLimit = maxChars - reserveForMarker;
+  const slice = text.slice(0, sliceLimit);
+  const minBoundary = Math.floor(sliceLimit * MIN_USEFUL_RATIO);
+  const candidates = [
+    slice.lastIndexOf(`
+
+`),
+    slice.lastIndexOf(`
+`),
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("? "),
+    slice.lastIndexOf("! ")
+  ];
+  const cutAt = Math.max(...candidates);
+  if (cutAt >= minBoundary) {
+    return slice.slice(0, cutAt + 1) + MARKER;
+  }
+  const lastSpace = slice.lastIndexOf(" ");
+  if (lastSpace >= minBoundary) {
+    return slice.slice(0, lastSpace) + MARKER;
+  }
+  return slice + MARKER;
+}
+var ROLE_CAPS = {
+  user: 2000,
+  assistant: 4000
+};
+function capForRole(role) {
+  return ROLE_CAPS[role];
+}
+
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
@@ -2504,7 +2569,7 @@ async function handleUserPromptSubmit(hook, project) {
       session_id: hook.session_id,
       project,
       role: "user",
-      content: promptText.slice(0, 2000),
+      content: smartTruncate(promptText, capForRole("user")),
       prompt_number: promptNum,
       timestamp: Date.now()
     });
@@ -2544,11 +2609,12 @@ async function handleUserPromptSubmit(hook, project) {
     try {
       const mdTracker = new ClaudeMdTracker;
       const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      mdSummary = mdTracker.formatForInjection(mdEntries);
       const tracker = new ResourceTracker;
       for (const entry of mdEntries) {
         tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
       }
+      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+      mdSummary = mdTracker.formatForInjection(injectableEntries);
     } catch {}
   }
   let smartMatchSection = "";
@@ -2667,7 +2733,6 @@ import { createInterface } from "readline";
 var log8 = createLogger("transcript-parser");
 var MAX_FILE_SIZE = 50 * 1024 * 1024;
 var MAX_MESSAGES = 200;
-var MAX_CONTENT_LENGTH = 2000;
 async function parseTranscript(transcriptPath, sessionId, project) {
   if (!transcriptPath || !existsSync6(transcriptPath)) {
     log8.info("Transcript not found, skipping", { path: transcriptPath });
@@ -2715,7 +2780,7 @@ async function parseTranscript(transcriptPath, sessionId, project) {
         session_id: sessionId,
         project,
         role,
-        content: content.slice(0, MAX_CONTENT_LENGTH),
+        content: smartTruncate(content, capForRole(role)),
         prompt_number: promptNumber,
         timestamp
       };
@@ -3017,9 +3082,9 @@ async function indexEmbedding(docType, docId, text, db) {
 // src/retrieval/proactive-retrieval.ts
 import { existsSync as existsSync7, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3 } from "fs";
 import { join as join6 } from "path";
-import { homedir as homedir4 } from "os";
+import { homedir as homedir5 } from "os";
 var log12 = createLogger("proactive-retrieval");
-var DATA_DIR = join6(homedir4(), ".claude-memory-hub");
+var DATA_DIR = join6(homedir5(), ".claude-memory-hub");
 var PROACTIVE_DIR = join6(DATA_DIR, "proactive");
 var TOOL_CALL_INTERVAL = 15;
 var MAX_INJECTION_CHARS = 3000;
@@ -3143,9 +3208,9 @@ function safeJson4(text, fallback) {
 // src/capture/batch-queue.ts
 import { existsSync as existsSync8, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync4 } from "fs";
 import { join as join7 } from "path";
-import { homedir as homedir5 } from "os";
+import { homedir as homedir6 } from "os";
 var log13 = createLogger("batch-queue");
-var DATA_DIR2 = join7(homedir5(), ".claude-memory-hub");
+var DATA_DIR2 = join7(homedir6(), ".claude-memory-hub");
 var BATCH_DIR = join7(DATA_DIR2, "batch");
 var QUEUE_PATH = join7(BATCH_DIR, "queue.jsonl");
 var LOCK_PATH = join7(BATCH_DIR, "queue.lock");
