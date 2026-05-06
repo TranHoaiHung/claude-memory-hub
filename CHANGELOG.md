@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.12.0] - 2026-05-06
+
+`doctor` command — diagnose installation health and auto-install optional embedding deps with one command. Larger transcript capture (10MB → 50MB).
+
+### New: `claude-memory-hub doctor [--fix]`
+
+Existing users discovered embeddings were silently disabled because `@huggingface/transformers` is `optional` and `npm install -g` skips optional deps. `doctor` makes the failure visible and fixable:
+
+```bash
+claude-memory-hub doctor          # diagnose only
+claude-memory-hub doctor --fix    # install sharp + transformers into ~/.claude-memory-hub/node_modules/
+```
+
+Checks: database integrity, dist files, hooks registration, bun runtime, `@huggingface/transformers` + `sharp` presence, libvips dylib path on darwin-arm64. Prints actionable fix command for every failed check.
+
+The `--fix` flag installs runtime deps **into the stable dir** (`~/.claude-memory-hub/`), not your project — so installing memory-hub never bloats your `node_modules`.
+
+### Bugfix: 21MB Transcripts Silently Skipped
+
+**Root cause:** `MAX_FILE_SIZE = 10MB` in `transcript-parser.ts` caused all sessions with transcript >10MB to be skipped at session-end. Long debug/refactor sessions lost conversation capture.
+
+**Fix:** Bumped to 50MB. Streaming line-by-line + `MAX_MESSAGES=200` cap + `MAX_CONTENT_LENGTH=2000` already bound memory, so the larger limit is safe.
+
+### Files Changed
+
+- `src/cli/doctor.ts` (new) — installation diagnostic with auto-fix
+- `src/cli/main.ts` — wire `doctor` command + help text
+- `src/capture/transcript-parser.ts` — `MAX_FILE_SIZE: 10MB → 50MB`
+- `README.md` — document `doctor --fix` for enabling semantic search
+- `package.json` — bump version
+
+---
+
 ## [0.11.5] - 2026-04-06
 
 Memory hint injection — Claude now always knows memory hub is active, even when FTS5 finds no keyword match.

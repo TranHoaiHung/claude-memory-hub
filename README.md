@@ -434,10 +434,28 @@ All data stored locally at `~/.claude-memory-hub/`. No cloud. No telemetry. No n
 ```
 @modelcontextprotocol/sdk          MCP stdio server (required)
 bun:sqlite                         Built-in, zero install
-@huggingface/transformers          Semantic embeddings (optional)
+@huggingface/transformers          Semantic embeddings (optional, ~90MB model on first use)
+sharp                              Image preprocessing for transformers (optional)
 ```
 
-Two npm packages + one optional. No Python. No Chroma. No Docker. No API key.
+Two npm packages + two optional. No Python. No Chroma. No Docker. No API key.
+
+### Enabling semantic search
+
+By default, only FTS5 keyword search is active (zero-install). To enable semantic embeddings:
+
+```bash
+claude-memory-hub doctor --fix
+```
+
+This installs `@huggingface/transformers` + `sharp` into `~/.claude-memory-hub/node_modules/`
+without polluting your project deps. To verify everything is healthy:
+
+```bash
+claude-memory-hub doctor
+```
+
+To disable semantic search at runtime: `export CLAUDE_MEMORY_HUB_EMBEDDINGS=disabled`.
 
 ---
 

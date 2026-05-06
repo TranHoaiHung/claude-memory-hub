@@ -1819,10 +1819,241 @@ var init_importer = __esm(() => {
   log9 = createLogger("importer");
 });
 
-// src/cli/main.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync, writeFileSync, readdirSync, unlinkSync } from "fs";
+// src/cli/doctor.ts
+var exports_doctor = {};
+__export(exports_doctor, {
+  runDoctor: () => runDoctor
+});
+import { existsSync as existsSync5, readFileSync, statSync as statSync2 } from "fs";
 import { homedir as homedir5 } from "os";
-import { join as join5, resolve, dirname } from "path";
+import { join as join5 } from "path";
+import { spawnSync } from "child_process";
+function checkDatabase2() {
+  if (!existsSync5(DB_PATH)) {
+    return {
+      name: "database",
+      status: "fail",
+      detail: `memory.db not found at ${DB_PATH}`,
+      fix: "Run: npx claude-memory-hub install"
+    };
+  }
+  try {
+    const { runHealthCheck: runHealthCheck2 } = (init_monitor(), __toCommonJS(exports_monitor));
+    const report = runHealthCheck2();
+    const failed = (report.checks ?? []).filter((c) => c.status !== "ok");
+    if (failed.length > 0) {
+      return {
+        name: "database",
+        status: "warn",
+        detail: `${failed.length} health check(s) flagged: ${failed.map((c) => c.name).join(", ")}`,
+        fix: "Run: claude-memory-hub health (for details)"
+      };
+    }
+    const stats = statSync2(DB_PATH);
+    return { name: "database", status: "ok", detail: `${(stats.size / 1024 / 1024).toFixed(1)}MB, integrity OK` };
+  } catch (err) {
+    return { name: "database", status: "fail", detail: String(err) };
+  }
+}
+function checkEmbeddings() {
+  if (process.env["CLAUDE_MEMORY_HUB_EMBEDDINGS"] === "disabled") {
+    return { name: "embeddings", status: "warn", detail: "explicitly disabled via CLAUDE_MEMORY_HUB_EMBEDDINGS=disabled" };
+  }
+  const localTransformers = join5(STABLE_DIR, "node_modules", "@huggingface", "transformers", "package.json");
+  const localSharp = join5(STABLE_DIR, "node_modules", "sharp", "package.json");
+  if (!existsSync5(localTransformers)) {
+    return {
+      name: "embeddings",
+      status: "warn",
+      detail: "@huggingface/transformers not installed (semantic search disabled, FTS5 keyword still works)",
+      fix: "Run: claude-memory-hub doctor --fix  (or: cd ~/.claude-memory-hub && npm install @huggingface/transformers sharp)"
+    };
+  }
+  if (!existsSync5(localSharp)) {
+    return {
+      name: "embeddings",
+      status: "warn",
+      detail: "sharp not installed (image preprocessing for transformers may fail)",
+      fix: "Run: claude-memory-hub doctor --fix"
+    };
+  }
+  const libvipsDir = join5(STABLE_DIR, "node_modules", "@img", "sharp-libvips-darwin-arm64", "lib");
+  if (process.platform === "darwin" && process.arch === "arm64" && !existsSync5(libvipsDir)) {
+    return {
+      name: "embeddings",
+      status: "fail",
+      detail: "sharp installed but libvips missing \u2014 embeddings will silently fall back",
+      fix: "Run: claude-memory-hub doctor --fix"
+    };
+  }
+  return { name: "embeddings", status: "ok", detail: "@huggingface/transformers + sharp present" };
+}
+function checkHooks() {
+  if (!existsSync5(SETTINGS_PATH)) {
+    return {
+      name: "hooks",
+      status: "fail",
+      detail: `~/.claude/settings.json not found`,
+      fix: "Run: npx claude-memory-hub install"
+    };
+  }
+  try {
+    const settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+    const hooks = settings.hooks ?? {};
+    const expected = ["UserPromptSubmit", "PostToolUse", "PreCompact", "PostCompact", "Stop"];
+    const found = expected.filter((name) => {
+      const entries = hooks[name] ?? [];
+      return entries.some((e) => {
+        const entry = e;
+        return entry.hooks?.some((h) => h.command?.includes(".claude-memory-hub/dist/hooks/"));
+      });
+    });
+    if (found.length === 0) {
+      return {
+        name: "hooks",
+        status: "fail",
+        detail: "No memory-hub hooks registered",
+        fix: "Run: npx claude-memory-hub install"
+      };
+    }
+    if (found.length < expected.length) {
+      return {
+        name: "hooks",
+        status: "warn",
+        detail: `Only ${found.length}/${expected.length} hooks registered: ${found.join(", ")}`,
+        fix: "Run: npx claude-memory-hub install (re-registers all hooks)"
+      };
+    }
+    return { name: "hooks", status: "ok", detail: `All 5 lifecycle hooks registered` };
+  } catch (err) {
+    return { name: "hooks", status: "fail", detail: String(err) };
+  }
+}
+function checkDistFiles() {
+  const distDir = join5(STABLE_DIR, "dist");
+  const required = [
+    "index.js",
+    "cli.js",
+    "hooks/post-tool-use.js",
+    "hooks/user-prompt-submit.js",
+    "hooks/session-end.js",
+    "hooks/pre-compact.js",
+    "hooks/post-compact.js"
+  ];
+  const missing = required.filter((f) => !existsSync5(join5(distDir, f)));
+  if (missing.length > 0) {
+    return {
+      name: "dist files",
+      status: "fail",
+      detail: `Missing: ${missing.join(", ")}`,
+      fix: "Run: npx claude-memory-hub install"
+    };
+  }
+  return { name: "dist files", status: "ok", detail: `All ${required.length} files present` };
+}
+function checkBunPath() {
+  const result = spawnSync(process.platform === "win32" ? "where" : "which", ["bun"], { encoding: "utf-8" });
+  const path = result.stdout?.trim().split(/\r?\n/)[0]?.trim();
+  if (!path || !existsSync5(path)) {
+    return {
+      name: "bun runtime",
+      status: "fail",
+      detail: "bun not found in PATH (hooks will fail silently)",
+      fix: "Install bun: curl -fsSL https://bun.sh/install | bash"
+    };
+  }
+  return { name: "bun runtime", status: "ok", detail: path };
+}
+function attemptFix() {
+  console.log(`
+--- Attempting auto-fix ---`);
+  const pkgPath = join5(STABLE_DIR, "package.json");
+  if (!existsSync5(pkgPath)) {
+    console.log("Creating package.json for runtime deps...");
+    const pkg = {
+      name: "claude-memory-hub-runtime",
+      version: "1.0.0",
+      private: true,
+      dependencies: {
+        sharp: "^0.34.5",
+        "@huggingface/transformers": "^3.0.0"
+      }
+    };
+    __require("fs").writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  }
+  console.log("Installing sharp + @huggingface/transformers (this may take a minute)...");
+  const bunResult = spawnSync("bun", ["install", "--no-save"], {
+    cwd: STABLE_DIR,
+    stdio: "inherit"
+  });
+  if (bunResult.status !== 0) {
+    console.log("bun install failed, trying npm...");
+    const npmResult = spawnSync("npm", ["install"], {
+      cwd: STABLE_DIR,
+      stdio: "inherit"
+    });
+    if (npmResult.status !== 0) {
+      console.log("Auto-fix failed. Please run manually:");
+      console.log(`  cd ${STABLE_DIR} && npm install`);
+      return false;
+    }
+  }
+  console.log(`
+[OK] Runtime deps installed.`);
+  return true;
+}
+function runDoctor(args) {
+  const shouldFix = args.includes("--fix");
+  console.log(`claude-memory-hub doctor \u2014 installation health check
+`);
+  const checks = [
+    checkDatabase2(),
+    checkDistFiles(),
+    checkHooks(),
+    checkBunPath(),
+    checkEmbeddings()
+  ];
+  for (const c of checks) {
+    console.log(`  ${ICON[c.status]} ${c.name.padEnd(15)} \u2014 ${c.detail}`);
+    if (c.fix && c.status !== "ok") {
+      console.log(`           fix: ${c.fix}`);
+    }
+  }
+  const hasFailures = checks.some((c) => c.status === "fail");
+  const hasWarnings = checks.some((c) => c.status === "warn");
+  const fixableEmbeddings = checks.find((c) => c.name === "embeddings" && c.status !== "ok");
+  console.log("");
+  if (!hasFailures && !hasWarnings) {
+    console.log("All checks passed. Memory hub is healthy.");
+    return;
+  }
+  if (shouldFix && fixableEmbeddings) {
+    const ok = attemptFix();
+    if (ok) {
+      console.log("\nRe-run `claude-memory-hub doctor` to verify.");
+    }
+    process.exitCode = ok ? 0 : 1;
+    return;
+  }
+  if (hasFailures) {
+    console.log("Some checks failed. Re-run with --fix to attempt auto-repair.");
+    process.exitCode = 1;
+  } else {
+    console.log("Warnings present. Re-run with --fix to install optional embedding deps.");
+  }
+}
+var STABLE_DIR, DB_PATH, SETTINGS_PATH, ICON;
+var init_doctor = __esm(() => {
+  STABLE_DIR = join5(homedir5(), ".claude-memory-hub");
+  DB_PATH = join5(STABLE_DIR, "memory.db");
+  SETTINGS_PATH = join5(homedir5(), ".claude", "settings.json");
+  ICON = { ok: "[OK]  ", warn: "[WARN]", fail: "[FAIL]" };
+});
+
+// src/cli/main.ts
+import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync, readdirSync, unlinkSync } from "fs";
+import { homedir as homedir6 } from "os";
+import { join as join6, resolve, dirname } from "path";
 
 // src/migration/claude-mem-migrator.ts
 init_schema();
@@ -2114,96 +2345,96 @@ function buildSummaryText(s) {
 }
 
 // src/cli/main.ts
-import { spawnSync } from "child_process";
-var CLAUDE_DIR = join5(homedir5(), ".claude");
-var SETTINGS_PATH = join5(CLAUDE_DIR, "settings.json");
-var COMMANDS_DIR = join5(CLAUDE_DIR, "commands");
+import { spawnSync as spawnSync2 } from "child_process";
+var CLAUDE_DIR = join6(homedir6(), ".claude");
+var SETTINGS_PATH2 = join6(CLAUDE_DIR, "settings.json");
+var COMMANDS_DIR = join6(CLAUDE_DIR, "commands");
 var PKG_DIR = resolve(dirname(import.meta.dir));
-var STABLE_DIR = join5(homedir5(), ".claude-memory-hub");
+var STABLE_DIR2 = join6(homedir6(), ".claude-memory-hub");
 function shellPath(p) {
   const normalized = p.replace(/\\/g, "/");
   return normalized.includes(" ") ? `"${normalized}"` : normalized;
 }
 function getBunPath() {
-  const result = spawnSync(process.platform === "win32" ? "where" : "which", ["bun"], {
+  const result = spawnSync2(process.platform === "win32" ? "where" : "which", ["bun"], {
     encoding: "utf-8"
   });
   const resolved = result.stdout?.trim().split(/\r?\n/)[0]?.trim();
-  if (resolved && existsSync5(resolved))
+  if (resolved && existsSync6(resolved))
     return shellPath(resolved);
   const candidates = [
-    join5(homedir5(), ".bun", "bin", "bun"),
-    join5(homedir5(), ".bun", "bin", "bun.exe")
+    join6(homedir6(), ".bun", "bin", "bun"),
+    join6(homedir6(), ".bun", "bin", "bun.exe")
   ];
   for (const c of candidates) {
-    if (existsSync5(c))
+    if (existsSync6(c))
       return shellPath(c);
   }
   return "bun";
 }
 function copyDistToStableDir() {
-  const srcDist = join5(PKG_DIR, "dist");
-  const destDist = join5(STABLE_DIR, "dist");
-  if (!existsSync5(srcDist)) {
+  const srcDist = join6(PKG_DIR, "dist");
+  const destDist = join6(STABLE_DIR2, "dist");
+  if (!existsSync6(srcDist)) {
     throw new Error(`dist/ not found at ${srcDist}. Run 'bun run build:all' first.`);
   }
-  const destHooks = join5(destDist, "hooks");
+  const destHooks = join6(destDist, "hooks");
   mkdirSync3(destHooks, { recursive: true });
   for (const file of readdirSync(srcDist)) {
     if (file.endsWith(".js")) {
-      const src = join5(srcDist, file);
-      const dest = join5(destDist, file);
-      writeFileSync(dest, readFileSync(src));
+      const src = join6(srcDist, file);
+      const dest = join6(destDist, file);
+      writeFileSync(dest, readFileSync2(src));
     }
   }
-  const srcHooks = join5(srcDist, "hooks");
-  if (existsSync5(srcHooks)) {
+  const srcHooks = join6(srcDist, "hooks");
+  if (existsSync6(srcHooks)) {
     for (const file of readdirSync(srcHooks)) {
       if (file.endsWith(".js")) {
-        const src = join5(srcHooks, file);
-        const dest = join5(destHooks, file);
-        writeFileSync(dest, readFileSync(src));
+        const src = join6(srcHooks, file);
+        const dest = join6(destHooks, file);
+        writeFileSync(dest, readFileSync2(src));
       }
     }
   }
-  const srcCmds = join5(PKG_DIR, "commands");
-  if (existsSync5(srcCmds)) {
-    const destCmds = join5(STABLE_DIR, "commands");
+  const srcCmds = join6(PKG_DIR, "commands");
+  if (existsSync6(srcCmds)) {
+    const destCmds = join6(STABLE_DIR2, "commands");
     mkdirSync3(destCmds, { recursive: true });
     for (const file of readdirSync(srcCmds)) {
       if (file.endsWith(".md")) {
-        writeFileSync(join5(destCmds, file), readFileSync(join5(srcCmds, file)));
+        writeFileSync(join6(destCmds, file), readFileSync2(join6(srcCmds, file)));
       }
     }
   }
 }
 function getHookPath(hookName) {
-  return shellPath(join5(STABLE_DIR, "dist", "hooks", `${hookName}.js`));
+  return shellPath(join6(STABLE_DIR2, "dist", "hooks", `${hookName}.js`));
 }
 function getMcpServerPath() {
-  return shellPath(join5(STABLE_DIR, "dist", "index.js"));
+  return shellPath(join6(STABLE_DIR2, "dist", "index.js"));
 }
 function loadSettings() {
-  if (!existsSync5(SETTINGS_PATH))
+  if (!existsSync6(SETTINGS_PATH2))
     return {};
   try {
-    return JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+    return JSON.parse(readFileSync2(SETTINGS_PATH2, "utf-8"));
   } catch {
     return {};
   }
 }
 function saveSettings(settings) {
-  if (!existsSync5(CLAUDE_DIR))
+  if (!existsSync6(CLAUDE_DIR))
     mkdirSync3(CLAUDE_DIR, { recursive: true });
-  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + `
+  writeFileSync(SETTINGS_PATH2, JSON.stringify(settings, null, 2) + `
 `);
 }
-var CLAUDE_JSON_PATH = join5(homedir5(), ".claude.json");
+var CLAUDE_JSON_PATH = join6(homedir6(), ".claude.json");
 function loadClaudeJson() {
-  if (!existsSync5(CLAUDE_JSON_PATH))
+  if (!existsSync6(CLAUDE_JSON_PATH))
     return {};
   try {
-    return JSON.parse(readFileSync(CLAUDE_JSON_PATH, "utf-8"));
+    return JSON.parse(readFileSync2(CLAUDE_JSON_PATH, "utf-8"));
   } catch {
     return {};
   }
@@ -2238,19 +2469,19 @@ function unregisterMcpFromClaudeJson() {
   } catch {}
 }
 function installCommands() {
-  let srcCommands = join5(PKG_DIR, "commands");
-  if (!existsSync5(srcCommands))
-    srcCommands = join5(STABLE_DIR, "commands");
-  if (!existsSync5(srcCommands))
+  let srcCommands = join6(PKG_DIR, "commands");
+  if (!existsSync6(srcCommands))
+    srcCommands = join6(STABLE_DIR2, "commands");
+  if (!existsSync6(srcCommands))
     return 0;
   mkdirSync3(COMMANDS_DIR, { recursive: true });
   let count = 0;
   for (const file of readdirSync(srcCommands)) {
     if (!file.endsWith(".md"))
       continue;
-    const src = join5(srcCommands, file);
-    const dest = join5(COMMANDS_DIR, file);
-    writeFileSync(dest, readFileSync(src));
+    const src = join6(srcCommands, file);
+    const dest = join6(COMMANDS_DIR, file);
+    writeFileSync(dest, readFileSync2(src));
     count++;
   }
   return count;
@@ -2258,9 +2489,9 @@ function installCommands() {
 function uninstallCommands() {
   const memCommands = ["mem-search.md", "mem-status.md", "mem-save.md"];
   for (const file of memCommands) {
-    const p = join5(COMMANDS_DIR, file);
+    const p = join6(COMMANDS_DIR, file);
     try {
-      if (existsSync5(p))
+      if (existsSync6(p))
         unlinkSync(p);
     } catch {}
   }
@@ -2280,7 +2511,7 @@ function install() {
 1. Registering MCP server...`);
   const mcpPath = getMcpServerPath();
   const bunBin = getBunPath();
-  const result = spawnSync("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
+  const result = spawnSync2("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
     stdio: "inherit"
   });
   if (result.status !== 0) {
@@ -2319,8 +2550,8 @@ function install() {
   }
   saveSettings(settings);
   console.log(`   ${registered} hook(s) registered. (${5 - registered} already existed)`);
-  const dataDir = join5(homedir5(), ".claude-memory-hub");
-  if (!existsSync5(dataDir)) {
+  const dataDir = join6(homedir6(), ".claude-memory-hub");
+  if (!existsSync6(dataDir)) {
     mkdirSync3(dataDir, { recursive: true, mode: 448 });
     console.log(`
 3. Created data directory: ${dataDir}`);
@@ -2366,7 +2597,7 @@ function uninstall() {
   uninstallCommands();
   console.log("Removed slash commands from ~/.claude/commands/");
   unregisterMcpFromClaudeJson();
-  spawnSync("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
+  spawnSync2("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
     stdio: "inherit"
   });
   const settings = loadSettings();
@@ -2391,14 +2622,14 @@ function status() {
   const settings = loadSettings();
   const hasMcp = !!settings.mcpServers?.["claude-memory-hub"];
   const hookCount = Object.values(settings.hooks ?? {}).flat().filter((e) => JSON.stringify(e).includes("claude-memory-hub")).length;
-  const dataDir = join5(homedir5(), ".claude-memory-hub");
-  const hasData = existsSync5(join5(dataDir, "memory.db"));
+  const dataDir = join6(homedir6(), ".claude-memory-hub");
+  const hasData = existsSync6(join6(dataDir, "memory.db"));
   console.log(`  MCP server:  ${hasMcp ? "registered" : "not registered"}`);
   console.log(`  Hooks:       ${hookCount}/5 registered`);
   console.log(`  Database:    ${hasData ? "exists" : "not created yet"}`);
   if (hasData) {
-    const { statSync: statSync2 } = __require("fs");
-    const stats = statSync2(join5(dataDir, "memory.db"));
+    const { statSync: statSync3 } = __require("fs");
+    const stats = statSync3(join6(dataDir, "memory.db"));
     console.log(`  DB size:     ${(stats.size / 1024).toFixed(1)} KB`);
   }
   if (!hasMcp || hookCount < 5) {
@@ -2511,6 +2742,11 @@ switch (command) {
     console.log(`Deleted: ${result.sessions_deleted} sessions, ${result.entities_deleted} entities, ${result.embeddings_deleted} embeddings`);
     break;
   }
+  case "doctor": {
+    const { runDoctor: runDoctor2 } = (init_doctor(), __toCommonJS(exports_doctor));
+    runDoctor2(process.argv.slice(3));
+    break;
+  }
   case "prune": {
     const { getDatabase: getDatabase2 } = (init_schema(), __toCommonJS(exports_schema));
     const db = getDatabase2();
@@ -2557,6 +2793,7 @@ switch (command) {
     console.log("  migrate     Import data from claude-mem");
     console.log("  viewer      Open browser UI at localhost:37888");
     console.log("  health      Run health check");
+    console.log("  doctor      Diagnose installation + auto-fix embeddings (--fix)");
     console.log("  reindex     Rebuild TF-IDF search index");
     console.log("  export      Export data as JSONL (--since T, --table T)");
     console.log("  import      Import JSONL from stdin (--dry-run)");

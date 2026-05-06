@@ -2102,7 +2102,7 @@ function projectFromCwd(cwd) {
 import { createReadStream, existsSync as existsSync5, statSync as statSync2 } from "fs";
 import { createInterface } from "readline";
 var log6 = createLogger("transcript-parser");
-var MAX_FILE_SIZE = 10 * 1024 * 1024;
+var MAX_FILE_SIZE = 50 * 1024 * 1024;
 var MAX_MESSAGES = 200;
 var MAX_CONTENT_LENGTH = 2000;
 async function parseTranscript(transcriptPath, sessionId, project) {
