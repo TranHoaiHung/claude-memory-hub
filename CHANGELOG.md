@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.13.1] - 2026-05-06
+
+**Hotfix** — UserPromptSubmit was silently failing for users with v0.5+ databases. Discovered during a v0.13.0 review session; affects every release since v0.11.x.
+
+### Bugfix: `fts_messages` dropped on every cold start
+
+**Root cause:** `repairSchema()` swept "orphaned" FTS5 tables but its whitelist only included `fts_memories`. The `fts_messages` table (added in migration v5 for conversation capture) was therefore dropped at every database open, while its triggers stayed. The next `INSERT INTO messages` then crashed with `no such table: main.fts_messages`. Because hooks swallow all errors silently, UserPromptSubmit returned an empty `additionalContext` and the user saw zero memory injection — but never knew anything was broken.
+
+**Fix:**
+1. Whitelist `fts_messages` (and any future FTS table) explicitly in the orphan sweep.
+2. Add `healFtsMessages()` self-heal: if triggers reference `fts_messages` but the table is gone, rebuild it from the parent `messages` table on next startup. Idempotent and zero-data-loss.
+
+If you were affected, your `messages` table data was preserved (only the FTS5 search index was missing). After upgrade, the heal runs automatically on first launch.
+
+### How to verify the fix worked
+
+```bash
+sqlite3 ~/.claude-memory-hub/memory.db "
+  SELECT
+    (SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages') as fts_table,
+    (SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages_insert') as trigger
+"
+# Expected: 1|1   (both present)
+```
+
+### Files Changed
+
+- `src/db/schema.ts` — fix whitelist, add `healFtsMessages()`
+- `tests/unit/schema.test.ts` — add regression test that drops `fts_messages` and asserts heal rebuilds it without throwing on next message insert
+
+158 tests pass.
+
+---
+
 ## [0.13.0] - 2026-05-06
 
 **Second brain for Claude** — every prompt now triggers a semantic match against your skills, agents, and CLAUDE.md files so Claude knows which resource is right for the task, not just which one was used most recently.

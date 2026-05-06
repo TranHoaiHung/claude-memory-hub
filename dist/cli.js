@@ -149,10 +149,12 @@ function repairSchema(db) {
   } catch (e) {
     log.error("Integrity check threw", { error: String(e) });
   }
+  const KNOWN_FTS = new Set(["fts_memories", "fts_messages"]);
   try {
     const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%'").all();
     for (const t of tables) {
-      if (t.name === "fts_memories" || t.name.startsWith("fts_memories_"))
+      const isKnown = [...KNOWN_FTS].some((k) => t.name === k || t.name.startsWith(`${k}_`));
+      if (isKnown)
         continue;
       log.warn("Orphaned FTS table detected, dropping", { table: t.name });
       try {
@@ -160,6 +162,35 @@ function repairSchema(db) {
       } catch {}
     }
   } catch {}
+  try {
+    healFtsMessages(db);
+  } catch (e) {
+    log.warn("FTS heal skipped", { error: String(e) });
+  }
+}
+function healFtsMessages(db) {
+  const triggerExists = db.query("SELECT COUNT(*) n FROM sqlite_master WHERE type='trigger' AND name='fts_messages_insert'").get()?.n ?? 0;
+  const tableExists = db.query("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='fts_messages'").get()?.n ?? 0;
+  const messagesExists = db.query("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='messages'").get()?.n ?? 0;
+  if (!messagesExists)
+    return;
+  if (tableExists)
+    return;
+  if (!triggerExists)
+    return;
+  log.warn("fts_messages missing but triggers exist \u2014 rebuilding from messages");
+  db.run(`
+    CREATE VIRTUAL TABLE fts_messages USING fts5(
+      session_id UNINDEXED,
+      role,
+      content,
+      tokenize = 'porter unicode61'
+    )
+  `);
+  db.run(`
+    INSERT INTO fts_messages(rowid, session_id, role, content)
+      SELECT id, session_id, role, content FROM messages
+  `);
 }
 function applyMigrations(db) {
   const currentVersion = db.query("SELECT MAX(version) as version FROM schema_versions").get()?.version ?? 0;
