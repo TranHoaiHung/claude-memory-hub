@@ -5,6 +5,81 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.13.3] - 2026-05-07
+
+**Fixes the "I don't have access to previous chats" failure mode.** When the user asks about prior conversation in a fresh session, memory hub now injects the last few messages directly + tells Claude to call `memory_conversation` for fuller transcripts. Detection is embedding-based — no hard-coded keyword list, works in any language the embedding model knows.
+
+### What broke before
+
+Reproducer: open Claude Code, chat for a while, quit, open a new session in the same project, ask `"tin nhắn gần nhất tôi chat với bạn là gì"` (or `"what was our last conversation about"`). Claude replied:
+
+> "Tôi không có quyền truy cập vào lịch sử chat của các phiên trước đó — mỗi phiên Claude Code bắt đầu mới và không lưu nội dung tin nhắn cũ."
+
+Memory hub was capturing every message into the `messages` table, but the UserPromptSubmit injection only included **summaries** (which describe what happened, not the literal text). When the user explicitly asked about the chat itself, the answer wasn't in scope for injection — and Claude's MCP tool descriptions didn't strongly hint at `memory_conversation` for this exact use case.
+
+### Fix 1: History-intent detection (semantic, language-agnostic)
+
+New module `src/context/history-intent.ts`:
+- 10 canonical exemplar phrases (English + Vietnamese mix), embedded once and cached
+- Any user prompt is embedded once, compared by cosine similarity to all exemplars
+- If the best match score ≥ 0.55, the prompt is flagged as "asking about prior conversation"
+
+Why semantic instead of regex: users phrase this in dozens of ways across many languages. A regex list grows unbounded and always misses something. Embedding similarity generalises to any language the model was trained on.
+
+Verified detection (real test output):
+
+| Prompt | Score | Match |
+|---|---|---|
+| `tin nhắn gần nhất tôi chat với bạn là gì` | 0.83 | ✓ |
+| `last message we exchanged?` | 0.92 | ✓ |
+| `lần trước chúng ta đã làm gì` | 1.00 | ✓ |
+| `what was I working on yesterday` | 0.79 | ✓ |
+| `cuộc trò chuyện trước đây của tôi` | 0.97 | ✓ |
+| `fix bug crash khi login iOS` | 0.18 | ✗ (correctly rejected) |
+| `add new feature for SIP` | 0.16 | ✗ (correctly rejected) |
+
+To extend: add new exemplar phrases to `HISTORY_EXEMPLARS` array. No regex required.
+
+### Fix 2: Recent conversation injection
+
+New module `src/context/conversation-injector.ts` — `buildRecentConversationSection()`:
+1. If the **current** session has ≥ 2 messages: inject the last 6.
+2. Otherwise: inject the last 6 messages from the **most recent prior session in the same project**.
+3. Filtered by project to avoid leaking unrelated conversations.
+4. Each message preview capped at 240 chars; total section bounded.
+
+Format includes per-message tag, timestamp, role, prompt number, content preview, and a footer pointing Claude at `memory_conversation` for fuller transcripts.
+
+The section is added at **priority 1** in the budget allocator — when the user explicitly asks about chat history, this section is the answer and should never be dropped.
+
+### Fix 3: Stronger MCP tool descriptions
+
+Updated `memory_conversation` description to make Claude auto-call it instead of saying "I don't have access":
+
+> "AUTO-USE when the user asks about prior conversations, last/recent messages, what was discussed before, or anything implying conversation history — in any language (e.g. 'tin nhắn gần nhất', 'last chat', 'lần trước', 'previous session'). … Prefer this tool over saying 'I don't have access to previous chats' — memory hub captures every user prompt + assistant response and they are queryable here."
+
+`memory_recall` description now points users at `memory_conversation` for raw chat content, since FTS5 keyword search on summaries doesn't surface message text.
+
+### Files Changed
+
+- `src/context/history-intent.ts` (new) — semantic intent detector with cached exemplar embeddings
+- `src/context/conversation-injector.ts` (new) — pulls recent messages by session/project
+- `src/capture/hook-handler.ts` — wires both modules into UserPromptSubmit injection at priority 1
+- `src/mcp/tool-definitions.ts` — strengthened `memory_conversation` + `memory_recall` descriptions
+- `tests/unit/conversation-injector.test.ts` (new) — 5 cases (DB injection pattern)
+
+180 tests pass (added 5).
+
+### How to upgrade
+
+```bash
+bunx claude-memory-hub@latest install
+```
+
+Then **fully quit Claude Code (Cmd+Q)** and reopen — hooks must reload to pick up the new dist.
+
+---
+
 ## [0.13.2] - 2026-05-06
 
 **Quality improvements** discovered during a self-review of v0.13.1 — both fixes target token efficiency and search accuracy with zero new features.

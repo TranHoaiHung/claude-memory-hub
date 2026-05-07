@@ -2798,6 +2798,108 @@ function clamp01(n) {
   return Math.max(0, Math.min(1, n));
 }
 
+// src/context/history-intent.ts
+var HISTORY_EXEMPLARS = [
+  "what was the last message we exchanged",
+  "what did we work on previously",
+  "show me our previous conversation",
+  "what were we discussing before",
+  "tin nh\u1EAFn g\u1EA7n nh\u1EA5t l\xE0 g\xEC",
+  "l\u1EA7n tr\u01B0\u1EDBc ch\xFAng ta \u0111\xE3 l\xE0m g\xEC",
+  "c\xF4ng vi\u1EC7c tr\u01B0\u1EDBc \u0111\xF3 c\u1EE7a b\u1EA1n l\xE0 g\xEC",
+  "cu\u1ED9c tr\xF2 chuy\u1EC7n tr\u01B0\u1EDBc \u0111\xE2y",
+  "l\u1ECBch s\u1EED chat c\u1EE7a t\xF4i",
+  "what was I working on"
+];
+var SIMILARITY_THRESHOLD = 0.55;
+var cachedExemplarVectors = null;
+var cachedExemplarsLoading = null;
+async function ensureExemplarsLoaded() {
+  if (cachedExemplarVectors)
+    return;
+  if (!cachedExemplarsLoading) {
+    cachedExemplarsLoading = (async () => {
+      const vecs = await embeddingModel.embedBatch(HISTORY_EXEMPLARS, 8);
+      cachedExemplarVectors = vecs;
+    })();
+  }
+  await cachedExemplarsLoading;
+}
+async function detectHistoryIntent(prompt) {
+  if (!prompt || prompt.length < 6)
+    return { match: false, score: 0 };
+  await embeddingModel.embed("warmup");
+  if (!embeddingModel.isAvailable)
+    return { match: false, score: 0 };
+  const queryVec = await embeddingModel.embed(prompt);
+  if (!queryVec)
+    return { match: false, score: 0 };
+  await ensureExemplarsLoaded();
+  if (!cachedExemplarVectors)
+    return { match: false, score: 0 };
+  let bestScore = 0;
+  for (const ev of cachedExemplarVectors) {
+    if (!ev)
+      continue;
+    const score = cosine(queryVec, ev);
+    if (score > bestScore)
+      bestScore = score;
+  }
+  return { match: bestScore >= SIMILARITY_THRESHOLD, score: bestScore };
+}
+function cosine(a, b) {
+  let dot = 0;
+  for (let i = 0;i < EMBEDDING_DIM; i++)
+    dot += a[i] * b[i];
+  return dot;
+}
+
+// src/context/conversation-injector.ts
+var MAX_MESSAGES_PER_SECTION = 6;
+var PER_MESSAGE_PREVIEW_CHARS = 240;
+function buildRecentConversationSection(currentSessionId, project, injectedDb) {
+  const db = injectedDb ?? getDatabase();
+  const store = new SessionStore(db);
+  const sameSession = store.getSessionMessages(currentSessionId);
+  if (sameSession.length >= 2) {
+    const recent = sameSession.slice(-MAX_MESSAGES_PER_SECTION);
+    return formatSection("Recent messages in this session", recent.map((m) => ({
+      role: m.role,
+      prompt_number: m.prompt_number,
+      content: m.content,
+      timestamp: m.timestamp,
+      session_id: m.session_id
+    })));
+  }
+  const priorSessionId = db.query(`SELECT id FROM sessions
+       WHERE project = ? AND id != ?
+       ORDER BY started_at DESC LIMIT 1`).get(project, currentSessionId)?.id;
+  if (!priorSessionId)
+    return "";
+  const priorMessages = db.query(`SELECT role, prompt_number, content, timestamp, session_id
+       FROM messages WHERE session_id = ?
+       ORDER BY timestamp DESC LIMIT ?`).all(priorSessionId, MAX_MESSAGES_PER_SECTION).reverse();
+  if (priorMessages.length === 0)
+    return "";
+  return formatSection(`Recent messages in your previous session in project "${project}"`, priorMessages);
+}
+function formatSection(heading, messages) {
+  const lines = [`**${heading}:**`];
+  for (const m of messages) {
+    const date = new Date(m.timestamp).toISOString().slice(0, 16).replace("T", " ");
+    const tag = m.role === "user" ? "\uD83E\uDDD1" : "\uD83E\uDD16";
+    const preview = compactWhitespace(m.content).slice(0, PER_MESSAGE_PREVIEW_CHARS);
+    const truncated = m.content.length > PER_MESSAGE_PREVIEW_CHARS ? "\u2026" : "";
+    lines.push(`  ${tag} [${date}] ${m.role}#${m.prompt_number}: ${preview}${truncated}`);
+  }
+  lines.push("_For full transcript, call `memory_conversation` with session_id, " + "or `memory_conversation` with `search` for cross-session lookup._");
+  return lines.join(`
+`);
+}
+function compactWhitespace(s) {
+  return s.replace(/\s+/g, " ").trim();
+}
+
 // src/capture/smart-truncate.ts
 var MIN_USEFUL_RATIO = 0.8;
 var MARKER = `
@@ -2954,6 +3056,15 @@ async function handleUserPromptSubmit(hook, project) {
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
+  let recentConvoSection = "";
+  try {
+    if ((hook.prompt?.length ?? 0) >= 6) {
+      const intent = await detectHistoryIntent(hook.prompt ?? "");
+      if (intent.match) {
+        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
+      }
+    }
+  } catch {}
   let overheadWarning = "";
   try {
     const overhead = await registry.getOverheadReport(project);
@@ -2964,7 +3075,7 @@ async function handleUserPromptSubmit(hook, project) {
     }
   } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
-  const safeContext = validator.validate(fitWithinBudget(memorySection, mdSummary, smartMatchSection, advice, overheadWarning));
+  const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, mdSummary, smartMatchSection, advice, overheadWarning));
   return { additionalContext: safeContext };
 }
 function formatSmartMatch(matches) {
@@ -2978,14 +3089,15 @@ function formatSmartMatch(matches) {
   return lines.join(`
 `);
 }
-function fitWithinBudget(memoryText, mdText, smartMatchText, adviceText, overheadText) {
+function fitWithinBudget(memoryText, recentConvoText, mdText, smartMatchText, adviceText, overheadText) {
   const MAX_CHARS2 = 8000;
   const sections = [
-    { text: memoryText || "", priority: 1, minChars: 500 },
-    { text: smartMatchText || "", priority: 2, minChars: 100 },
-    { text: mdText || "", priority: 3, minChars: 200 },
-    { text: adviceText || "", priority: 4, minChars: 0 },
-    { text: overheadText || "", priority: 5, minChars: 0 }
+    { text: recentConvoText || "", priority: 1, minChars: 400 },
+    { text: memoryText || "", priority: 2, minChars: 500 },
+    { text: smartMatchText || "", priority: 3, minChars: 100 },
+    { text: mdText || "", priority: 4, minChars: 200 },
+    { text: adviceText || "", priority: 5, minChars: 0 },
+    { text: overheadText || "", priority: 6, minChars: 0 }
   ].filter((s) => s.text.length > 0);
   const totalNeeded = sections.reduce((sum, s) => sum + s.text.length, 0);
   if (totalNeeded <= MAX_CHARS2) {
