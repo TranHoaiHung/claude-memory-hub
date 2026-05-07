@@ -2900,6 +2900,52 @@ function compactWhitespace(s) {
   return s.replace(/\s+/g, " ").trim();
 }
 
+// src/context/awareness-hint.ts
+function buildAwarenessHint(options) {
+  if (options.isCommandInvocation)
+    return "";
+  const db = options.db ?? getDatabase();
+  const stats = collectStats(db, options.project);
+  if (stats.summaries === 0 && stats.messages === 0)
+    return "";
+  if (options.hasMemoryInjected || options.hasRecentConvoInjected) {
+    return shortHint(stats);
+  }
+  return fullHint(stats);
+}
+function shortHint(s) {
+  return [
+    "**\uD83E\uDDE0 Memory hub:** " + `${s.summaries} sessions, ${s.messages} messages stored. ` + "Call `memory_search` or `memory_conversation` for more."
+  ].join(`
+`);
+}
+function fullHint(s) {
+  const lines = [
+    "**\uD83E\uDDE0 Memory hub active**",
+    `_Stored: ${s.summaries} summaries, ${s.messages} messages, ${s.resources} indexed resources` + (s.project_summaries > 0 ? ` (${s.project_summaries} for current project)._` : `._`),
+    "_Before answering questions about prior work, files, decisions, or chat history, " + "call one of:_",
+    "  - `memory_recall` \u2014 search summaries by keyword",
+    "  - `memory_search` \u2014 3-layer progressive search (use for technical terms)",
+    "  - `memory_conversation` \u2014 retrieve raw user/assistant messages",
+    "  - `memory_resources_for_prompt` \u2014 find best skill/agent for the task",
+    `_Do not say "I don't have access to previous chats" \u2014 query first._`
+  ];
+  return lines.join(`
+`);
+}
+function collectStats(db, project) {
+  const summaries = db.query("SELECT COUNT(*) n FROM long_term_summaries").get()?.n ?? 0;
+  const messages = db.query("SELECT COUNT(*) n FROM messages").get()?.n ?? 0;
+  const resources = db.query("SELECT COUNT(*) n FROM resource_descriptions").get()?.n ?? 0;
+  const projectSummaries = db.query("SELECT COUNT(*) n FROM long_term_summaries WHERE project = ?").get(project)?.n ?? 0;
+  return {
+    summaries,
+    messages,
+    resources,
+    project_summaries: projectSummaries
+  };
+}
+
 // src/capture/smart-truncate.ts
 var MIN_USEFUL_RATIO = 0.8;
 var MARKER = `
@@ -3075,7 +3121,17 @@ async function handleUserPromptSubmit(hook, project) {
     }
   } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
-  const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, mdSummary, smartMatchSection, advice, overheadWarning));
+  let awarenessHint = "";
+  try {
+    const analysisForHint = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
+    awarenessHint = buildAwarenessHint({
+      project,
+      isCommandInvocation: analysisForHint.is_command_invocation,
+      hasMemoryInjected: memorySection.length > 0,
+      hasRecentConvoInjected: recentConvoSection.length > 0
+    });
+  } catch {}
+  const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
   return { additionalContext: safeContext };
 }
 function formatSmartMatch(matches) {
@@ -3089,10 +3145,11 @@ function formatSmartMatch(matches) {
   return lines.join(`
 `);
 }
-function fitWithinBudget(memoryText, recentConvoText, mdText, smartMatchText, adviceText, overheadText) {
+function fitWithinBudget(memoryText, recentConvoText, awarenessHintText, mdText, smartMatchText, adviceText, overheadText) {
   const MAX_CHARS2 = 8000;
   const sections = [
     { text: recentConvoText || "", priority: 1, minChars: 400 },
+    { text: awarenessHintText || "", priority: 1, minChars: 100 },
     { text: memoryText || "", priority: 2, minChars: 500 },
     { text: smartMatchText || "", priority: 3, minChars: 100 },
     { text: mdText || "", priority: 4, minChars: 200 },

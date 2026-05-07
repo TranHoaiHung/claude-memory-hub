@@ -5,6 +5,81 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.13.4] - 2026-05-07
+
+**Fix the proactivity gap.** v0.13.0 → v0.13.3 made memory recallable, but Claude still didn't reach for it unless the user explicitly named the MCP tool. Result: even with rich data, Claude defaulted to `git log` or said "I don't have history" because nothing in its prompt context pushed it toward memory hub.
+
+### Root cause
+
+MCP tool descriptions are passive — Claude treats them as "tools available" but cheap in-context tools (Bash git log, Read) win by default. The user-prompt-submit injection only triggered conditional sections (memory match, history intent, smart match), so generic prompts produced empty injections and zero awareness.
+
+### Fix 1: Always-on awareness hint
+
+New module `src/context/awareness-hint.ts` — produces a tiny (~30-160 token) section injected on every UserPromptSubmit when:
+- DB has data (≥ 1 summary or message)
+- User isn't running a slash command
+
+Two variants based on context state:
+
+**SHORT hint** (~30 tokens) — when memory section already injected:
+```
+🧠 Memory hub: 61 sessions, 784 messages stored.
+Call `memory_search` or `memory_conversation` for more.
+```
+
+**FULL hint** (~160 tokens) — when no memory section was injected (Claude needs the directive):
+```
+🧠 Memory hub active
+Stored: N summaries, M messages, K indexed resources (X for current project).
+Before answering questions about prior work, files, decisions, or chat history, call one of:
+  - `memory_recall` — search summaries by keyword
+  - `memory_search` — 3-layer progressive search (use for technical terms)
+  - `memory_conversation` — retrieve raw user/assistant messages
+  - `memory_resources_for_prompt` — find best skill/agent for the task
+Do not say "I don't have access to previous chats" — query first.
+```
+
+The hint sits at **priority 1** in the budget allocator alongside memory + recent-conversation sections. Cost: ~30-160 tokens/prompt depending on variant. Benefit: Claude proactively queries memory instead of defaulting to git log.
+
+Skipped in three cases (no nag):
+- Fresh install with empty DB
+- Slash command invocation (`/...`)
+- Already-rich injection (full memory + recent convo) — short hint suffices
+
+### Fix 2: Stronger `memory_recall` description
+
+Updated tool description with hard directive:
+
+> "ALWAYS call this BEFORE answering any question that references prior work, past decisions, recent activity, or 'what did we do' — even when the user doesn't explicitly mention memory. Do not fall back to `git log` or assume no history exists; memory hub stores summaries beyond what git tracks."
+
+### Files Changed
+
+- `src/context/awareness-hint.ts` (new) — hint builder with state-aware variants, DB injection-friendly for tests
+- `src/capture/hook-handler.ts` — wire awareness hint at priority 1, update `fitWithinBudget` signature
+- `src/mcp/tool-definitions.ts` — strengthened `memory_recall` description
+- `tests/unit/awareness-hint.test.ts` (new) — 7 cases (empty DB, slash, full/short variants, project filtering, message-only)
+
+187 tests pass (added 7).
+
+### How to upgrade
+
+```bash
+bunx claude-memory-hub@latest install
+```
+
+Then **fully quit Claude Code (Cmd+Q)** and reopen. The next prompt you type will include the awareness hint if your DB has data.
+
+### Token cost transparency
+
+For a typical user with 50+ sessions stored:
+- Best case (memory already injected): +30 tokens/prompt
+- Average case: +100 tokens/prompt
+- Worst case (full hint, no other injection): +160 tokens/prompt
+
+At 100 prompts/day with Sonnet, this is ~$0.03-0.05/day in extra input cost. The tradeoff: Claude actually uses the memory it stores.
+
+---
+
 ## [0.13.3] - 2026-05-07
 
 **Fixes the "I don't have access to previous chats" failure mode.** When the user asks about prior conversation in a fresh session, memory hub now injects the last few messages directly + tells Claude to call `memory_conversation` for fuller transcripts. Detection is embedding-based — no hard-coded keyword list, works in any language the embedding model knows.
