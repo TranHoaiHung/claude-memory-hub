@@ -444,6 +444,33 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
     log.info("Migration v6 complete");
   }
+  if (currentVersion < 7) {
+    log.info("Applying migration v7: injection_log table for telemetry");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS injection_log (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id              TEXT NOT NULL,
+        project                 TEXT NOT NULL,
+        intent                  TEXT,
+        language                TEXT,
+        prompt_length           INTEGER NOT NULL DEFAULT 0,
+        smart_match_count       INTEGER NOT NULL DEFAULT 0,
+        smart_match_top_score   REAL    NOT NULL DEFAULT 0,
+        memory_section_chars    INTEGER NOT NULL DEFAULT 0,
+        claude_md_chars         INTEGER NOT NULL DEFAULT 0,
+        recent_convo_chars      INTEGER NOT NULL DEFAULT 0,
+        awareness_hint_chars    INTEGER NOT NULL DEFAULT 0,
+        total_injection_chars   INTEGER NOT NULL DEFAULT 0,
+        history_intent_matched  INTEGER NOT NULL DEFAULT 0,
+        timestamp               INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_session ON injection_log(session_id, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_project ON injection_log(project, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_intent  ON injection_log(intent, timestamp)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
+    log.info("Migration v7 complete");
+  }
 }
 var _db = null;
 function getDatabase() {
@@ -2622,6 +2649,42 @@ function collectStats(db, project) {
   };
 }
 
+// src/db/injection-telemetry.ts
+var log8 = createLogger("injection-telemetry");
+function logInjection(entry, db) {
+  if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
+    return;
+  try {
+    const d = db ?? getDatabase();
+    d.run(`INSERT INTO injection_log(
+         session_id, project, intent, language,
+         prompt_length,
+         smart_match_count, smart_match_top_score,
+         memory_section_chars, claude_md_chars,
+         recent_convo_chars, awareness_hint_chars,
+         total_injection_chars,
+         history_intent_matched, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+      entry.session_id,
+      entry.project,
+      entry.intent,
+      entry.language,
+      entry.prompt_length,
+      entry.smart_match_count,
+      entry.smart_match_top_score,
+      entry.memory_section_chars,
+      entry.claude_md_chars,
+      entry.recent_convo_chars,
+      entry.awareness_hint_chars,
+      entry.total_injection_chars,
+      entry.history_intent_matched ? 1 : 0,
+      Date.now()
+    ]);
+  } catch (err) {
+    log8.warn("logInjection failed", { error: String(err) });
+  }
+}
+
 // src/capture/smart-truncate.ts
 var MIN_USEFUL_RATIO = 0.8;
 var MARKER = `
@@ -2766,22 +2829,28 @@ async function handleUserPromptSubmit(hook, project) {
     } catch {}
   }
   let smartMatchSection = "";
+  let smartMatchCount = 0;
+  let smartMatchTopScore = 0;
+  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
   try {
-    const analysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
-    if (!analysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
-      const matches = await matchResourcesForPrompt(hook.prompt ?? "", analysis, {
+    if (!promptAnalysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
+      const matches = await matchResourcesForPrompt(hook.prompt ?? "", promptAnalysis, {
         project,
         threshold: 0.3,
         limit: 5
       });
+      smartMatchCount = matches.length;
+      smartMatchTopScore = matches[0]?.score ?? 0;
       if (matches.length > 0)
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
   let recentConvoSection = "";
+  let historyIntentMatched = false;
   try {
     if ((hook.prompt?.length ?? 0) >= 6) {
       const intent = await detectHistoryIntent(hook.prompt ?? "");
+      historyIntentMatched = intent.match;
       if (intent.match) {
         recentConvoSection = buildRecentConversationSection(hook.session_id, project);
       }
@@ -2799,15 +2868,31 @@ async function handleUserPromptSubmit(hook, project) {
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
   try {
-    const analysisForHint = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
     awarenessHint = buildAwarenessHint({
       project,
-      isCommandInvocation: analysisForHint.is_command_invocation,
+      isCommandInvocation: promptAnalysis.is_command_invocation,
       hasMemoryInjected: memorySection.length > 0,
       hasRecentConvoInjected: recentConvoSection.length > 0
     });
   } catch {}
   const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  try {
+    logInjection({
+      session_id: hook.session_id,
+      project,
+      intent: promptAnalysis.intent,
+      language: promptAnalysis.language,
+      prompt_length: hook.prompt?.length ?? 0,
+      smart_match_count: smartMatchCount,
+      smart_match_top_score: smartMatchTopScore,
+      memory_section_chars: memorySection.length,
+      claude_md_chars: mdSummary.length,
+      recent_convo_chars: recentConvoSection.length,
+      awareness_hint_chars: awarenessHint.length,
+      total_injection_chars: safeContext.length,
+      history_intent_matched: historyIntentMatched
+    });
+  } catch {}
   return { additionalContext: safeContext };
 }
 function formatSmartMatch(matches) {
@@ -2900,7 +2985,7 @@ function projectFromCwd(cwd) {
 import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync3 } from "fs";
 import { join as join6 } from "path";
 import { homedir as homedir5 } from "os";
-var log8 = createLogger("batch-queue");
+var log9 = createLogger("batch-queue");
 var DATA_DIR = join6(homedir5(), ".claude-memory-hub");
 var BATCH_DIR = join6(DATA_DIR, "batch");
 var QUEUE_PATH = join6(BATCH_DIR, "queue.jsonl");
@@ -2914,7 +2999,7 @@ function enqueueEvent(event) {
 `;
     appendFileSync2(QUEUE_PATH, line, "utf-8");
   } catch (err) {
-    log8.error("enqueue failed", { error: String(err) });
+    log9.error("enqueue failed", { error: String(err) });
     throw err;
   }
 }
@@ -2934,7 +3019,7 @@ function tryFlush() {
       releaseLock();
     }
   } catch (err) {
-    log8.error("flush failed", { error: String(err) });
+    log9.error("flush failed", { error: String(err) });
     return false;
   }
 }
@@ -2948,7 +3033,7 @@ function flushQueue() {
     try {
       events.push(JSON.parse(line));
     } catch {
-      log8.warn("skipping malformed queue line");
+      log9.warn("skipping malformed queue line");
     }
   }
   if (events.length === 0)
@@ -2977,7 +3062,7 @@ function flushQueue() {
     }
   })();
   writeFileSync(QUEUE_PATH, "", "utf-8");
-  log8.info("batch flushed", { events: events.length });
+  log9.info("batch flushed", { events: events.length });
 }
 function tryAcquireLock() {
   try {
@@ -3018,7 +3103,7 @@ function isBatchEnabled() {
 import { existsSync as existsSync7, readFileSync as readFileSync4, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4 } from "fs";
 import { join as join7 } from "path";
 import { homedir as homedir6 } from "os";
-var log9 = createLogger("proactive-retrieval");
+var log10 = createLogger("proactive-retrieval");
 var DATA_DIR2 = join7(homedir6(), ".claude-memory-hub");
 var PROACTIVE_DIR = join7(DATA_DIR2, "proactive");
 var TOOL_CALL_INTERVAL = 15;
@@ -3064,7 +3149,7 @@ function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse
   state.injectedTopics.push(currentTopic);
   state.lastInjectionAt = Date.now();
   saveState(sessionId, state);
-  log9.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
+  log10.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
   return { shouldInject: true, additionalContext: context };
 }
 function cleanupProactiveState(sessionId) {

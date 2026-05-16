@@ -444,6 +444,33 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
     log.info("Migration v6 complete");
   }
+  if (currentVersion < 7) {
+    log.info("Applying migration v7: injection_log table for telemetry");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS injection_log (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id              TEXT NOT NULL,
+        project                 TEXT NOT NULL,
+        intent                  TEXT,
+        language                TEXT,
+        prompt_length           INTEGER NOT NULL DEFAULT 0,
+        smart_match_count       INTEGER NOT NULL DEFAULT 0,
+        smart_match_top_score   REAL    NOT NULL DEFAULT 0,
+        memory_section_chars    INTEGER NOT NULL DEFAULT 0,
+        claude_md_chars         INTEGER NOT NULL DEFAULT 0,
+        recent_convo_chars      INTEGER NOT NULL DEFAULT 0,
+        awareness_hint_chars    INTEGER NOT NULL DEFAULT 0,
+        total_injection_chars   INTEGER NOT NULL DEFAULT 0,
+        history_intent_matched  INTEGER NOT NULL DEFAULT 0,
+        timestamp               INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_session ON injection_log(session_id, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_project ON injection_log(project, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_intent  ON injection_log(intent, timestamp)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
+    log.info("Migration v7 complete");
+  }
 }
 var _db = null;
 function getDatabase() {
@@ -2622,6 +2649,42 @@ function collectStats(db, project) {
   };
 }
 
+// src/db/injection-telemetry.ts
+var log8 = createLogger("injection-telemetry");
+function logInjection(entry, db) {
+  if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
+    return;
+  try {
+    const d = db ?? getDatabase();
+    d.run(`INSERT INTO injection_log(
+         session_id, project, intent, language,
+         prompt_length,
+         smart_match_count, smart_match_top_score,
+         memory_section_chars, claude_md_chars,
+         recent_convo_chars, awareness_hint_chars,
+         total_injection_chars,
+         history_intent_matched, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+      entry.session_id,
+      entry.project,
+      entry.intent,
+      entry.language,
+      entry.prompt_length,
+      entry.smart_match_count,
+      entry.smart_match_top_score,
+      entry.memory_section_chars,
+      entry.claude_md_chars,
+      entry.recent_convo_chars,
+      entry.awareness_hint_chars,
+      entry.total_injection_chars,
+      entry.history_intent_matched ? 1 : 0,
+      Date.now()
+    ]);
+  } catch (err) {
+    log8.warn("logInjection failed", { error: String(err) });
+  }
+}
+
 // src/capture/smart-truncate.ts
 var MIN_USEFUL_RATIO = 0.8;
 var MARKER = `
@@ -2766,22 +2829,28 @@ async function handleUserPromptSubmit(hook, project) {
     } catch {}
   }
   let smartMatchSection = "";
+  let smartMatchCount = 0;
+  let smartMatchTopScore = 0;
+  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
   try {
-    const analysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
-    if (!analysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
-      const matches = await matchResourcesForPrompt(hook.prompt ?? "", analysis, {
+    if (!promptAnalysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
+      const matches = await matchResourcesForPrompt(hook.prompt ?? "", promptAnalysis, {
         project,
         threshold: 0.3,
         limit: 5
       });
+      smartMatchCount = matches.length;
+      smartMatchTopScore = matches[0]?.score ?? 0;
       if (matches.length > 0)
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
   let recentConvoSection = "";
+  let historyIntentMatched = false;
   try {
     if ((hook.prompt?.length ?? 0) >= 6) {
       const intent = await detectHistoryIntent(hook.prompt ?? "");
+      historyIntentMatched = intent.match;
       if (intent.match) {
         recentConvoSection = buildRecentConversationSection(hook.session_id, project);
       }
@@ -2799,15 +2868,31 @@ async function handleUserPromptSubmit(hook, project) {
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
   try {
-    const analysisForHint = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
     awarenessHint = buildAwarenessHint({
       project,
-      isCommandInvocation: analysisForHint.is_command_invocation,
+      isCommandInvocation: promptAnalysis.is_command_invocation,
       hasMemoryInjected: memorySection.length > 0,
       hasRecentConvoInjected: recentConvoSection.length > 0
     });
   } catch {}
   const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  try {
+    logInjection({
+      session_id: hook.session_id,
+      project,
+      intent: promptAnalysis.intent,
+      language: promptAnalysis.language,
+      prompt_length: hook.prompt?.length ?? 0,
+      smart_match_count: smartMatchCount,
+      smart_match_top_score: smartMatchTopScore,
+      memory_section_chars: memorySection.length,
+      claude_md_chars: mdSummary.length,
+      recent_convo_chars: recentConvoSection.length,
+      awareness_hint_chars: awarenessHint.length,
+      total_injection_chars: safeContext.length,
+      history_intent_matched: historyIntentMatched
+    });
+  } catch {}
   return { additionalContext: safeContext };
 }
 function formatSmartMatch(matches) {
@@ -2899,18 +2984,18 @@ function projectFromCwd(cwd) {
 // src/capture/transcript-parser.ts
 import { createReadStream, existsSync as existsSync6, statSync as statSync3 } from "fs";
 import { createInterface } from "readline";
-var log8 = createLogger("transcript-parser");
+var log9 = createLogger("transcript-parser");
 var MAX_FILE_SIZE = 50 * 1024 * 1024;
 var MAX_MESSAGES = 200;
 async function parseTranscript(transcriptPath, sessionId, project) {
   if (!transcriptPath || !existsSync6(transcriptPath)) {
-    log8.info("Transcript not found, skipping", { path: transcriptPath });
+    log9.info("Transcript not found, skipping", { path: transcriptPath });
     return [];
   }
   try {
     const stat = statSync3(transcriptPath);
     if (stat.size > MAX_FILE_SIZE) {
-      log8.warn("Transcript too large, skipping", { size: stat.size, max: MAX_FILE_SIZE });
+      log9.warn("Transcript too large, skipping", { size: stat.size, max: MAX_FILE_SIZE });
       return [];
     }
   } catch {
@@ -2960,14 +3045,14 @@ async function parseTranscript(transcriptPath, sessionId, project) {
       messages.push(msg);
     }
   } catch (err) {
-    log8.error("Transcript parse failed", { error: String(err) });
+    log9.error("Transcript parse failed", { error: String(err) });
     return [];
   }
   const privacyConfig = loadPrivacyConfig();
   for (const msg of messages) {
     msg.content = sanitize(msg.content, privacyConfig);
   }
-  log8.info("Transcript parsed", {
+  log9.info("Transcript parsed", {
     path: transcriptPath,
     total: messages.length,
     user: messages.filter((m) => m.role === "user").length,
@@ -3035,7 +3120,7 @@ function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
 }
 
 // src/summarizer/cli-summarizer.ts
-var log9 = createLogger("cli-summarizer");
+var log10 = createLogger("cli-summarizer");
 var MAX_PROMPT_CHARS = 6000;
 var MAX_OUTPUT_CHARS = 2000;
 var DEFAULT_TIMEOUT_MS = 30000;
@@ -3094,7 +3179,7 @@ async function tryCliSummary(ctx, timeoutMs) {
   const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
   const timeout = timeoutMs ?? envTimeout;
   if (!isClaudeCliAvailable()) {
-    log9.info("claude CLI not found, skipping Tier 2");
+    log10.info("claude CLI not found, skipping Tier 2");
     return;
   }
   const prompt = buildCliPrompt(ctx);
@@ -3105,7 +3190,7 @@ async function tryCliSummary(ctx, timeoutMs) {
     if (attempt < MAX_RETRIES)
       await new Promise((r) => setTimeout(r, 1000));
   }
-  log9.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
+  log10.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
   return;
 }
 async function attemptCliCall(prompt, timeout, attempt) {
@@ -3131,12 +3216,12 @@ async function attemptCliCall(prompt, timeout, attempt) {
       const output = await new Response(proc.stdout).text();
       const exitCode = await proc.exited;
       if (exitCode !== 0) {
-        log9.warn("claude CLI exited with non-zero", { exitCode, attempt });
+        log10.warn("claude CLI exited with non-zero", { exitCode, attempt });
         return;
       }
       const text = output.trim();
       if (!text || text.length < 10) {
-        log9.warn("claude CLI returned empty or too short output", { attempt });
+        log10.warn("claude CLI returned empty or too short output", { attempt });
         return;
       }
       const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
@@ -3144,19 +3229,19 @@ async function attemptCliCall(prompt, timeout, attempt) {
     })();
     const result = await Promise.race([outputPromise, timeoutPromise]);
     if (result) {
-      log9.info("Tier 2 CLI summary generated", { length: result.length, attempt });
+      log10.info("Tier 2 CLI summary generated", { length: result.length, attempt });
     } else {
-      log9.warn("Tier 2 CLI attempt failed or timed out", { attempt });
+      log10.warn("Tier 2 CLI attempt failed or timed out", { attempt });
     }
     return result;
   } catch (err) {
-    log9.error("Tier 2 CLI attempt error", { error: String(err), attempt });
+    log10.error("Tier 2 CLI attempt error", { error: String(err), attempt });
     return;
   }
 }
 
 // src/summarizer/session-summarizer.ts
-var log10 = createLogger("session-summarizer");
+var log11 = createLogger("session-summarizer");
 
 class SessionSummarizer {
   sessionStore;
@@ -3215,7 +3300,7 @@ class SessionSummarizer {
         allNotes.push(conversationDigest);
       summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
     }
-    log10.info("Summary generated", { session_id, tier, length: summaryText.length });
+    log11.info("Summary generated", { session_id, tier, length: summaryText.length });
     const ltSummary = {
       session_id,
       project,
@@ -3234,7 +3319,7 @@ function estimateTokenSavings(fileCount, errorCount, noteCount) {
 }
 
 // src/search/semantic-search.ts
-var log11 = createLogger("semantic-search");
+var log12 = createLogger("semantic-search");
 async function indexEmbedding(docType, docId, text, db) {
   const vector = await embeddingModel.embed(text);
   if (!vector)
@@ -3252,7 +3337,7 @@ async function indexEmbedding(docType, docId, text, db) {
 import { existsSync as existsSync7, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3 } from "fs";
 import { join as join6 } from "path";
 import { homedir as homedir5 } from "os";
-var log12 = createLogger("proactive-retrieval");
+var log13 = createLogger("proactive-retrieval");
 var DATA_DIR = join6(homedir5(), ".claude-memory-hub");
 var PROACTIVE_DIR = join6(DATA_DIR, "proactive");
 var TOOL_CALL_INTERVAL = 15;
@@ -3298,7 +3383,7 @@ function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse
   state.injectedTopics.push(currentTopic);
   state.lastInjectionAt = Date.now();
   saveState(sessionId, state);
-  log12.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
+  log13.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
   return { shouldInject: true, additionalContext: context };
 }
 function cleanupProactiveState(sessionId) {
@@ -3378,7 +3463,7 @@ function safeJson4(text, fallback) {
 import { existsSync as existsSync8, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync4 } from "fs";
 import { join as join7 } from "path";
 import { homedir as homedir6 } from "os";
-var log13 = createLogger("batch-queue");
+var log14 = createLogger("batch-queue");
 var DATA_DIR2 = join7(homedir6(), ".claude-memory-hub");
 var BATCH_DIR = join7(DATA_DIR2, "batch");
 var QUEUE_PATH = join7(BATCH_DIR, "queue.jsonl");
@@ -3392,7 +3477,7 @@ function enqueueEvent(event) {
 `;
     appendFileSync2(QUEUE_PATH, line, "utf-8");
   } catch (err) {
-    log13.error("enqueue failed", { error: String(err) });
+    log14.error("enqueue failed", { error: String(err) });
     throw err;
   }
 }
@@ -3412,7 +3497,7 @@ function tryFlush() {
       releaseLock();
     }
   } catch (err) {
-    log13.error("flush failed", { error: String(err) });
+    log14.error("flush failed", { error: String(err) });
     return false;
   }
 }
@@ -3426,7 +3511,7 @@ function flushQueue() {
     try {
       events.push(JSON.parse(line));
     } catch {
-      log13.warn("skipping malformed queue line");
+      log14.warn("skipping malformed queue line");
     }
   }
   if (events.length === 0)
@@ -3455,7 +3540,7 @@ function flushQueue() {
     }
   })();
   writeFileSync2(QUEUE_PATH, "", "utf-8");
-  log13.info("batch flushed", { events: events.length });
+  log14.info("batch flushed", { events: events.length });
 }
 function tryAcquireLock() {
   try {

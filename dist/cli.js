@@ -347,6 +347,33 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
     log.info("Migration v6 complete");
   }
+  if (currentVersion < 7) {
+    log.info("Applying migration v7: injection_log table for telemetry");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS injection_log (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id              TEXT NOT NULL,
+        project                 TEXT NOT NULL,
+        intent                  TEXT,
+        language                TEXT,
+        prompt_length           INTEGER NOT NULL DEFAULT 0,
+        smart_match_count       INTEGER NOT NULL DEFAULT 0,
+        smart_match_top_score   REAL    NOT NULL DEFAULT 0,
+        memory_section_chars    INTEGER NOT NULL DEFAULT 0,
+        claude_md_chars         INTEGER NOT NULL DEFAULT 0,
+        recent_convo_chars      INTEGER NOT NULL DEFAULT 0,
+        awareness_hint_chars    INTEGER NOT NULL DEFAULT 0,
+        total_injection_chars   INTEGER NOT NULL DEFAULT 0,
+        history_intent_matched  INTEGER NOT NULL DEFAULT 0,
+        timestamp               INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_session ON injection_log(session_id, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_project ON injection_log(project, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_intent  ON injection_log(intent, timestamp)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
+    log.info("Migration v7 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -2988,11 +3015,66 @@ var init_doctor = __esm(() => {
   init_doctor_actions();
 });
 
+// src/db/injection-telemetry.ts
+function aggregateInjections(options = {}) {
+  const since = options.sinceMs ?? SINCE_LAST_30D();
+  const d = options.db ?? getDatabase();
+  const totals = d.query(`SELECT
+        COUNT(*)                                     as n,
+        AVG(total_injection_chars)                   as avg_total,
+        AVG(memory_section_chars)                    as avg_memory,
+        AVG(smart_match_count)                       as avg_match_count,
+        AVG(smart_match_top_score)                   as avg_top_score,
+        SUM(CASE WHEN smart_match_count   > 0 THEN 1 ELSE 0 END) as with_match,
+        SUM(CASE WHEN history_intent_matched = 1 THEN 1 ELSE 0 END) as with_history,
+        SUM(CASE WHEN awareness_hint_chars > 0 THEN 1 ELSE 0 END) as with_hint
+     FROM injection_log WHERE timestamp >= ?`).get(since);
+  const total = totals?.n ?? 0;
+  const byIntent = d.query(`SELECT intent, COUNT(*) count,
+            AVG(total_injection_chars) avg_total,
+            AVG(memory_section_chars)  avg_memory,
+            AVG(claude_md_chars)       avg_claude_md
+     FROM injection_log WHERE timestamp >= ?
+     GROUP BY intent ORDER BY count DESC`).all(since);
+  return {
+    total_injections: total,
+    avg_total_chars: Math.round(totals?.avg_total ?? 0),
+    avg_memory_chars: Math.round(totals?.avg_memory ?? 0),
+    avg_smart_match_count: Number((totals?.avg_match_count ?? 0).toFixed(2)),
+    avg_top_score: Number((totals?.avg_top_score ?? 0).toFixed(3)),
+    prompts_with_match: totals?.with_match ?? 0,
+    prompts_with_match_pct: total > 0 ? Number(((totals?.with_match ?? 0) / total * 100).toFixed(1)) : 0,
+    history_intent_count: totals?.with_history ?? 0,
+    awareness_hint_count: totals?.with_hint ?? 0,
+    by_intent: byIntent.map((b) => ({
+      intent: b.intent ?? "unknown",
+      count: b.count,
+      avg_total_chars: Math.round(b.avg_total ?? 0),
+      avg_memory_chars: Math.round(b.avg_memory ?? 0),
+      avg_claude_md_chars: Math.round(b.avg_claude_md ?? 0)
+    }))
+  };
+}
+var log12, SINCE_LAST_30D = () => Date.now() - 30 * 86400000;
+var init_injection_telemetry = __esm(() => {
+  init_schema();
+  init_logger();
+  log12 = createLogger("injection-telemetry");
+});
+
 // src/cli/stats.ts
 var exports_stats = {};
 __export(exports_stats, {
+  runStatsCommand: () => runStatsCommand,
   runStats: () => runStats
 });
+function runStatsCommand(args) {
+  if (args.includes("--injections")) {
+    runInjectionStats();
+    return;
+  }
+  runStats();
+}
 function runStats() {
   const db = getDatabase();
   const since = Date.now() - 30 * DAY_MS;
@@ -3057,9 +3139,43 @@ function runStats() {
     console.log("No issues detected.");
   }
 }
+function runInjectionStats() {
+  const agg = aggregateInjections();
+  console.log("Injection Telemetry \u2014 last 30 days");
+  console.log("\u2500".repeat(48));
+  if (agg.total_injections === 0) {
+    console.log("No injection telemetry recorded yet.");
+    console.log("");
+    console.log("Telemetry started writing in v0.14.0. Run a few prompts in");
+    console.log("Claude Code and try again. Or check env var:");
+    console.log("  echo $CLAUDE_MEMORY_HUB_TELEMETRY   # should not be 'disabled'");
+    return;
+  }
+  console.log(`Total injections:     ${agg.total_injections}`);
+  console.log(`Avg total chars:      ${agg.avg_total_chars}  (~${Math.round(agg.avg_total_chars / 3.75)} tokens)`);
+  console.log(`Avg memory chars:     ${agg.avg_memory_chars}`);
+  console.log("");
+  console.log("Smart match performance:");
+  console.log(`  Prompts with match: ${agg.prompts_with_match} / ${agg.total_injections}  (${agg.prompts_with_match_pct}%)`);
+  console.log(`  Avg matches/prompt: ${agg.avg_smart_match_count}`);
+  console.log(`  Avg top score:      ${agg.avg_top_score}`);
+  console.log("");
+  console.log("Other signals:");
+  console.log(`  History intent fired: ${agg.history_intent_count} prompts`);
+  console.log(`  Awareness hint shown: ${agg.awareness_hint_count} prompts`);
+  console.log("");
+  if (agg.by_intent.length > 0) {
+    console.log("Breakdown by intent:");
+    for (const b of agg.by_intent) {
+      const padIntent = b.intent.padEnd(10);
+      console.log(`  ${padIntent} ${String(b.count).padStart(4)}x   avg ${String(b.avg_total_chars).padStart(5)} chars  (memory ${b.avg_memory_chars}, claude_md ${b.avg_claude_md_chars})`);
+    }
+  }
+}
 var DAY_MS = 86400000;
 var init_stats = __esm(() => {
   init_schema();
+  init_injection_telemetry();
 });
 
 // src/cli/main.ts
@@ -3760,8 +3876,8 @@ switch (command) {
     break;
   }
   case "stats": {
-    const { runStats: runStats2 } = (init_stats(), __toCommonJS(exports_stats));
-    runStats2();
+    const { runStatsCommand: runStatsCommand2 } = (init_stats(), __toCommonJS(exports_stats));
+    runStatsCommand2(process.argv.slice(3));
     break;
   }
   case "prune": {
@@ -3811,7 +3927,7 @@ switch (command) {
     console.log("  viewer      Open browser UI at localhost:37888");
     console.log("  health      Run health check");
     console.log("  doctor      Diagnose installation + auto-fix embeddings (--fix --backfill)");
-    console.log("  stats       Memory health report (sessions, top projects, hot files)");
+    console.log("  stats       Memory health report (--injections for telemetry breakdown)");
     console.log("  reindex     Rebuild TF-IDF search index");
     console.log("  export      Export data as JSONL (--since T, --table T)");
     console.log("  import      Import JSONL from stdin (--dry-run)");

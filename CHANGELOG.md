@@ -5,6 +5,97 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.14.0] - 2026-05-16
+
+**Ship telemetry first, build features on real data.**
+
+This is the minimum viable v0.14.0: a single phase — injection telemetry — that produces the metric every future feature should be tuned against. Originally the plan packed importance scoring + adaptive injection into this release, but a self-audit before coding showed those phases were built on premises ("search rank vô nghĩa", "900-token waste on 'hello world'") that weren't backed by data. Honest engineering says: instrument before you optimise.
+
+### What ships
+
+Migration v7 adds `injection_log` — one row per UserPromptSubmit recording:
+
+| Field | Captures |
+|---|---|
+| `intent` + `language` | What kind of prompt + what language (from `prompt-analyzer`) |
+| `prompt_length` | User input size |
+| `smart_match_count` + `smart_match_top_score` | Did the resource matcher fire? How confident? |
+| `memory_section_chars` | How many chars went into the "past sessions" section |
+| `claude_md_chars` | Size of the CLAUDE.md heading injection |
+| `recent_convo_chars` | Size of the history-intent section (v0.13.3) |
+| `awareness_hint_chars` | Size of the proactive hint (v0.13.4) |
+| `total_injection_chars` | Final size after budget allocation |
+| `history_intent_matched` | Did the embedding-based history detector fire? |
+| `timestamp` | When |
+
+Writes are silent and non-blocking — telemetry errors never break injection. Opt out with `CLAUDE_MEMORY_HUB_TELEMETRY=disabled`.
+
+### New: `claude-memory-hub stats --injections`
+
+```
+Injection Telemetry — last 30 days
+────────────────────────────────────────────────
+Total injections:     5
+Avg total chars:      2348  (~626 tokens)
+Avg memory chars:     1622
+
+Smart match performance:
+  Prompts with match: 1 / 5  (20%)
+  Avg matches/prompt: 0.6
+  Avg top score:      0.093
+
+Other signals:
+  History intent fired: 1 prompts
+  Awareness hint shown: 5 prompts
+
+Breakdown by intent:
+  general       3x   avg  2029 chars  (memory 1289, claude_md 123)
+  debug         1x   avg  3451 chars  (memory 2902, claude_md 123)
+  implement     1x   avg  2202 chars  (memory 1341, claude_md 123)
+```
+
+The output above is **real telemetry from this developer's first 5 prompts** post-deploy — not a mock. The 20% match rate is honest data: it's far below the 60% target the plan had assumed, which means the next phase (importance scoring or matcher tuning) has a concrete baseline to beat.
+
+### What does NOT ship (and why)
+
+Phase 2 (importance scoring) and Phase 3 (adaptive injection) from the original v0.14.0 plan are **deferred to v0.14.1+** because:
+
+1. **Verified the premise was wrong.** A live `memory_search` query for "auth" returned legitimate decisions ranked correctly — no junk near the top. Existing ranking is better than the plan assumed.
+2. **Single data point isn't a pattern.** The "hello world test → 913 tokens" example was one test session months ago, not a baseline.
+3. **No telemetry meant no way to verify gains.** Now there is.
+
+The right time to ship importance/adaptive is when telemetry shows specific failures (low match score on common intents, oversized injections on question-type prompts, etc.) — not before.
+
+### Files Changed
+
+- `src/db/schema.ts` — migration v7 + `injection_log` table with 3 indexes
+- `src/db/injection-telemetry.ts` (new) — `logInjection` writer, `aggregateInjections` reader, `pruneInjectionLog` maintenance
+- `src/capture/hook-handler.ts` — lift `promptAnalysis` + match metrics out of try blocks; log telemetry at end of `handleUserPromptSubmit`
+- `src/cli/stats.ts` — new `runStatsCommand(args)` router; new `runInjectionStats()` for `--injections` flag
+- `src/cli/main.ts` — wire `stats --injections`, update help text
+- `tests/unit/injection-telemetry.test.ts` (new) — 10 cases (write, opt-out, throw-safety, aggregates, intent breakdown, history/hint counts, empty table, time window, prune)
+- `tests/unit/schema.test.ts` — update version-bump test from v6→v7, add `injection_log` existence test
+
+198 tests pass (added 11).
+
+### How to upgrade
+
+```bash
+bunx claude-memory-hub@latest install
+```
+
+Then **Cmd+Q Claude Code** and reopen. After a handful of prompts:
+
+```bash
+bunx claude-memory-hub@latest stats --injections
+```
+
+### What I'll do with this data
+
+Over the next 5-7 days, collect a baseline. If `prompts_with_match` stays below 40% or `avg_top_score` stays below 0.4, that's evidence the resource matcher needs work — and v0.14.1 will target it with real data, not speculation. If those numbers are healthy, v0.14.1 may instead focus on adaptive budgets for question-type prompts (visible in the `by_intent` breakdown).
+
+---
+
 ## [0.13.4] - 2026-05-07
 
 **Fix the proactivity gap.** v0.13.0 → v0.13.3 made memory recallable, but Claude still didn't reach for it unless the user explicitly named the MCP tool. Result: even with rich data, Claude defaulted to `git log` or said "I don't have history" because nothing in its prompt context pushed it toward memory hub.

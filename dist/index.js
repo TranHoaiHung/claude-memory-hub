@@ -6812,6 +6812,33 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (6, ?)", [Date.now()]);
     log.info("Migration v6 complete");
   }
+  if (currentVersion < 7) {
+    log.info("Applying migration v7: injection_log table for telemetry");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS injection_log (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id              TEXT NOT NULL,
+        project                 TEXT NOT NULL,
+        intent                  TEXT,
+        language                TEXT,
+        prompt_length           INTEGER NOT NULL DEFAULT 0,
+        smart_match_count       INTEGER NOT NULL DEFAULT 0,
+        smart_match_top_score   REAL    NOT NULL DEFAULT 0,
+        memory_section_chars    INTEGER NOT NULL DEFAULT 0,
+        claude_md_chars         INTEGER NOT NULL DEFAULT 0,
+        recent_convo_chars      INTEGER NOT NULL DEFAULT 0,
+        awareness_hint_chars    INTEGER NOT NULL DEFAULT 0,
+        total_injection_chars   INTEGER NOT NULL DEFAULT 0,
+        history_intent_matched  INTEGER NOT NULL DEFAULT 0,
+        timestamp               INTEGER NOT NULL
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_session ON injection_log(session_id, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_project ON injection_log(project, timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_intent  ON injection_log(intent, timestamp)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
+    log.info("Migration v7 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -9265,6 +9292,47 @@ var init_awareness_hint = __esm(() => {
   init_schema();
 });
 
+// src/db/injection-telemetry.ts
+function logInjection(entry, db) {
+  if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
+    return;
+  try {
+    const d = db ?? getDatabase();
+    d.run(`INSERT INTO injection_log(
+         session_id, project, intent, language,
+         prompt_length,
+         smart_match_count, smart_match_top_score,
+         memory_section_chars, claude_md_chars,
+         recent_convo_chars, awareness_hint_chars,
+         total_injection_chars,
+         history_intent_matched, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+      entry.session_id,
+      entry.project,
+      entry.intent,
+      entry.language,
+      entry.prompt_length,
+      entry.smart_match_count,
+      entry.smart_match_top_score,
+      entry.memory_section_chars,
+      entry.claude_md_chars,
+      entry.recent_convo_chars,
+      entry.awareness_hint_chars,
+      entry.total_injection_chars,
+      entry.history_intent_matched ? 1 : 0,
+      Date.now()
+    ]);
+  } catch (err) {
+    log12.warn("logInjection failed", { error: String(err) });
+  }
+}
+var log12;
+var init_injection_telemetry = __esm(() => {
+  init_schema();
+  init_logger();
+  log12 = createLogger("injection-telemetry");
+});
+
 // src/capture/hook-handler.ts
 var exports_hook_handler = {};
 __export(exports_hook_handler, {
@@ -9377,22 +9445,28 @@ async function handleUserPromptSubmit(hook, project) {
     } catch {}
   }
   let smartMatchSection = "";
+  let smartMatchCount = 0;
+  let smartMatchTopScore = 0;
+  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
   try {
-    const analysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
-    if (!analysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
-      const matches = await matchResourcesForPrompt(hook.prompt ?? "", analysis, {
+    if (!promptAnalysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
+      const matches = await matchResourcesForPrompt(hook.prompt ?? "", promptAnalysis, {
         project,
         threshold: 0.3,
         limit: 5
       });
+      smartMatchCount = matches.length;
+      smartMatchTopScore = matches[0]?.score ?? 0;
       if (matches.length > 0)
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
   let recentConvoSection = "";
+  let historyIntentMatched = false;
   try {
     if ((hook.prompt?.length ?? 0) >= 6) {
       const intent = await detectHistoryIntent(hook.prompt ?? "");
+      historyIntentMatched = intent.match;
       if (intent.match) {
         recentConvoSection = buildRecentConversationSection(hook.session_id, project);
       }
@@ -9410,15 +9484,31 @@ async function handleUserPromptSubmit(hook, project) {
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
   try {
-    const analysisForHint = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
     awarenessHint = buildAwarenessHint({
       project,
-      isCommandInvocation: analysisForHint.is_command_invocation,
+      isCommandInvocation: promptAnalysis.is_command_invocation,
       hasMemoryInjected: memorySection.length > 0,
       hasRecentConvoInjected: recentConvoSection.length > 0
     });
   } catch {}
   const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  try {
+    logInjection({
+      session_id: hook.session_id,
+      project,
+      intent: promptAnalysis.intent,
+      language: promptAnalysis.language,
+      prompt_length: hook.prompt?.length ?? 0,
+      smart_match_count: smartMatchCount,
+      smart_match_top_score: smartMatchTopScore,
+      memory_section_chars: memorySection.length,
+      claude_md_chars: mdSummary.length,
+      recent_convo_chars: recentConvoSection.length,
+      awareness_hint_chars: awarenessHint.length,
+      total_injection_chars: safeContext.length,
+      history_intent_matched: historyIntentMatched
+    });
+  } catch {}
   return { additionalContext: safeContext };
 }
 function formatSmartMatch(matches) {
@@ -9521,6 +9611,7 @@ var init_hook_handler = __esm(() => {
   init_history_intent();
   init_conversation_injector();
   init_awareness_hint();
+  init_injection_telemetry();
   init_smart_truncate();
   init_privacy_filter();
 });
