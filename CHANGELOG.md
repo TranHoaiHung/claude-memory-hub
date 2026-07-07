@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.15.1] - 2026-07-08
+
+**Error capture actually works now — plus summarizer quality and effectiveness metrics.**
+
+### Fixed: error capture was completely dead
+
+Four months of production data contained **zero** `error` entities. Root cause verified against real transcripts: Claude Code's hook payloads carry no exit code — failed tools send `tool_response` as a plain STRING (`"Error: ..."`), and Bash always reports `{stdout, stderr, interrupted, isImage}` with the failure text embedded in stdout and `is_error` still false.
+
+- New `capture/error-detector.ts` — multi-signal detection: string responses (`Error:` / `tool_use_error`), explicit `exit_code`/`is_error`/`error` fields when present, and 8 high-confidence Bash output patterns (`exited with code N`, `Traceback`, `npm ERR!`, `fatal:`, `command not found`, `error TS\d+`, …). Conservative: max one error per call, warnings are not flagged.
+- Failed Edit/Write/Read no longer record phantom `file_modified`/`file_created`/`file_read` entities.
+- Proactive retrieval's error trigger (same dead `exit_code` check) now uses the detector — past-error context injection can actually fire.
+- `tool_response` type widened to `string | object` to match reality.
+
+### Summarizer quality
+
+- Tier-2 prompt rewritten: asks for decisions + reasons, error resolutions, unfinished work; **preserves Vietnamese feature names and user requirements verbatim** while writing searchable English (FTS5 porter stemming is English-biased); demands exact file/function/error identifiers for future keyword recall.
+- Tier-2 daily budget: max 20 `claude -p` spawns/day (override `CLAUDE_MEMORY_HUB_LLM_DAILY_MAX`), overflow degrades to rule-based instead of burning quota.
+
+### Effectiveness metrics
+
+- `memory_tool_used` marking moved to the hook entry so it fires on the (default) batch path too, not just the direct-write fallback.
+- `stats --injections` now reports the effectiveness hit rate: sessions where Claude actually called a `memory_*` tool after injection.
+
+---
+
 ## [0.15.0] - 2026-07-08
 
 **Inject once, remember everything: session-baseline injection, entity dedup, knowledge graph, Obsidian export.**

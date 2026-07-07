@@ -95,13 +95,6 @@ var init_logger = __esm(() => {
 });
 
 // src/db/schema.ts
-var exports_schema = {};
-__export(exports_schema, {
-  initDatabase: () => initDatabase,
-  getDbPath: () => getDbPath,
-  getDatabase: () => getDatabase,
-  closeDatabase: () => closeDatabase
-});
 import { Database } from "bun:sqlite";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
 import { homedir as homedir2 } from "os";
@@ -435,12 +428,6 @@ function getDatabase() {
     initDatabase(_db);
   }
   return _db;
-}
-function closeDatabase() {
-  if (_db) {
-    _db.close();
-    _db = null;
-  }
 }
 var log, CREATE_TABLES = `
 -- Migration version tracking

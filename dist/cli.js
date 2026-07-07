@@ -3101,6 +3101,9 @@ function aggregateInjections(options = {}) {
         SUM(CASE WHEN awareness_hint_chars > 0 THEN 1 ELSE 0 END) as with_hint
      FROM injection_log WHERE timestamp >= ?`).get(since);
   const total = totals?.n ?? 0;
+  const toolUse = d.query(`SELECT COUNT(DISTINCT session_id) as sessions,
+            COUNT(DISTINCT CASE WHEN memory_tool_used = 1 THEN session_id END) as used
+     FROM injection_log WHERE timestamp >= ?`).get(since);
   const byIntent = d.query(`SELECT intent, COUNT(*) count,
             AVG(total_injection_chars) avg_total,
             AVG(memory_section_chars)  avg_memory,
@@ -3117,6 +3120,8 @@ function aggregateInjections(options = {}) {
     prompts_with_match_pct: total > 0 ? Number(((totals?.with_match ?? 0) / total * 100).toFixed(1)) : 0,
     history_intent_count: totals?.with_history ?? 0,
     awareness_hint_count: totals?.with_hint ?? 0,
+    sessions_with_memory_tool_use: toolUse?.used ?? 0,
+    memory_tool_hit_rate_pct: (toolUse?.sessions ?? 0) > 0 ? Number(((toolUse?.used ?? 0) / (toolUse?.sessions ?? 1) * 100).toFixed(1)) : 0,
     by_intent: byIntent.map((b) => ({
       intent: b.intent ?? "unknown",
       count: b.count,
@@ -3908,6 +3913,9 @@ function runInjectionStats() {
   console.log("Other signals:");
   console.log(`  History intent fired: ${agg.history_intent_count} prompts`);
   console.log(`  Awareness hint shown: ${agg.awareness_hint_count} prompts`);
+  console.log("");
+  console.log("Effectiveness (memory_* tool called after injection):");
+  console.log(`  Sessions with memory tool use: ${agg.sessions_with_memory_tool_use}  (hit rate ${agg.memory_tool_hit_rate_pct}%)`);
   console.log("");
   if (agg.by_intent.length > 0) {
     console.log("Breakdown by intent:");

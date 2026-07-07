@@ -6582,13 +6582,6 @@ var init_logger = __esm(() => {
 });
 
 // src/db/schema.ts
-var exports_schema = {};
-__export(exports_schema, {
-  initDatabase: () => initDatabase,
-  getDbPath: () => getDbPath,
-  getDatabase: () => getDatabase,
-  closeDatabase: () => closeDatabase
-});
 import { Database } from "bun:sqlite";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
 import { homedir as homedir2 } from "os";
@@ -6922,12 +6915,6 @@ function getDatabase() {
     initDatabase(_db);
   }
   return _db;
-}
-function closeDatabase() {
-  if (_db) {
-    _db.close();
-    _db = null;
-  }
 }
 var log, CREATE_TABLES = `
 -- Migration version tracking
@@ -8656,6 +8643,80 @@ function extractCodePatterns(content) {
 }
 var CONTEXT_MAX_LENGTH = 500;
 
+// src/capture/error-detector.ts
+function detectToolError(toolName, toolInput, toolResponse) {
+  if (typeof toolResponse === "string") {
+    const text = toolResponse.trim();
+    if (/^Error/i.test(text) || text.includes("tool_use_error")) {
+      const firstLine = text.replace(/<\/?tool_use_error>/g, "").split(`
+`)[0] ?? text;
+      return {
+        value: `${toolName} failed: ${firstLine.slice(0, 140)}`,
+        context: text.slice(0, 500),
+        importance: 3
+      };
+    }
+    return null;
+  }
+  if (!toolResponse || typeof toolResponse !== "object")
+    return null;
+  const r = toolResponse;
+  const exitCode = typeof r["exit_code"] === "number" ? r["exit_code"] : typeof r["exitCode"] === "number" ? r["exitCode"] : undefined;
+  const errField = typeof r["error"] === "string" && r["error"].length > 0 ? r["error"] : undefined;
+  const isError = r["is_error"] === true || r["isError"] === true;
+  const cmd = toolName === "Bash" && typeof toolInput?.["command"] === "string" ? toolInput["command"] : "";
+  if (typeof exitCode === "number" && exitCode !== 0 || isError || errField) {
+    const stderr = typeof r["stderr"] === "string" ? r["stderr"] : "";
+    const stdout = typeof r["stdout"] === "string" ? r["stdout"] : "";
+    const ctx = [errField, stderr, stdout].filter(Boolean).join(`
+`).slice(0, 500);
+    return {
+      value: exitCode !== undefined ? `[exit ${exitCode}] ${(cmd || toolName).slice(0, 140)}` : `${toolName} failed: ${(errField ?? cmd ?? "").slice(0, 140)}`,
+      context: ctx,
+      importance: 4
+    };
+  }
+  if (toolName === "Bash") {
+    const stdout = typeof r["stdout"] === "string" ? r["stdout"] : "";
+    const stderr = typeof r["stderr"] === "string" ? r["stderr"] : "";
+    const combined = (stdout + `
+` + stderr).slice(-2000);
+    for (const p of BASH_ERROR_PATTERNS) {
+      const match = combined.match(p.re);
+      if (match?.index !== undefined) {
+        const excerpt = excerptAround(combined, match.index);
+        return {
+          value: `[${p.label}] ${cmd.slice(0, 140)}`,
+          context: excerpt,
+          importance: p.importance
+        };
+      }
+    }
+  }
+  return null;
+}
+function excerptAround(text, index) {
+  const lineStart = text.lastIndexOf(`
+`, index) + 1;
+  const lines = text.slice(lineStart).split(`
+`).slice(0, 3);
+  return lines.join(`
+`).slice(0, 400);
+}
+var BASH_ERROR_PATTERNS;
+var init_error_detector = __esm(() => {
+  BASH_ERROR_PATTERNS = [
+    { re: /exited with code \d+/, label: "exit", importance: 4 },
+    { re: /Traceback \(most recent call last\)/, label: "python", importance: 4 },
+    { re: /npm ERR!/, label: "npm", importance: 4 },
+    { re: /(?:^|\n)fatal: /, label: "git", importance: 4 },
+    { re: /command not found/, label: "not-found", importance: 3 },
+    { re: /error TS\d+/, label: "tsc", importance: 3 },
+    { re: /(?:^|\n)\s*(?:error|ERROR)[: ]/, label: "error", importance: 3 },
+    { re: /Build failed|Compilation failed|FAILED \(|Tests? failed/i, label: "build", importance: 3 }
+  ];
+});
+
 // src/capture/privacy-filter.ts
 function stripPrivateTags(text) {
   return text.replace(PRIVATE_TAG_RE, "[REDACTED]");
@@ -8883,17 +8944,21 @@ function extractEntities(hook, promptNumber = 0) {
   const now = Date.now();
   const raw = [];
   const privacyConfig = loadPrivacyConfig();
+  const toolError = detectToolError(tool_name, tool_input, tool_response);
+  if (toolError) {
+    raw.push(makeEntity(session_id, project, tool_name, "error", toolError.value, toolError.importance, now, promptNumber, toolError.context || undefined));
+  }
   switch (tool_name) {
     case "Read": {
       const path = stringField2(tool_input, "file_path");
-      if (path && !isIgnoredPath(path, privacyConfig)) {
+      if (path && !toolError && !isIgnoredPath(path, privacyConfig)) {
         raw.push(makeEntity(session_id, project, tool_name, "file_read", path, 1, now, promptNumber));
       }
       break;
     }
     case "Write": {
       const path = stringField2(tool_input, "file_path");
-      if (path && !isIgnoredPath(path, privacyConfig)) {
+      if (path && !toolError && !isIgnoredPath(path, privacyConfig)) {
         raw.push(makeEntity(session_id, project, tool_name, "file_created", path, 4, now, promptNumber));
       }
       break;
@@ -8901,23 +8966,15 @@ function extractEntities(hook, promptNumber = 0) {
     case "Edit":
     case "MultiEdit": {
       const path = stringField2(tool_input, "file_path");
-      if (path && !isIgnoredPath(path, privacyConfig)) {
+      if (path && !toolError && !isIgnoredPath(path, privacyConfig)) {
         raw.push(makeEntity(session_id, project, tool_name, "file_modified", path, 4, now, promptNumber));
       }
       break;
     }
     case "Bash": {
       const cmd = stringField2(tool_input, "command") ?? "";
-      const exitCode = tool_response?.exit_code;
-      const stdout = stringField2(tool_response, "stdout") ?? "";
-      const stderr = stringField2(tool_response, "stderr") ?? "";
-      if (typeof exitCode === "number" && exitCode !== 0) {
-        const errorCtx = [stderr, stdout].filter(Boolean).join(`
-`).slice(0, 300);
-        raw.push(makeEntity(session_id, project, tool_name, "error", `[exit ${exitCode}] ${cmd.slice(0, 120)}`, exitCode > 0 ? 3 : 5, now, promptNumber, errorCtx || undefined));
-      }
       const writtenFile = extractFileFromBashCmd(cmd);
-      if (writtenFile && (exitCode === 0 || exitCode === undefined)) {
+      if (writtenFile && !toolError) {
         raw.push(makeEntity(session_id, project, tool_name, "file_modified", writtenFile, 2, now, promptNumber));
       }
       break;
@@ -8968,6 +9025,8 @@ function makeEntity(session_id, project, tool_name, entity_type, entity_value, i
   return context !== undefined ? { ...base, context } : base;
 }
 function getResponseText2(response) {
+  if (typeof response !== "object" || response === null)
+    return;
   return stringField2(response, "output") ?? stringField2(response, "stdout") ?? undefined;
 }
 function stringField2(obj, key) {
@@ -9002,6 +9061,7 @@ function extractFileFromBashCmd(cmd) {
   return;
 }
 var init_entity_extractor = __esm(() => {
+  init_error_detector();
   init_observation_extractor();
   init_privacy_filter();
 });
@@ -9469,6 +9529,7 @@ var init_injection_state = __esm(() => {
 var exports_hook_handler = {};
 __export(exports_hook_handler, {
   projectFromCwd: () => projectFromCwd,
+  markMemoryToolUsed: () => markMemoryToolUsed,
   handleUserPromptSubmit: () => handleUserPromptSubmit,
   handleSessionEnd: () => handleSessionEnd,
   handlePostToolUse: () => handlePostToolUse,
@@ -9509,14 +9570,13 @@ async function handlePostToolUse(hook, project) {
   }
   if (hook.tool_name.startsWith("mcp__")) {
     tracker.trackUsage(hook.session_id, project, "mcp_tool", hook.tool_name);
-    if (hook.tool_name.startsWith("mcp__claude-memory-hub__")) {
-      try {
-        const { getDatabase: getDatabase2 } = await Promise.resolve().then(() => (init_schema(), exports_schema));
-        getDatabase2().run(`UPDATE injection_log SET memory_tool_used = 1
-           WHERE id = (SELECT id FROM injection_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1)`, [hook.session_id]);
-      } catch {}
-    }
   }
+}
+function markMemoryToolUsed(sessionId) {
+  try {
+    getDatabase().run(`UPDATE injection_log SET memory_tool_used = 1
+       WHERE id = (SELECT id FROM injection_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1)`, [sessionId]);
+  } catch {}
 }
 async function handleUserPromptSubmit(hook, project) {
   const store = new SessionStore;
@@ -9761,6 +9821,7 @@ function projectFromCwd(cwd) {
 var init_hook_handler = __esm(() => {
   init_session_store();
   init_long_term_store();
+  init_schema();
   init_entity_extractor();
   init_resource_tracker();
   init_smart_resource_loader();
