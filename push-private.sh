@@ -16,7 +16,9 @@ cp -R src/ "$BACKUP_DIR/src/" 2>/dev/null || true
 cp -R hooks/ "$BACKUP_DIR/hooks/" 2>/dev/null || true
 cp -R tests/ "$BACKUP_DIR/tests/" 2>/dev/null || true
 cp -R plans/ "$BACKUP_DIR/plans/" 2>/dev/null || true
+cp -R commands/ "$BACKUP_DIR/commands/" 2>/dev/null || true
 cp tsconfig.json "$BACKUP_DIR/" 2>/dev/null || true
+cp bunfig.toml "$BACKUP_DIR/" 2>/dev/null || true
 cp install.sh "$BACKUP_DIR/" 2>/dev/null || true
 
 # Create a temporary branch with ALL files
@@ -25,7 +27,7 @@ git stash 2>/dev/null || true
 git checkout -b "$TEMP_BRANCH"
 
 # Force add source files
-git add -f src/ hooks/ tests/ plans/ tsconfig.json install.sh 2>/dev/null || true
+git add -f src/ hooks/ tests/ plans/ commands/ tsconfig.json bunfig.toml install.sh 2>/dev/null || true
 git add -f .claude/ 2>/dev/null || true
 git add -f dist/ .github/ README.md CHANGELOG.md LICENSE package.json bun.lock .gitignore .npmignore assets/ push-private.sh push-public.sh
 
@@ -45,7 +47,9 @@ cp -R "$BACKUP_DIR/src/" src/ 2>/dev/null || true
 cp -R "$BACKUP_DIR/hooks/" hooks/ 2>/dev/null || true
 cp -R "$BACKUP_DIR/tests/" tests/ 2>/dev/null || true
 cp -R "$BACKUP_DIR/plans/" plans/ 2>/dev/null || true
+cp -R "$BACKUP_DIR/commands/" commands/ 2>/dev/null || true
 cp "$BACKUP_DIR/tsconfig.json" . 2>/dev/null || true
+cp "$BACKUP_DIR/bunfig.toml" . 2>/dev/null || true
 cp "$BACKUP_DIR/install.sh" . 2>/dev/null || true
 rm -rf "$BACKUP_DIR"
 

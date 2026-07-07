@@ -16,28 +16,22 @@ var __toESM = (mod, isNodeMode, target) => {
       });
   return to;
 };
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, {
+      get: all[name],
+      enumerable: true,
+      configurable: true,
+      set: (newValue) => all[name] = () => newValue
+    });
+};
+var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
 var __require = import.meta.require;
-
-// src/db/schema.ts
-import { Database } from "bun:sqlite";
-import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
-import { homedir as homedir2 } from "os";
-import { join as join2 } from "path";
 
 // src/logger/index.ts
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-var LEVEL_PRIORITY = {
-  debug: 0,
-  info: 1,
-  warn: 2,
-  error: 3
-};
-var LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
-var LOG_FILE = join(LOG_DIR, "memory-hub.log");
-var MAX_LOG_SIZE = 5 * 1024 * 1024;
-var _minLevel = process.env.CMH_LOG_LEVEL || "info";
 function shouldLog(level) {
   return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[_minLevel];
 }
@@ -85,146 +79,43 @@ function createLogger(module) {
     error: (msg, data) => log("error", msg, data)
   };
 }
-var logger = createLogger("core");
+var LEVEL_PRIORITY, LOG_DIR, LOG_FILE, MAX_LOG_SIZE, _minLevel, logger;
+var init_logger = __esm(() => {
+  LEVEL_PRIORITY = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3
+  };
+  LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
+  LOG_FILE = join(LOG_DIR, "memory-hub.log");
+  MAX_LOG_SIZE = 5 * 1024 * 1024;
+  _minLevel = process.env.CMH_LOG_LEVEL || "info";
+  logger = createLogger("core");
+});
 
 // src/db/schema.ts
-var log = createLogger("schema");
+var exports_schema = {};
+__export(exports_schema, {
+  initDatabase: () => initDatabase,
+  getDbPath: () => getDbPath,
+  getDatabase: () => getDatabase,
+  closeDatabase: () => closeDatabase
+});
+import { Database } from "bun:sqlite";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
 function getDbPath() {
+  const override = process.env["CLAUDE_MEMORY_HUB_DB"];
+  if (override)
+    return override;
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
   }
   return join2(dir, "memory.db");
 }
-var CREATE_TABLES = `
--- Migration version tracking
-CREATE TABLE IF NOT EXISTS schema_versions (
-  version     INTEGER PRIMARY KEY,
-  applied_at  INTEGER NOT NULL
-);
-
--- L2: Session lifecycle
-CREATE TABLE IF NOT EXISTS sessions (
-  id          TEXT PRIMARY KEY,
-  project     TEXT NOT NULL,
-  started_at  INTEGER NOT NULL,
-  ended_at    INTEGER,
-  user_prompt TEXT,
-  status      TEXT NOT NULL DEFAULT 'active'
-    CHECK(status IN ('active', 'completed', 'failed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
-CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
-
--- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
-CREATE TABLE IF NOT EXISTS entities (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  project       TEXT NOT NULL,
-  tool_name     TEXT NOT NULL,
-  entity_type   TEXT NOT NULL
-    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
-  entity_value  TEXT NOT NULL,
-  context       TEXT,
-  importance    INTEGER NOT NULL DEFAULT 1
-    CHECK(importance BETWEEN 1 AND 5),
-  created_at    INTEGER NOT NULL,
-  prompt_number INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
-CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
-CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
-CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
-CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
-
--- L2: Manual session notes (from MCP memory_store tool or summarizer)
-CREATE TABLE IF NOT EXISTS session_notes (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  content     TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
-
--- L3: Cross-session persistent summaries
-CREATE TABLE IF NOT EXISTS long_term_summaries (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id    TEXT NOT NULL UNIQUE,
-  project       TEXT NOT NULL,
-  summary       TEXT NOT NULL,
-  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  token_savings INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
-CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
-
--- L3: FTS5 virtual table for semantic search across summaries
--- porter stemming + unicode61 handles English technical content well
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
-  session_id    UNINDEXED,
-  project,
-  summary,
-  files_touched,
-  decisions,
-  content       = 'long_term_summaries',
-  content_rowid = 'id',
-  tokenize      = 'porter unicode61'
-);
-
--- Keep FTS5 index in sync with content table via triggers
-CREATE TRIGGER IF NOT EXISTS fts_memories_insert
-  AFTER INSERT ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
-    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
-  END;
-
-CREATE TRIGGER IF NOT EXISTS fts_memories_update
-  AFTER UPDATE ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
-    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
-    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
-    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
-  END;
-
-CREATE TRIGGER IF NOT EXISTS fts_memories_delete
-  AFTER DELETE ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
-    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
-  END;
-
--- V2: Health monitoring
-CREATE TABLE IF NOT EXISTS health_checks (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  component   TEXT NOT NULL,
-  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
-  message     TEXT,
-  latency_ms  INTEGER,
-  checked_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
-
--- V2: TF-IDF vector index for semantic search
-CREATE TABLE IF NOT EXISTS tfidf_index (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
-  doc_id      INTEGER NOT NULL,
-  term        TEXT NOT NULL,
-  tf          REAL NOT NULL,
-  idf         REAL NOT NULL DEFAULT 0.0
-);
-
-CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
-CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
-`;
 function initDatabase(db) {
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA synchronous = NORMAL");
@@ -471,8 +362,72 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
     log.info("Migration v7 complete");
   }
+  if (currentVersion < 8) {
+    log.info("Applying migration v8: entity dedup + touch_count, injection source tracking");
+    db.transaction(() => {
+      db.run(`DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM long_term_summaries WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%'`);
+      try {
+        db.run("ALTER TABLE entities ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 1");
+      } catch {}
+      db.run(`
+        CREATE TEMP TABLE entity_dedup AS
+          SELECT MIN(id) AS keep_id, COUNT(*) AS c, MAX(importance) AS max_imp, MAX(created_at) AS last_seen
+          FROM entities GROUP BY session_id, entity_type, entity_value
+      `);
+      db.run(`
+        UPDATE entities SET
+          touch_count = (SELECT c FROM entity_dedup WHERE keep_id = entities.id),
+          importance  = (SELECT max_imp FROM entity_dedup WHERE keep_id = entities.id),
+          created_at  = (SELECT last_seen FROM entity_dedup WHERE keep_id = entities.id)
+        WHERE id IN (SELECT keep_id FROM entity_dedup WHERE c > 1)
+      `);
+      db.run(`DELETE FROM entities WHERE id NOT IN (SELECT keep_id FROM entity_dedup)`);
+      db.run(`DROP TABLE entity_dedup`);
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_dedup ON entities(session_id, entity_type, entity_value)`);
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN injected_at TEXT NOT NULL DEFAULT 'prompt'");
+      } catch {}
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN dedup_skipped INTEGER NOT NULL DEFAULT 0");
+      } catch {}
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (8, ?)", [Date.now()]);
+    log.info("Migration v8 complete");
+  }
+  if (currentVersion < 9) {
+    log.info("Applying migration v9: graph_edges for entity/code graph");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project    TEXT NOT NULL,
+        src_type   TEXT NOT NULL CHECK(src_type IN ('file','error','decision','session')),
+        src_key    TEXT NOT NULL,
+        dst_type   TEXT NOT NULL CHECK(dst_type IN ('file','error','decision','session')),
+        dst_key    TEXT NOT NULL,
+        rel        TEXT NOT NULL CHECK(rel IN ('co_edited','error_in','decided_about','session_touched','imports')),
+        weight     REAL NOT NULL DEFAULT 1,
+        first_seen INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL,
+        UNIQUE(project, src_type, src_key, dst_type, dst_key, rel)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_src ON graph_edges(project, src_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_dst ON graph_edges(project, dst_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_rel ON graph_edges(rel)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (9, ?)", [Date.now()]);
+    log.info("Migration v9 complete");
+  }
+  if (currentVersion < 10) {
+    log.info("Applying migration v10: injection effectiveness feedback");
+    try {
+      db.run("ALTER TABLE injection_log ADD COLUMN memory_tool_used INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
+    log.info("Migration v10 complete");
+  }
 }
-var _db = null;
 function getDatabase() {
   if (!_db) {
     const path = getDbPath();
@@ -481,8 +436,149 @@ function getDatabase() {
   }
   return _db;
 }
+function closeDatabase() {
+  if (_db) {
+    _db.close();
+    _db = null;
+  }
+}
+var log, CREATE_TABLES = `
+-- Migration version tracking
+CREATE TABLE IF NOT EXISTS schema_versions (
+  version     INTEGER PRIMARY KEY,
+  applied_at  INTEGER NOT NULL
+);
+
+-- L2: Session lifecycle
+CREATE TABLE IF NOT EXISTS sessions (
+  id          TEXT PRIMARY KEY,
+  project     TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  user_prompt TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+    CHECK(status IN ('active', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
+CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
+
+-- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
+CREATE TABLE IF NOT EXISTS entities (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  project       TEXT NOT NULL,
+  tool_name     TEXT NOT NULL,
+  entity_type   TEXT NOT NULL
+    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
+  entity_value  TEXT NOT NULL,
+  context       TEXT,
+  importance    INTEGER NOT NULL DEFAULT 1
+    CHECK(importance BETWEEN 1 AND 5),
+  created_at    INTEGER NOT NULL,
+  prompt_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
+CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
+CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
+CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
+
+-- L2: Manual session notes (from MCP memory_store tool or summarizer)
+CREATE TABLE IF NOT EXISTS session_notes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
+
+-- L3: Cross-session persistent summaries
+CREATE TABLE IF NOT EXISTS long_term_summaries (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL UNIQUE,
+  project       TEXT NOT NULL,
+  summary       TEXT NOT NULL,
+  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  token_savings INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
+CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
+
+-- L3: FTS5 virtual table for semantic search across summaries
+-- porter stemming + unicode61 handles English technical content well
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
+  session_id    UNINDEXED,
+  project,
+  summary,
+  files_touched,
+  decisions,
+  content       = 'long_term_summaries',
+  content_rowid = 'id',
+  tokenize      = 'porter unicode61'
+);
+
+-- Keep FTS5 index in sync with content table via triggers
+CREATE TRIGGER IF NOT EXISTS fts_memories_insert
+  AFTER INSERT ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_update
+  AFTER UPDATE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_delete
+  AFTER DELETE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+  END;
+
+-- V2: Health monitoring
+CREATE TABLE IF NOT EXISTS health_checks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  component   TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
+  message     TEXT,
+  latency_ms  INTEGER,
+  checked_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
+
+-- V2: TF-IDF vector index for semantic search
+CREATE TABLE IF NOT EXISTS tfidf_index (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+  doc_id      INTEGER NOT NULL,
+  term        TEXT NOT NULL,
+  tf          REAL NOT NULL,
+  idf         REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
+CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
+`, _db = null;
+var init_schema = __esm(() => {
+  init_logger();
+  log = createLogger("schema");
+});
 
 // src/db/session-store.ts
+init_schema();
+
 class SessionStore {
   db;
   constructor(db) {
@@ -516,7 +612,12 @@ class SessionStore {
         return -1;
     }
     const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, entity_type, entity_value) DO UPDATE SET
+         touch_count = touch_count + 1,
+         created_at  = excluded.created_at,
+         importance  = MAX(entities.importance, excluded.importance),
+         context     = COALESCE(excluded.context, entities.context)`, [
       entity.session_id,
       entity.project,
       entity.tool_name,
@@ -622,6 +723,8 @@ class SessionStore {
 }
 
 // src/db/long-term-store.ts
+init_schema();
+
 class LongTermStore {
   db;
   constructor(db) {
@@ -659,14 +762,15 @@ class LongTermStore {
     if (!safeQuery)
       return [];
     try {
-      return this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
+      const candidates = this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
                   lts.files_touched, lts.decisions, lts.errors_fixed,
                   lts.created_at, rank
            FROM fts_memories
            JOIN long_term_summaries lts ON lts.id = fts_memories.rowid
            WHERE fts_memories MATCH ?
            ORDER BY rank
-           LIMIT ?`).all(safeQuery, limit);
+           LIMIT ?`).all(safeQuery, Math.max(limit * 3, 9));
+      return candidates.map((r) => ({ ...r, rank: (r.rank ?? 0) * recencyBoost(r.created_at) })).sort((a, b) => a.rank - b.rank).slice(0, limit);
     } catch {
       return this.fallbackSearch(query, limit);
     }
@@ -696,6 +800,16 @@ class LongTermStore {
          WHERE files_touched LIKE ?
          ORDER BY created_at DESC LIMIT ?`).all(`%${escaped}%`, limit);
   }
+}
+function recencyBoost(createdAt) {
+  const ageDays = (Date.now() - createdAt) / 86400000;
+  if (ageDays < 7)
+    return 1.5;
+  if (ageDays < 30)
+    return 1.2;
+  if (ageDays < 90)
+    return 1;
+  return 0.8;
 }
 function sanitizeFtsQuery(query) {
   const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^()]/g, "")).filter((w) => w.length > 1);
@@ -744,6 +858,7 @@ function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
 }
 
 // src/summarizer/cli-summarizer.ts
+init_logger();
 var log2 = createLogger("cli-summarizer");
 var MAX_PROMPT_CHARS = 6000;
 var MAX_OUTPUT_CHARS = 2000;
@@ -865,6 +980,7 @@ async function attemptCliCall(prompt, timeout, attempt) {
 }
 
 // src/summarizer/session-summarizer.ts
+init_logger();
 var log3 = createLogger("session-summarizer");
 
 class SessionSummarizer {
@@ -1130,6 +1246,7 @@ function extractCodePatterns(content) {
 }
 
 // src/capture/privacy-filter.ts
+init_logger();
 var log4 = createLogger("privacy-filter");
 var DEFAULT_PRIVACY_CONFIG = {
   tag_stripping: true,
@@ -1470,6 +1587,7 @@ function extractFileFromBashCmd(cmd) {
 }
 
 // src/context/resource-tracker.ts
+init_schema();
 var SCHEMA_ADDITIONS = `
 CREATE TABLE IF NOT EXISTS resource_usage (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1555,6 +1673,7 @@ class ResourceTracker {
 }
 
 // src/context/resource-registry.ts
+init_logger();
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
@@ -2129,6 +2248,7 @@ function safeJson(text, fallback) {
 }
 
 // src/context/injection-validator.ts
+init_logger();
 var log6 = createLogger("injection-validator");
 var MAX_CHARS = 8000;
 
@@ -2184,6 +2304,8 @@ function mapResourceTypeToKind(type) {
 }
 
 // src/context/claude-md-tracker.ts
+init_schema();
+init_logger();
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
 import { homedir as homedir4 } from "os";
 import { join as join4, dirname, basename as basename2 } from "path";
@@ -2564,7 +2686,11 @@ function pickPrimary(s) {
   return null;
 }
 
+// src/context/resource-embedding-search.ts
+init_schema();
+
 // src/search/embedding-model.ts
+init_logger();
 var log8 = createLogger("embedding-model");
 var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 var EMBEDDING_DIM = 384;
@@ -2689,6 +2815,7 @@ function cosineSimilarity(a, b) {
 }
 
 // src/context/resource-matcher.ts
+init_logger();
 var log9 = createLogger("resource-matcher");
 var CONTEXT_BOOSTS = [
   { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
@@ -2882,6 +3009,7 @@ function cosine(a, b) {
 }
 
 // src/context/conversation-injector.ts
+init_schema();
 var MAX_MESSAGES_PER_SECTION = 6;
 var PER_MESSAGE_PREVIEW_CHARS = 240;
 function buildRecentConversationSection(currentSessionId, project, injectedDb) {
@@ -2928,6 +3056,7 @@ function compactWhitespace(s) {
 }
 
 // src/context/awareness-hint.ts
+init_schema();
 function buildAwarenessHint(options) {
   if (options.isCommandInvocation)
     return "";
@@ -2974,6 +3103,8 @@ function collectStats(db, project) {
 }
 
 // src/db/injection-telemetry.ts
+init_schema();
+init_logger();
 var log10 = createLogger("injection-telemetry");
 function logInjection(entry, db) {
   if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
@@ -2987,8 +3118,8 @@ function logInjection(entry, db) {
          memory_section_chars, claude_md_chars,
          recent_convo_chars, awareness_hint_chars,
          total_injection_chars,
-         history_intent_matched, timestamp
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         history_intent_matched, injected_at, dedup_skipped, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
       entry.session_id,
       entry.project,
       entry.intent,
@@ -3002,11 +3133,19 @@ function logInjection(entry, db) {
       entry.awareness_hint_chars,
       entry.total_injection_chars,
       entry.history_intent_matched ? 1 : 0,
+      entry.injected_at ?? "prompt",
+      entry.dedup_skipped ?? 0,
       Date.now()
     ]);
   } catch (err) {
     log10.warn("logInjection failed", { error: String(err) });
   }
+}
+function pruneInjectionLog(olderThanDays = 90, db) {
+  const d = db ?? getDatabase();
+  const cutoff = Date.now() - olderThanDays * 86400000;
+  const result = d.run(`DELETE FROM injection_log WHERE timestamp < ?`, [cutoff]);
+  return result.changes;
 }
 
 // src/capture/smart-truncate.ts
@@ -3048,6 +3187,43 @@ function capForRole(role) {
   return ROLE_CAPS[role];
 }
 
+// src/context/injection-state.ts
+import { existsSync as existsSync6, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3, unlinkSync } from "fs";
+import { join as join6 } from "path";
+import { homedir as homedir5 } from "os";
+var STATE_DIR = join6(homedir5(), ".claude-memory-hub", "proactive");
+function statePath(sessionId) {
+  return join6(STATE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}-inject.json`);
+}
+function loadInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync6(path)) {
+      const parsed = JSON.parse(readFileSync3(path, "utf-8"));
+      return {
+        baselineInjected: parsed.baselineInjected === true,
+        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : []
+      };
+    }
+  } catch {}
+  return { baselineInjected: false, injectedSummaryIds: [] };
+}
+function saveInjectionState(sessionId, state) {
+  try {
+    if (!existsSync6(STATE_DIR)) {
+      mkdirSync3(STATE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+function cleanupInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync6(path))
+      unlinkSync(path);
+  } catch {}
+}
+
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
@@ -3083,6 +3259,13 @@ async function handlePostToolUse(hook, project) {
   }
   if (hook.tool_name.startsWith("mcp__")) {
     tracker.trackUsage(hook.session_id, project, "mcp_tool", hook.tool_name);
+    if (hook.tool_name.startsWith("mcp__claude-memory-hub__")) {
+      try {
+        const { getDatabase: getDatabase2 } = await Promise.resolve().then(() => (init_schema(), exports_schema));
+        getDatabase2().run(`UPDATE injection_log SET memory_tool_used = 1
+           WHERE id = (SELECT id FROM injection_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1)`, [hook.session_id]);
+      } catch {}
+    }
   }
 }
 async function handleUserPromptSubmit(hook, project) {
@@ -3112,50 +3295,82 @@ async function handleUserPromptSubmit(hook, project) {
   const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
-  let results = ltStore.search(hook.prompt, 3);
-  let memoryHint = "";
-  if (results.length === 0) {
-    const recent = ltStore.getRecentSummariesAll(3);
-    if (recent.length > 0) {
-      results = recent.map((r) => ({
-        session_id: r.session_id,
-        project: r.project,
-        summary: r.summary,
-        files_touched: r.files_touched,
-        decisions: r.decisions,
-        errors_fixed: r.errors_fixed,
-        created_at: r.created_at,
-        rank: 0
-      }));
-      const total = ltStore.countSummaries();
-      memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+  const state = loadInjectionState(hook.session_id);
+  const baselineDone = state.baselineInjected;
+  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
+  let recentConvoSection = "";
+  let historyIntentMatched = false;
+  try {
+    if ((hook.prompt?.length ?? 0) >= 6) {
+      const intent = await detectHistoryIntent(hook.prompt ?? "");
+      historyIntentMatched = intent.match;
+      if (intent.match) {
+        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
+      }
     }
+  } catch {}
+  let results = [];
+  let memoryHint = "";
+  let dedupSkipped = 0;
+  if (!baselineDone || historyIntentMatched) {
+    results = ltStore.search(hook.prompt, 3);
+    if (results.length === 0) {
+      const recent = ltStore.getRecentSummariesAll(3);
+      if (recent.length > 0) {
+        results = recent.map((r) => ({
+          session_id: r.session_id,
+          project: r.project,
+          summary: r.summary,
+          files_touched: r.files_touched,
+          decisions: r.decisions,
+          errors_fixed: r.errors_fixed,
+          created_at: r.created_at,
+          rank: 0
+        }));
+        const total = ltStore.countSummaries();
+        memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+      }
+    }
+    const beforeDedup = results.length;
+    results = results.filter((r) => !state.injectedSummaryIds.includes(r.session_id));
+    dedupSkipped = beforeDedup - results.length;
   }
   const registry = getResourceRegistry();
-  registry.scan(hook.cwd);
-  const validator = new InjectionValidator(registry);
-  const loader = new SmartResourceLoader(registry);
-  const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
-  plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
-  plan.skipped = validator.filterAliveRecommendations(plan.skipped);
-  const advice = loader.formatContextAdvice(plan);
+  let advice = "";
   let mdSummary = "";
-  if (hook.cwd) {
+  let overheadWarning = "";
+  const validator = new InjectionValidator(registry);
+  if (!baselineDone) {
+    registry.scan(hook.cwd);
+    const loader = new SmartResourceLoader(registry);
+    const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
+    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+    advice = loader.formatContextAdvice(plan);
+    if (hook.cwd) {
+      try {
+        const mdTracker = new ClaudeMdTracker;
+        const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+        const tracker = new ResourceTracker;
+        for (const entry of mdEntries) {
+          tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+        }
+        const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+        mdSummary = mdTracker.formatForInjection(injectableEntries);
+      } catch {}
+    }
     try {
-      const mdTracker = new ClaudeMdTracker;
-      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      const tracker = new ResourceTracker;
-      for (const entry of mdEntries) {
-        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      const overhead = await registry.getOverheadReport(project);
+      const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+      if (unusedTokens > 1e4) {
+        const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+        overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
       }
-      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
-      mdSummary = mdTracker.formatForInjection(injectableEntries);
     } catch {}
   }
   let smartMatchSection = "";
   let smartMatchCount = 0;
   let smartMatchTopScore = 0;
-  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
   try {
     if (!promptAnalysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
       const matches = await matchResourcesForPrompt(hook.prompt ?? "", promptAnalysis, {
@@ -3169,37 +3384,24 @@ async function handleUserPromptSubmit(hook, project) {
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
-  let recentConvoSection = "";
-  let historyIntentMatched = false;
-  try {
-    if ((hook.prompt?.length ?? 0) >= 6) {
-      const intent = await detectHistoryIntent(hook.prompt ?? "");
-      historyIntentMatched = intent.match;
-      if (intent.match) {
-        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
-      }
-    }
-  } catch {}
-  let overheadWarning = "";
-  try {
-    const overhead = await registry.getOverheadReport(project);
-    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
-    if (unusedTokens > 1e4) {
-      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
-      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
-    }
-  } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
-  try {
-    awarenessHint = buildAwarenessHint({
-      project,
-      isCommandInvocation: promptAnalysis.is_command_invocation,
-      hasMemoryInjected: memorySection.length > 0,
-      hasRecentConvoInjected: recentConvoSection.length > 0
-    });
-  } catch {}
+  if (!baselineDone || memorySection.length > 0 || recentConvoSection.length > 0) {
+    try {
+      awarenessHint = buildAwarenessHint({
+        project,
+        isCommandInvocation: promptAnalysis.is_command_invocation,
+        hasMemoryInjected: memorySection.length > 0,
+        hasRecentConvoInjected: recentConvoSection.length > 0
+      });
+    } catch {}
+  }
   const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  state.baselineInjected = true;
+  if (results.length > 0) {
+    state.injectedSummaryIds = [...new Set([...state.injectedSummaryIds, ...results.map((r) => r.session_id)])];
+  }
+  saveInjectionState(hook.session_id, state);
   try {
     logInjection({
       session_id: hook.session_id,
@@ -3214,7 +3416,9 @@ async function handleUserPromptSubmit(hook, project) {
       recent_convo_chars: recentConvoSection.length,
       awareness_hint_chars: awarenessHint.length,
       total_injection_chars: safeContext.length,
-      history_intent_matched: historyIntentMatched
+      history_intent_matched: historyIntentMatched,
+      injected_at: baselineDone ? "prompt" : "first_prompt",
+      dedup_skipped: dedupSkipped
     });
   } catch {}
   return { additionalContext: safeContext };

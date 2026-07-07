@@ -6582,11 +6582,21 @@ var init_logger = __esm(() => {
 });
 
 // src/db/schema.ts
+var exports_schema = {};
+__export(exports_schema, {
+  initDatabase: () => initDatabase,
+  getDbPath: () => getDbPath,
+  getDatabase: () => getDatabase,
+  closeDatabase: () => closeDatabase
+});
 import { Database } from "bun:sqlite";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
 import { homedir as homedir2 } from "os";
 import { join as join2 } from "path";
 function getDbPath() {
+  const override = process.env["CLAUDE_MEMORY_HUB_DB"];
+  if (override)
+    return override;
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
@@ -6839,6 +6849,71 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
     log.info("Migration v7 complete");
   }
+  if (currentVersion < 8) {
+    log.info("Applying migration v8: entity dedup + touch_count, injection source tracking");
+    db.transaction(() => {
+      db.run(`DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM long_term_summaries WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%'`);
+      try {
+        db.run("ALTER TABLE entities ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 1");
+      } catch {}
+      db.run(`
+        CREATE TEMP TABLE entity_dedup AS
+          SELECT MIN(id) AS keep_id, COUNT(*) AS c, MAX(importance) AS max_imp, MAX(created_at) AS last_seen
+          FROM entities GROUP BY session_id, entity_type, entity_value
+      `);
+      db.run(`
+        UPDATE entities SET
+          touch_count = (SELECT c FROM entity_dedup WHERE keep_id = entities.id),
+          importance  = (SELECT max_imp FROM entity_dedup WHERE keep_id = entities.id),
+          created_at  = (SELECT last_seen FROM entity_dedup WHERE keep_id = entities.id)
+        WHERE id IN (SELECT keep_id FROM entity_dedup WHERE c > 1)
+      `);
+      db.run(`DELETE FROM entities WHERE id NOT IN (SELECT keep_id FROM entity_dedup)`);
+      db.run(`DROP TABLE entity_dedup`);
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_dedup ON entities(session_id, entity_type, entity_value)`);
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN injected_at TEXT NOT NULL DEFAULT 'prompt'");
+      } catch {}
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN dedup_skipped INTEGER NOT NULL DEFAULT 0");
+      } catch {}
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (8, ?)", [Date.now()]);
+    log.info("Migration v8 complete");
+  }
+  if (currentVersion < 9) {
+    log.info("Applying migration v9: graph_edges for entity/code graph");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project    TEXT NOT NULL,
+        src_type   TEXT NOT NULL CHECK(src_type IN ('file','error','decision','session')),
+        src_key    TEXT NOT NULL,
+        dst_type   TEXT NOT NULL CHECK(dst_type IN ('file','error','decision','session')),
+        dst_key    TEXT NOT NULL,
+        rel        TEXT NOT NULL CHECK(rel IN ('co_edited','error_in','decided_about','session_touched','imports')),
+        weight     REAL NOT NULL DEFAULT 1,
+        first_seen INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL,
+        UNIQUE(project, src_type, src_key, dst_type, dst_key, rel)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_src ON graph_edges(project, src_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_dst ON graph_edges(project, dst_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_rel ON graph_edges(rel)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (9, ?)", [Date.now()]);
+    log.info("Migration v9 complete");
+  }
+  if (currentVersion < 10) {
+    log.info("Applying migration v10: injection effectiveness feedback");
+    try {
+      db.run("ALTER TABLE injection_log ADD COLUMN memory_tool_used INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
+    log.info("Migration v10 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -6847,6 +6922,12 @@ function getDatabase() {
     initDatabase(_db);
   }
   return _db;
+}
+function closeDatabase() {
+  if (_db) {
+    _db.close();
+    _db = null;
+  }
 }
 var log, CREATE_TABLES = `
 -- Migration version tracking
@@ -7016,7 +7097,12 @@ class SessionStore {
         return -1;
     }
     const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, entity_type, entity_value) DO UPDATE SET
+         touch_count = touch_count + 1,
+         created_at  = excluded.created_at,
+         importance  = MAX(entities.importance, excluded.importance),
+         context     = COALESCE(excluded.context, entities.context)`, [
       entity.session_id,
       entity.project,
       entity.tool_name,
@@ -7202,14 +7288,15 @@ class LongTermStore {
     if (!safeQuery)
       return [];
     try {
-      return this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
+      const candidates = this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
                   lts.files_touched, lts.decisions, lts.errors_fixed,
                   lts.created_at, rank
            FROM fts_memories
            JOIN long_term_summaries lts ON lts.id = fts_memories.rowid
            WHERE fts_memories MATCH ?
            ORDER BY rank
-           LIMIT ?`).all(safeQuery, limit);
+           LIMIT ?`).all(safeQuery, Math.max(limit * 3, 9));
+      return candidates.map((r) => ({ ...r, rank: (r.rank ?? 0) * recencyBoost(r.created_at) })).sort((a, b) => a.rank - b.rank).slice(0, limit);
     } catch {
       return this.fallbackSearch(query, limit);
     }
@@ -7239,6 +7326,16 @@ class LongTermStore {
          WHERE files_touched LIKE ?
          ORDER BY created_at DESC LIMIT ?`).all(`%${escaped}%`, limit);
   }
+}
+function recencyBoost(createdAt) {
+  const ageDays = (Date.now() - createdAt) / 86400000;
+  if (ageDays < 7)
+    return 1.5;
+  if (ageDays < 30)
+    return 1.2;
+  if (ageDays < 90)
+    return 1;
+  return 0.8;
 }
 function sanitizeFtsQuery(query) {
   const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^()]/g, "")).filter((w) => w.length > 1);
@@ -9305,8 +9402,8 @@ function logInjection(entry, db) {
          memory_section_chars, claude_md_chars,
          recent_convo_chars, awareness_hint_chars,
          total_injection_chars,
-         history_intent_matched, timestamp
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         history_intent_matched, injected_at, dedup_skipped, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
       entry.session_id,
       entry.project,
       entry.intent,
@@ -9320,6 +9417,8 @@ function logInjection(entry, db) {
       entry.awareness_hint_chars,
       entry.total_injection_chars,
       entry.history_intent_matched ? 1 : 0,
+      entry.injected_at ?? "prompt",
+      entry.dedup_skipped ?? 0,
       Date.now()
     ]);
   } catch (err) {
@@ -9333,13 +9432,48 @@ var init_injection_telemetry = __esm(() => {
   log12 = createLogger("injection-telemetry");
 });
 
+// src/context/injection-state.ts
+import { existsSync as existsSync7, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3, unlinkSync } from "fs";
+import { join as join7 } from "path";
+import { homedir as homedir6 } from "os";
+function statePath(sessionId) {
+  return join7(STATE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}-inject.json`);
+}
+function loadInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync7(path)) {
+      const parsed = JSON.parse(readFileSync3(path, "utf-8"));
+      return {
+        baselineInjected: parsed.baselineInjected === true,
+        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : []
+      };
+    }
+  } catch {}
+  return { baselineInjected: false, injectedSummaryIds: [] };
+}
+function saveInjectionState(sessionId, state) {
+  try {
+    if (!existsSync7(STATE_DIR)) {
+      mkdirSync3(STATE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+var STATE_DIR;
+var init_injection_state = __esm(() => {
+  STATE_DIR = join7(homedir6(), ".claude-memory-hub", "proactive");
+});
+
 // src/capture/hook-handler.ts
 var exports_hook_handler = {};
 __export(exports_hook_handler, {
   projectFromCwd: () => projectFromCwd,
   handleUserPromptSubmit: () => handleUserPromptSubmit,
   handleSessionEnd: () => handleSessionEnd,
-  handlePostToolUse: () => handlePostToolUse
+  handlePostToolUse: () => handlePostToolUse,
+  fitWithinBudget: () => fitWithinBudget,
+  buildMemorySection: () => buildMemorySection
 });
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
@@ -9375,6 +9509,13 @@ async function handlePostToolUse(hook, project) {
   }
   if (hook.tool_name.startsWith("mcp__")) {
     tracker.trackUsage(hook.session_id, project, "mcp_tool", hook.tool_name);
+    if (hook.tool_name.startsWith("mcp__claude-memory-hub__")) {
+      try {
+        const { getDatabase: getDatabase2 } = await Promise.resolve().then(() => (init_schema(), exports_schema));
+        getDatabase2().run(`UPDATE injection_log SET memory_tool_used = 1
+           WHERE id = (SELECT id FROM injection_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1)`, [hook.session_id]);
+      } catch {}
+    }
   }
 }
 async function handleUserPromptSubmit(hook, project) {
@@ -9404,50 +9545,82 @@ async function handleUserPromptSubmit(hook, project) {
   const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
-  let results = ltStore.search(hook.prompt, 3);
-  let memoryHint = "";
-  if (results.length === 0) {
-    const recent = ltStore.getRecentSummariesAll(3);
-    if (recent.length > 0) {
-      results = recent.map((r) => ({
-        session_id: r.session_id,
-        project: r.project,
-        summary: r.summary,
-        files_touched: r.files_touched,
-        decisions: r.decisions,
-        errors_fixed: r.errors_fixed,
-        created_at: r.created_at,
-        rank: 0
-      }));
-      const total = ltStore.countSummaries();
-      memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+  const state = loadInjectionState(hook.session_id);
+  const baselineDone = state.baselineInjected;
+  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
+  let recentConvoSection = "";
+  let historyIntentMatched = false;
+  try {
+    if ((hook.prompt?.length ?? 0) >= 6) {
+      const intent = await detectHistoryIntent(hook.prompt ?? "");
+      historyIntentMatched = intent.match;
+      if (intent.match) {
+        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
+      }
     }
+  } catch {}
+  let results = [];
+  let memoryHint = "";
+  let dedupSkipped = 0;
+  if (!baselineDone || historyIntentMatched) {
+    results = ltStore.search(hook.prompt, 3);
+    if (results.length === 0) {
+      const recent = ltStore.getRecentSummariesAll(3);
+      if (recent.length > 0) {
+        results = recent.map((r) => ({
+          session_id: r.session_id,
+          project: r.project,
+          summary: r.summary,
+          files_touched: r.files_touched,
+          decisions: r.decisions,
+          errors_fixed: r.errors_fixed,
+          created_at: r.created_at,
+          rank: 0
+        }));
+        const total = ltStore.countSummaries();
+        memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+      }
+    }
+    const beforeDedup = results.length;
+    results = results.filter((r) => !state.injectedSummaryIds.includes(r.session_id));
+    dedupSkipped = beforeDedup - results.length;
   }
   const registry2 = getResourceRegistry();
-  registry2.scan(hook.cwd);
-  const validator = new InjectionValidator(registry2);
-  const loader = new SmartResourceLoader(registry2);
-  const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
-  plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
-  plan.skipped = validator.filterAliveRecommendations(plan.skipped);
-  const advice = loader.formatContextAdvice(plan);
+  let advice = "";
   let mdSummary = "";
-  if (hook.cwd) {
+  let overheadWarning = "";
+  const validator = new InjectionValidator(registry2);
+  if (!baselineDone) {
+    registry2.scan(hook.cwd);
+    const loader = new SmartResourceLoader(registry2);
+    const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
+    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+    advice = loader.formatContextAdvice(plan);
+    if (hook.cwd) {
+      try {
+        const mdTracker = new ClaudeMdTracker;
+        const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+        const tracker = new ResourceTracker;
+        for (const entry of mdEntries) {
+          tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+        }
+        const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+        mdSummary = mdTracker.formatForInjection(injectableEntries);
+      } catch {}
+    }
     try {
-      const mdTracker = new ClaudeMdTracker;
-      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      const tracker = new ResourceTracker;
-      for (const entry of mdEntries) {
-        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      const overhead = await registry2.getOverheadReport(project);
+      const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+      if (unusedTokens > 1e4) {
+        const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+        overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
       }
-      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
-      mdSummary = mdTracker.formatForInjection(injectableEntries);
     } catch {}
   }
   let smartMatchSection = "";
   let smartMatchCount = 0;
   let smartMatchTopScore = 0;
-  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
   try {
     if (!promptAnalysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
       const matches = await matchResourcesForPrompt(hook.prompt ?? "", promptAnalysis, {
@@ -9461,37 +9634,24 @@ async function handleUserPromptSubmit(hook, project) {
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
-  let recentConvoSection = "";
-  let historyIntentMatched = false;
-  try {
-    if ((hook.prompt?.length ?? 0) >= 6) {
-      const intent = await detectHistoryIntent(hook.prompt ?? "");
-      historyIntentMatched = intent.match;
-      if (intent.match) {
-        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
-      }
-    }
-  } catch {}
-  let overheadWarning = "";
-  try {
-    const overhead = await registry2.getOverheadReport(project);
-    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
-    if (unusedTokens > 1e4) {
-      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
-      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
-    }
-  } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
-  try {
-    awarenessHint = buildAwarenessHint({
-      project,
-      isCommandInvocation: promptAnalysis.is_command_invocation,
-      hasMemoryInjected: memorySection.length > 0,
-      hasRecentConvoInjected: recentConvoSection.length > 0
-    });
-  } catch {}
+  if (!baselineDone || memorySection.length > 0 || recentConvoSection.length > 0) {
+    try {
+      awarenessHint = buildAwarenessHint({
+        project,
+        isCommandInvocation: promptAnalysis.is_command_invocation,
+        hasMemoryInjected: memorySection.length > 0,
+        hasRecentConvoInjected: recentConvoSection.length > 0
+      });
+    } catch {}
+  }
   const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  state.baselineInjected = true;
+  if (results.length > 0) {
+    state.injectedSummaryIds = [...new Set([...state.injectedSummaryIds, ...results.map((r) => r.session_id)])];
+  }
+  saveInjectionState(hook.session_id, state);
   try {
     logInjection({
       session_id: hook.session_id,
@@ -9506,7 +9666,9 @@ async function handleUserPromptSubmit(hook, project) {
       recent_convo_chars: recentConvoSection.length,
       awareness_hint_chars: awarenessHint.length,
       total_injection_chars: safeContext.length,
-      history_intent_matched: historyIntentMatched
+      history_intent_matched: historyIntentMatched,
+      injected_at: baselineDone ? "prompt" : "first_prompt",
+      dedup_skipped: dedupSkipped
     });
   } catch {}
   return { additionalContext: safeContext };
@@ -9614,6 +9776,97 @@ var init_hook_handler = __esm(() => {
   init_injection_telemetry();
   init_smart_truncate();
   init_privacy_filter();
+  init_injection_state();
+});
+
+// src/graph/graph-queries.ts
+var exports_graph_queries = {};
+__export(exports_graph_queries, {
+  getNeighbors: () => getNeighbors,
+  getFileImpact: () => getFileImpact,
+  countEdges: () => countEdges
+});
+function getNeighbors(node, options = {}) {
+  const d = options.db ?? getDatabase();
+  const limit = Math.min(options.limit ?? 20, 100);
+  const pattern = `%${node.replace(/[%_]/g, "\\$&")}%`;
+  const conditions = ["(src_key LIKE ? OR dst_key LIKE ?)"];
+  const params = [pattern, pattern];
+  if (options.rel) {
+    conditions.push("rel = ?");
+    params.push(options.rel);
+  }
+  if (options.project) {
+    conditions.push("project = ?");
+    params.push(options.project);
+  }
+  params.push(limit);
+  return d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
+     FROM graph_edges
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY weight DESC, last_seen DESC
+     LIMIT ?`).all(...params);
+}
+function getFileImpact(file, db) {
+  const d = db ?? getDatabase();
+  const pattern = `%${file.replace(/[%_]/g, "\\$&")}%`;
+  const rows = d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
+     FROM graph_edges
+     WHERE src_key LIKE ? OR dst_key LIKE ?
+     ORDER BY weight DESC
+     LIMIT 200`).all(pattern, pattern);
+  const report = {
+    file,
+    co_edited: [],
+    errors: [],
+    decisions: [],
+    sessions: [],
+    imports: [],
+    imported_by: []
+  };
+  const isTarget = (k) => k.includes(file);
+  for (const e of rows) {
+    switch (e.rel) {
+      case "co_edited": {
+        const other = isTarget(e.src_key) ? e.dst_key : e.src_key;
+        if (report.co_edited.length < 10)
+          report.co_edited.push({ file: other, weight: round(e.weight) });
+        break;
+      }
+      case "error_in":
+        if (isTarget(e.dst_key) && report.errors.length < 10) {
+          report.errors.push({ error: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "decided_about":
+        if (isTarget(e.dst_key) && report.decisions.length < 10) {
+          report.decisions.push({ decision: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "session_touched":
+        if (isTarget(e.dst_key) && report.sessions.length < 10) {
+          report.sessions.push({ session_id: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "imports":
+        if (isTarget(e.src_key) && report.imports.length < 15)
+          report.imports.push(e.dst_key);
+        else if (isTarget(e.dst_key) && report.imported_by.length < 15)
+          report.imported_by.push(e.src_key);
+        break;
+    }
+  }
+  return report;
+}
+function countEdges(db) {
+  const d = db ?? getDatabase();
+  return d.query("SELECT COUNT(*) c FROM graph_edges").get()?.c ?? 0;
+}
+function round(n) {
+  return Math.round(n * 100) / 100;
+}
+var init_graph_queries = __esm(() => {
+  init_schema();
 });
 
 // node_modules/zod/v4/core/core.js
@@ -17781,6 +18034,61 @@ async function handleMemoryResourcesForPrompt(args) {
   return lines.join(`
 `);
 }
+async function handleMemoryGraph(args) {
+  const { getNeighbors: getNeighbors2, countEdges: countEdges2 } = await Promise.resolve().then(() => (init_graph_queries(), exports_graph_queries));
+  const edges = getNeighbors2(args.node, {
+    rel: args.rel,
+    project: args.project,
+    limit: args.limit
+  });
+  if (edges.length === 0) {
+    const total = countEdges2();
+    return total === 0 ? "Graph is empty. Run `claude-memory-hub graph build` to backfill from past sessions." : `No edges found for node "${args.node}"${args.rel ? ` with rel=${args.rel}` : ""}.`;
+  }
+  const lines = [`Graph edges for "${args.node}" (${edges.length}):`, ""];
+  for (const e of edges) {
+    lines.push(`- [${e.rel}] ${e.src_key} \u2192 ${e.dst_key} (w=${e.weight.toFixed(2)}, ${e.project})`);
+  }
+  return lines.join(`
+`);
+}
+async function handleMemoryImpact(args) {
+  const { getFileImpact: getFileImpact2 } = await Promise.resolve().then(() => (init_graph_queries(), exports_graph_queries));
+  const report = getFileImpact2(args.file);
+  const lines = [`Impact report for \`${args.file}\`:`, ""];
+  if (report.co_edited.length > 0) {
+    lines.push("**Usually edited together with:**");
+    for (const c of report.co_edited)
+      lines.push(`- ${c.file} (w=${c.weight})`);
+    lines.push("");
+  }
+  if (report.errors.length > 0) {
+    lines.push("**Past errors in this file:**");
+    for (const e of report.errors)
+      lines.push(`- ${e.error}`);
+    lines.push("");
+  }
+  if (report.decisions.length > 0) {
+    lines.push("**Decisions about this file:**");
+    for (const d of report.decisions)
+      lines.push(`- ${d.decision}`);
+    lines.push("");
+  }
+  if (report.imports.length > 0)
+    lines.push(`**Imports:** ${report.imports.join(", ")}`, "");
+  if (report.imported_by.length > 0)
+    lines.push(`**Imported by:** ${report.imported_by.join(", ")}`, "");
+  if (report.sessions.length > 0) {
+    lines.push(`**Touched by ${report.sessions.length} session(s)** \u2014 use \`memory_conversation\` with a session_id for details:`);
+    for (const s of report.sessions.slice(0, 5))
+      lines.push(`- ${s.session_id} (touches=${s.weight})`);
+  }
+  if (lines.length === 2) {
+    return `No graph data for \`${args.file}\`. Run \`claude-memory-hub graph build\` (sessions) or \`graph scan <repo>\` (imports) first.`;
+  }
+  return lines.join(`
+`);
+}
 
 // src/mcp/tool-definitions.ts
 var TOOL_DEFINITIONS = [
@@ -17932,6 +18240,31 @@ var TOOL_DEFINITIONS = [
       },
       required: ["prompt"]
     }
+  },
+  {
+    name: "memory_graph",
+    description: "Query the knowledge graph built from past sessions: which files were edited together (co_edited), " + "which errors happened in which files (error_in), which decisions concern which files (decided_about), " + "which sessions touched a file (session_touched), and static import relations (imports). " + "Pass a file path fragment, error text, or session id as node.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        node: { type: "string", description: "Node to look up (file path fragment, error text, or session id)" },
+        rel: { type: "string", enum: ["co_edited", "error_in", "decided_about", "session_touched", "imports"], description: "Optional relation filter" },
+        project: { type: "string", description: "Optional project filter" },
+        limit: { type: "number", description: "Max edges (default 20, max 100)" }
+      },
+      required: ["node"]
+    }
+  },
+  {
+    name: "memory_impact",
+    description: "One-shot impact view for a file: files usually edited together with it, past errors in it, " + "decisions about it, sessions that touched it, and its import relations. " + "Use before modifying a risky file to understand its blast radius and history.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        file: { type: "string", description: "File path (or unique fragment)" }
+      },
+      required: ["file"]
+    }
   }
 ];
 async function dispatchTool(name, args) {
@@ -17959,6 +18292,10 @@ async function dispatchTool(name, args) {
         return await handleMemoryHealth();
       case "memory_resources_for_prompt":
         return await handleMemoryResourcesForPrompt(args);
+      case "memory_graph":
+        return await handleMemoryGraph(args);
+      case "memory_impact":
+        return await handleMemoryImpact(args);
       default:
         return `Unknown tool: ${name}`;
     }

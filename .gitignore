@@ -4,6 +4,7 @@ hooks/
 tests/
 plans/
 tsconfig.json
+bunfig.toml
 install.sh
 .claude/
 

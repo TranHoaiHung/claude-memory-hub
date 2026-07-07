@@ -122,6 +122,9 @@ import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
 import { homedir as homedir2 } from "os";
 import { join as join2 } from "path";
 function getDbPath() {
+  const override = process.env["CLAUDE_MEMORY_HUB_DB"];
+  if (override)
+    return override;
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
@@ -373,6 +376,71 @@ function applyMigrations(db) {
     db.run(`CREATE INDEX IF NOT EXISTS idx_injection_log_intent  ON injection_log(intent, timestamp)`);
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
     log.info("Migration v7 complete");
+  }
+  if (currentVersion < 8) {
+    log.info("Applying migration v8: entity dedup + touch_count, injection source tracking");
+    db.transaction(() => {
+      db.run(`DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM long_term_summaries WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%'`);
+      try {
+        db.run("ALTER TABLE entities ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 1");
+      } catch {}
+      db.run(`
+        CREATE TEMP TABLE entity_dedup AS
+          SELECT MIN(id) AS keep_id, COUNT(*) AS c, MAX(importance) AS max_imp, MAX(created_at) AS last_seen
+          FROM entities GROUP BY session_id, entity_type, entity_value
+      `);
+      db.run(`
+        UPDATE entities SET
+          touch_count = (SELECT c FROM entity_dedup WHERE keep_id = entities.id),
+          importance  = (SELECT max_imp FROM entity_dedup WHERE keep_id = entities.id),
+          created_at  = (SELECT last_seen FROM entity_dedup WHERE keep_id = entities.id)
+        WHERE id IN (SELECT keep_id FROM entity_dedup WHERE c > 1)
+      `);
+      db.run(`DELETE FROM entities WHERE id NOT IN (SELECT keep_id FROM entity_dedup)`);
+      db.run(`DROP TABLE entity_dedup`);
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_dedup ON entities(session_id, entity_type, entity_value)`);
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN injected_at TEXT NOT NULL DEFAULT 'prompt'");
+      } catch {}
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN dedup_skipped INTEGER NOT NULL DEFAULT 0");
+      } catch {}
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (8, ?)", [Date.now()]);
+    log.info("Migration v8 complete");
+  }
+  if (currentVersion < 9) {
+    log.info("Applying migration v9: graph_edges for entity/code graph");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project    TEXT NOT NULL,
+        src_type   TEXT NOT NULL CHECK(src_type IN ('file','error','decision','session')),
+        src_key    TEXT NOT NULL,
+        dst_type   TEXT NOT NULL CHECK(dst_type IN ('file','error','decision','session')),
+        dst_key    TEXT NOT NULL,
+        rel        TEXT NOT NULL CHECK(rel IN ('co_edited','error_in','decided_about','session_touched','imports')),
+        weight     REAL NOT NULL DEFAULT 1,
+        first_seen INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL,
+        UNIQUE(project, src_type, src_key, dst_type, dst_key, rel)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_src ON graph_edges(project, src_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_dst ON graph_edges(project, dst_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_rel ON graph_edges(rel)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (9, ?)", [Date.now()]);
+    log.info("Migration v9 complete");
+  }
+  if (currentVersion < 10) {
+    log.info("Applying migration v10: injection effectiveness feedback");
+    try {
+      db.run("ALTER TABLE injection_log ADD COLUMN memory_tool_used INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
+    log.info("Migration v10 complete");
   }
 }
 function getDatabase() {
@@ -2008,7 +2076,7 @@ function checkHooks() {
   try {
     const settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
     const hooks = settings.hooks ?? {};
-    const expected = ["UserPromptSubmit", "PostToolUse", "PreCompact", "PostCompact", "Stop"];
+    const expected = ["SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"];
     const found = expected.filter((name) => {
       const entries = hooks[name] ?? [];
       return entries.some((e) => {
@@ -2025,14 +2093,15 @@ function checkHooks() {
       };
     }
     if (found.length < expected.length) {
+      const missing = expected.filter((e) => !found.includes(e));
       return {
         name: "hooks",
         status: "warn",
-        detail: `Only ${found.length}/${expected.length} hooks registered: ${found.join(", ")}`,
+        detail: `Only ${found.length}/${expected.length} hooks registered \u2014 missing: ${missing.join(", ")}`,
         fix: "Run: npx claude-memory-hub install (re-registers all hooks)"
       };
     }
-    return { name: "hooks", status: "ok", detail: `All 5 lifecycle hooks registered` };
+    return { name: "hooks", status: "ok", detail: `All ${expected.length} lifecycle hooks registered` };
   } catch (err) {
     return { name: "hooks", status: "fail", detail: String(err) };
   }
@@ -2044,6 +2113,8 @@ function checkDistFiles() {
     "cli.js",
     "hooks/post-tool-use.js",
     "hooks/user-prompt-submit.js",
+    "hooks/session-start.js",
+    "hooks/stop.js",
     "hooks/session-end.js",
     "hooks/pre-compact.js",
     "hooks/post-compact.js"
@@ -3055,11 +3126,685 @@ function aggregateInjections(options = {}) {
     }))
   };
 }
+function pruneInjectionLog(olderThanDays = 90, db) {
+  const d = db ?? getDatabase();
+  const cutoff = Date.now() - olderThanDays * 86400000;
+  const result = d.run(`DELETE FROM injection_log WHERE timestamp < ?`, [cutoff]);
+  return result.changes;
+}
 var log12, SINCE_LAST_30D = () => Date.now() - 30 * 86400000;
 var init_injection_telemetry = __esm(() => {
   init_schema();
   init_logger();
   log12 = createLogger("injection-telemetry");
+});
+
+// src/health/auto-cleanup.ts
+import { existsSync as existsSync9, readFileSync as readFileSync4, writeFileSync as writeFileSync2 } from "fs";
+import { join as join10 } from "path";
+import { homedir as homedir7 } from "os";
+function maybeRunAutoCleanup() {
+  try {
+    if (!isDue())
+      return;
+    const db = getDatabase();
+    const cutoff = Date.now() - RETENTION_DAYS * 86400000;
+    const entities = db.run(`DELETE FROM entities
+       WHERE created_at < ? AND importance <= 1 AND entity_type = 'file_read'`, [cutoff]).changes;
+    const injections = pruneInjectionLog(RETENTION_DAYS, db);
+    const healthChecks = db.run(`DELETE FROM health_checks WHERE checked_at < ?`, [cutoff]).changes;
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    writeFileSync2(MARKER_PATH, JSON.stringify({ last_run: Date.now() }), "utf-8");
+    log13.info("auto-cleanup complete", { entities, injections, healthChecks });
+  } catch (err) {
+    log13.warn("auto-cleanup failed", { error: String(err) });
+  }
+}
+function isDue() {
+  try {
+    if (!existsSync9(MARKER_PATH))
+      return true;
+    const parsed = JSON.parse(readFileSync4(MARKER_PATH, "utf-8"));
+    const last = typeof parsed.last_run === "number" ? parsed.last_run : 0;
+    return Date.now() - last > CADENCE_DAYS * 86400000;
+  } catch {
+    return true;
+  }
+}
+var log13, CADENCE_DAYS = 7, RETENTION_DAYS = 90, MARKER_PATH;
+var init_auto_cleanup = __esm(() => {
+  init_schema();
+  init_injection_telemetry();
+  init_logger();
+  log13 = createLogger("auto-cleanup");
+  MARKER_PATH = join10(homedir7(), ".claude-memory-hub", "last-cleanup.json");
+});
+
+// src/export/obsidian-notes.ts
+function safeName(name) {
+  return name.replace(/[\\/:*?"<>|#^[\]]/g, "-").trim() || "unknown";
+}
+function slug(text, maxWords = 6) {
+  return safeName(text.split(/\s+/).slice(0, maxWords).join(" ").toLowerCase()).slice(0, 60);
+}
+function fileNoteName(filePath) {
+  const base = safeName(filePath.split("/").pop() ?? "file");
+  return `${base}-${hash8(filePath)}.md`;
+}
+function isoDate(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+function hash8(text) {
+  let h = 5381;
+  for (let i = 0;i < text.length; i++) {
+    h = (h << 5) + h + text.charCodeAt(i) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+function parseJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+function renderSessionNote(row, d) {
+  const files = parseJson(row.files_touched, []);
+  const decisions = parseJson(row.decisions, []);
+  const errors = parseJson(row.errors_fixed, []);
+  const lines = [
+    "---",
+    `type: session`,
+    `project: "${row.project}"`,
+    `session_id: ${row.session_id}`,
+    `date: ${isoDate(row.created_at)}`,
+    `tags: [memory-hub, session]`,
+    "---",
+    "",
+    `# Session ${isoDate(row.created_at)} \u2014 [[${safeName(row.project)}]]`,
+    "",
+    row.summary,
+    ""
+  ];
+  if (files.length > 0) {
+    lines.push("## Files touched");
+    for (const f of files.slice(0, 15))
+      lines.push(`- ${fileLink(f, d)}`);
+    lines.push("");
+  }
+  if (decisions.length > 0) {
+    lines.push("## Decisions");
+    for (const dec of decisions.slice(0, 10))
+      lines.push(`- ${dec}`);
+    lines.push("");
+  }
+  if (errors.length > 0) {
+    lines.push("## Errors fixed");
+    for (const e of errors.slice(0, 10))
+      lines.push(`- ${e}`);
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+function renderDecisionNote(row) {
+  return [
+    "---",
+    `type: decision`,
+    `project: "${row.project}"`,
+    `importance: ${row.importance}`,
+    `date: ${isoDate(row.created_at)}`,
+    `session_id: ${row.session_id}`,
+    `tags: [memory-hub, decision]`,
+    "---",
+    "",
+    `# ${row.entity_value.slice(0, 120)}`,
+    "",
+    `Project: [[${safeName(row.project)}]]`,
+    "",
+    row.entity_value,
+    row.context ? `
+> ${row.context}` : "",
+    ""
+  ].join(`
+`);
+}
+function renderFileNote(f, d) {
+  const lines = [
+    "---",
+    `type: file`,
+    `project: "${f.project}"`,
+    `path: "${f.entity_value}"`,
+    `touches: ${f.touches}`,
+    `tags: [memory-hub, file]`,
+    "---",
+    "",
+    `# ${f.entity_value.split("/").pop()}`,
+    "",
+    `\`${f.entity_value}\``,
+    "",
+    `Project: [[${safeName(f.project)}]] \xB7 edited ${f.touches}\xD7 \xB7 last ${isoDate(f.last_seen)}`,
+    ""
+  ];
+  const edges = d.query(`SELECT src_key, dst_key, weight FROM graph_edges
+     WHERE rel = 'co_edited' AND (src_key = ? OR dst_key = ?)
+     ORDER BY weight DESC LIMIT 8`).all(f.entity_value, f.entity_value);
+  if (edges.length > 0) {
+    lines.push("## Usually edited together with");
+    for (const e of edges) {
+      const other = e.src_key === f.entity_value ? e.dst_key : e.src_key;
+      lines.push(`- [[${fileNoteName(other).replace(/\.md$/, "")}]] (${e.weight.toFixed(1)})`);
+    }
+    lines.push("");
+  }
+  const errors = d.query(`SELECT src_key FROM graph_edges WHERE rel = 'error_in' AND dst_key = ? ORDER BY weight DESC LIMIT 5`).all(f.entity_value);
+  if (errors.length > 0) {
+    lines.push("## Past errors here");
+    for (const e of errors)
+      lines.push(`- ${e.src_key}`);
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+function renderProjectMoc(project, d) {
+  const recent = d.query(`SELECT session_id, summary, created_at FROM long_term_summaries
+     WHERE project = ? ORDER BY created_at DESC LIMIT 20`).all(project);
+  const lines = [
+    "---",
+    `type: project`,
+    `tags: [memory-hub, project]`,
+    "---",
+    "",
+    `# ${project}`,
+    "",
+    "## Recent sessions"
+  ];
+  for (const s of recent) {
+    lines.push(`- [[${isoDate(s.created_at)} ${s.session_id.slice(0, 8)}]] \u2014 ${s.summary.slice(0, 100).replace(/\n/g, " ")}`);
+  }
+  lines.push("", `[[Home]]`);
+  return lines.join(`
+`);
+}
+function renderHome(projects) {
+  const lines = [
+    "---",
+    `tags: [memory-hub, moc]`,
+    "---",
+    "",
+    "# \uD83E\uDDE0 Memory Hub",
+    "",
+    "Knowledge exported from Claude Code sessions. One-way sync \u2014 edits here are not written back (yet).",
+    "",
+    "## Projects"
+  ];
+  for (const p of projects) {
+    lines.push(`- [[${safeName(p.project)}]] (${p.sessions} sessions)`);
+  }
+  return lines.join(`
+`);
+}
+function fileLink(filePath, d) {
+  try {
+    const hot = d.query(`SELECT COUNT(*) c FROM graph_edges WHERE rel = 'co_edited' AND (src_key = ? OR dst_key = ?)`).get(filePath, filePath);
+    if ((hot?.c ?? 0) > 0)
+      return `[[${fileNoteName(filePath).replace(/\.md$/, "")}]]`;
+  } catch {}
+  return `\`${filePath}\``;
+}
+
+// src/export/obsidian-exporter.ts
+var exports_obsidian_exporter = {};
+__export(exports_obsidian_exporter, {
+  syncObsidianVault: () => syncObsidianVault,
+  getVaultRoot: () => getVaultRoot
+});
+import { existsSync as existsSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync5, writeFileSync as writeFileSync3 } from "fs";
+import { join as join11 } from "path";
+import { homedir as homedir8 } from "os";
+function getVaultRoot() {
+  return process.env["CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT"] ?? DEFAULT_VAULT;
+}
+function syncObsidianVault(options = {}) {
+  const d = options.db ?? getDatabase();
+  const root = join11(getVaultRoot(), SUBFOLDER);
+  ensureDir(root);
+  ensureDir(join11(root, "_meta"));
+  const state = loadSyncState(root);
+  const result = {
+    vault: root,
+    sessions_exported: 0,
+    decisions_exported: 0,
+    file_notes_exported: 0,
+    projects: 0
+  };
+  const summaryRows = d.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+     FROM long_term_summaries
+     WHERE created_at > ?${options.project ? " AND project = ?" : ""}
+     ORDER BY created_at ASC`).all(...options.project ? [state.last_summary_at, options.project] : [state.last_summary_at]);
+  for (const row of summaryRows) {
+    const dir = join11(root, "Projects", safeName(row.project), "Sessions");
+    ensureDir(dir);
+    writeFileSync3(join11(dir, `${isoDate(row.created_at)} ${row.session_id.slice(0, 8)}.md`), renderSessionNote(row, d), "utf-8");
+    result.sessions_exported++;
+    state.last_summary_at = Math.max(state.last_summary_at, row.created_at);
+  }
+  const decisionRows = d.query(`SELECT id, project, entity_value, context, importance, created_at, session_id
+     FROM entities
+     WHERE entity_type IN ('decision','observation') AND importance >= 3 AND created_at > ?
+       ${options.project ? "AND project = ?" : ""}
+     ORDER BY created_at ASC LIMIT 500`).all(...options.project ? [state.last_decision_at, options.project] : [state.last_decision_at]);
+  for (const row of decisionRows) {
+    const dir = join11(root, "Projects", safeName(row.project), "Decisions");
+    ensureDir(dir);
+    writeFileSync3(join11(dir, `${row.id} ${slug(row.entity_value)}.md`), renderDecisionNote(row), "utf-8");
+    result.decisions_exported++;
+    state.last_decision_at = Math.max(state.last_decision_at, row.created_at);
+  }
+  const hotFiles = d.query(`SELECT project, entity_value, SUM(touch_count) touches, MAX(created_at) last_seen
+     FROM entities
+     WHERE entity_type IN ('file_modified','file_created')
+       ${options.project ? "AND project = ?" : ""}
+     GROUP BY project, entity_value
+     HAVING touches >= ?
+     ORDER BY touches DESC LIMIT 300`).all(...options.project ? [options.project, FILE_NOTE_MIN_TOUCHES] : [FILE_NOTE_MIN_TOUCHES]);
+  for (const f of hotFiles) {
+    const dir = join11(root, "Files", safeName(f.project));
+    ensureDir(dir);
+    writeFileSync3(join11(dir, fileNoteName(f.entity_value)), renderFileNote(f, d), "utf-8");
+    result.file_notes_exported++;
+  }
+  const projects = d.query(`SELECT project, COUNT(*) sessions FROM long_term_summaries GROUP BY project ORDER BY MAX(created_at) DESC`).all();
+  result.projects = projects.length;
+  for (const p of projects) {
+    if (options.project && p.project !== options.project)
+      continue;
+    const dir = join11(root, "Projects", safeName(p.project));
+    if (!existsSync10(dir))
+      continue;
+    writeFileSync3(join11(dir, `${safeName(p.project)}.md`), renderProjectMoc(p.project, d), "utf-8");
+  }
+  writeFileSync3(join11(root, "Home.md"), renderHome(projects), "utf-8");
+  saveSyncState(root, state);
+  log14.info("obsidian sync complete", { ...result });
+  return result;
+}
+function loadSyncState(root) {
+  try {
+    const parsed = JSON.parse(readFileSync5(join11(root, "_meta", "sync-state.json"), "utf-8"));
+    return {
+      last_summary_at: parsed.last_summary_at ?? 0,
+      last_decision_at: parsed.last_decision_at ?? 0
+    };
+  } catch {
+    return { last_summary_at: 0, last_decision_at: 0 };
+  }
+}
+function saveSyncState(root, state) {
+  writeFileSync3(join11(root, "_meta", "sync-state.json"), JSON.stringify(state, null, 2), "utf-8");
+}
+function ensureDir(dir) {
+  if (!existsSync10(dir))
+    mkdirSync3(dir, { recursive: true });
+}
+var log14, DEFAULT_VAULT, SUBFOLDER = "MemoryHub", FILE_NOTE_MIN_TOUCHES = 3;
+var init_obsidian_exporter = __esm(() => {
+  init_schema();
+  init_logger();
+  log14 = createLogger("obsidian-exporter");
+  DEFAULT_VAULT = join11(homedir8(), "Documents", "ObsidianVault");
+});
+
+// src/cli/daemon.ts
+var exports_daemon = {};
+__export(exports_daemon, {
+  runMaintenance: () => runMaintenance,
+  installDaemon: () => installDaemon
+});
+import { existsSync as existsSync11, mkdirSync as mkdirSync4, writeFileSync as writeFileSync4 } from "fs";
+import { join as join12 } from "path";
+import { homedir as homedir9 } from "os";
+import { spawnSync as spawnSync3 } from "child_process";
+function runMaintenance() {
+  console.log("claude-memory-hub maintenance");
+  maybeRunAutoCleanup();
+  console.log("  \u2713 retention check (7-day cadence)");
+  try {
+    getDatabase().run("PRAGMA wal_checkpoint(TRUNCATE)");
+    console.log("  \u2713 WAL checkpoint");
+  } catch (err) {
+    console.log(`  \u2717 WAL checkpoint: ${err}`);
+  }
+  try {
+    const r = syncObsidianVault({});
+    console.log(`  \u2713 obsidian sync \u2192 ${r.vault} (${r.sessions_exported} new sessions, ${r.decisions_exported} decisions)`);
+  } catch (err) {
+    console.log(`  \u2717 obsidian sync: ${err}`);
+  }
+}
+function installDaemon(bunBin) {
+  if (process.platform !== "darwin") {
+    console.log("install-daemon currently supports macOS (launchd) only.");
+    return;
+  }
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bunBin}</string>
+    <string>run</string>
+    <string>${join12(STABLE_DIR2, "dist", "cli.js")}</string>
+    <string>maintenance</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key><string>${join12(STABLE_DIR2, "logs", "maintenance.log")}</string>
+  <key>StandardErrorPath</key><string>${join12(STABLE_DIR2, "logs", "maintenance.log")}</string>
+</dict>
+</plist>
+`;
+  const dir = join12(homedir9(), "Library", "LaunchAgents");
+  if (!existsSync11(dir))
+    mkdirSync4(dir, { recursive: true });
+  writeFileSync4(PLIST_PATH, plist, "utf-8");
+  spawnSync3("launchctl", ["unload", PLIST_PATH], { encoding: "utf-8" });
+  const load = spawnSync3("launchctl", ["load", PLIST_PATH], { encoding: "utf-8" });
+  if (load.status === 0) {
+    console.log(`Daemon installed: ${PLIST_PATH}`);
+    console.log(`Runs daily at 03:30 \u2014 retention, WAL checkpoint, Obsidian sync (vault: ${getVaultRoot()}).`);
+    console.log("Remove with: launchctl unload " + PLIST_PATH);
+  } else {
+    console.log(`launchctl load failed: ${load.stderr || load.stdout}`);
+  }
+}
+var LABEL = "com.kihutech.claude-memory-hub", PLIST_PATH, STABLE_DIR2;
+var init_daemon = __esm(() => {
+  init_schema();
+  init_auto_cleanup();
+  init_obsidian_exporter();
+  PLIST_PATH = join12(homedir9(), "Library", "LaunchAgents", `${LABEL}.plist`);
+  STABLE_DIR2 = join12(homedir9(), ".claude-memory-hub");
+});
+
+// src/graph/edge-builder.ts
+var exports_edge_builder = {};
+__export(exports_edge_builder, {
+  buildSessionEdges: () => buildSessionEdges,
+  backfillAllSessions: () => backfillAllSessions
+});
+function buildSessionEdges(sessionId, project, db) {
+  const d = db ?? getDatabase();
+  let edges = 0;
+  const entities = d.query("SELECT * FROM entities WHERE session_id = ? ORDER BY prompt_number ASC, created_at ASC").all(sessionId);
+  if (entities.length === 0)
+    return { edges: 0 };
+  const upsert = d.prepare(`INSERT INTO graph_edges(project, src_type, src_key, dst_type, dst_key, rel, weight, first_seen, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project, src_type, src_key, dst_type, dst_key, rel) DO UPDATE SET
+       weight    = weight + excluded.weight,
+       last_seen = excluded.last_seen`);
+  const now = Date.now();
+  const modified = entities.filter((e) => e.entity_type === "file_modified" || e.entity_type === "file_created").sort((a, b) => (b.touch_count ?? 1) - (a.touch_count ?? 1)).slice(0, MAX_FILES_PER_SESSION);
+  d.transaction(() => {
+    for (let i = 0;i < modified.length; i++) {
+      for (let j = i + 1;j < modified.length; j++) {
+        const a = modified[i];
+        const b = modified[j];
+        if (a.entity_value === b.entity_value)
+          continue;
+        const dist = Math.abs(a.prompt_number - b.prompt_number);
+        if (dist > PROMPT_WINDOW)
+          continue;
+        const [src, dst] = a.entity_value < b.entity_value ? [a.entity_value, b.entity_value] : [b.entity_value, a.entity_value];
+        upsert.run(project, "file", key(src), "file", key(dst), "co_edited", 1 / (1 + dist), now, now);
+        edges++;
+      }
+    }
+    const errors = entities.filter((e) => e.entity_type === "error");
+    for (const err of errors) {
+      const target = [...modified].filter((f) => f.prompt_number <= err.prompt_number).sort((x, y) => y.prompt_number - x.prompt_number)[0];
+      if (!target)
+        continue;
+      upsert.run(project, "error", key(err.entity_value), "file", key(target.entity_value), "error_in", 1, now, now);
+      edges++;
+    }
+    const decisions = entities.filter((e) => (e.entity_type === "decision" || e.entity_type === "observation") && e.importance >= 3).slice(0, 10);
+    for (const dec of decisions) {
+      let linked = 0;
+      for (const f of modified) {
+        if (Math.abs(f.prompt_number - dec.prompt_number) > 1)
+          continue;
+        if (++linked > 5)
+          break;
+        upsert.run(project, "decision", key(dec.entity_value), "file", key(f.entity_value), "decided_about", 1, now, now);
+        edges++;
+      }
+    }
+    const touched = entities.filter((e) => e.entity_type.startsWith("file_"));
+    for (const f of touched) {
+      upsert.run(project, "session", sessionId, "file", key(f.entity_value), "session_touched", f.touch_count ?? 1, now, now);
+      edges++;
+    }
+  })();
+  return { edges };
+}
+function backfillAllSessions(db) {
+  const d = db ?? getDatabase();
+  const sessions = d.query("SELECT id, project FROM sessions").all();
+  let total = 0;
+  for (const s of sessions) {
+    try {
+      total += buildSessionEdges(s.id, s.project, d).edges;
+    } catch (err) {
+      log15.warn("edge build failed for session", { session: s.id, error: String(err) });
+    }
+  }
+  log15.info("graph backfill complete", { sessions: sessions.length, edges: total });
+  return { sessions: sessions.length, edges: total };
+}
+function key(value) {
+  return value.length <= KEY_MAX_CHARS ? value : value.slice(0, KEY_MAX_CHARS);
+}
+var log15, PROMPT_WINDOW = 3, MAX_FILES_PER_SESSION = 40, KEY_MAX_CHARS = 160;
+var init_edge_builder = __esm(() => {
+  init_schema();
+  init_logger();
+  log15 = createLogger("edge-builder");
+});
+
+// src/graph/code-scanner.ts
+var exports_code_scanner = {};
+__export(exports_code_scanner, {
+  scanRepoImports: () => scanRepoImports
+});
+import { readdirSync as readdirSync2, readFileSync as readFileSync6, statSync as statSync6, existsSync as existsSync12 } from "fs";
+import { join as join13, dirname, resolve, extname } from "path";
+function scanRepoImports(repoPath, project, db) {
+  const d = db ?? getDatabase();
+  const files = collectFiles(repoPath);
+  const upsert = d.prepare(`INSERT INTO graph_edges(project, src_type, src_key, dst_type, dst_key, rel, weight, first_seen, last_seen)
+     VALUES (?, 'file', ?, 'file', ?, 'imports', 1, ?, ?)
+     ON CONFLICT(project, src_type, src_key, dst_type, dst_key, rel) DO UPDATE SET
+       last_seen = excluded.last_seen`);
+  const now = Date.now();
+  let edges = 0;
+  d.transaction(() => {
+    d.run("DELETE FROM graph_edges WHERE project = ? AND rel = 'imports'", [project]);
+    for (const file of files) {
+      let content;
+      try {
+        content = readFileSync6(file, "utf-8");
+      } catch {
+        continue;
+      }
+      for (const pattern of IMPORT_PATTERNS) {
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(content)) !== null) {
+          const spec = match[1];
+          if (!spec || !spec.startsWith("."))
+            continue;
+          const target = resolveImport(file, spec);
+          if (target) {
+            upsert.run(project, file, target, now, now);
+            edges++;
+          }
+        }
+      }
+    }
+  })();
+  log16.info("import scan complete", { repo: repoPath, files: files.length, edges });
+  return { files_scanned: files.length, edges };
+}
+function collectFiles(root, acc = []) {
+  if (acc.length >= MAX_FILES)
+    return acc;
+  let entries;
+  try {
+    entries = readdirSync2(root);
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    if (acc.length >= MAX_FILES)
+      break;
+    if (entry.startsWith(".") || SKIP_DIRS.has(entry))
+      continue;
+    const full = join13(root, entry);
+    try {
+      const stat = statSync6(full);
+      if (stat.isDirectory()) {
+        collectFiles(full, acc);
+      } else if (SCAN_EXTENSIONS.has(extname(entry))) {
+        acc.push(full);
+      }
+    } catch {}
+  }
+  return acc;
+}
+function resolveImport(fromFile, spec) {
+  const base = resolve(dirname(fromFile), spec);
+  for (const suffix of RESOLVE_SUFFIXES) {
+    const candidate = base + suffix;
+    try {
+      if (existsSync12(candidate) && statSync6(candidate).isFile())
+        return candidate;
+    } catch {}
+  }
+  return null;
+}
+var log16, SCAN_EXTENSIONS, SKIP_DIRS, MAX_FILES = 5000, IMPORT_PATTERNS, RESOLVE_SUFFIXES;
+var init_code_scanner = __esm(() => {
+  init_schema();
+  init_logger();
+  log16 = createLogger("code-scanner");
+  SCAN_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".swift", ".kt", ".kts", ".java", ".py", ".dart"]);
+  SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "Pods", "vendor", ".gradle", "DerivedData", "__pycache__", ".dart_tool", "coverage"]);
+  IMPORT_PATTERNS = [
+    /(?:import|export)\s+[^"']*?from\s+["']([^"']+)["']/g,
+    /import\s+["']([^"']+)["']/g,
+    /require\(\s*["']([^"']+)["']\s*\)/g,
+    /^\s*import\s+([A-Za-z0-9_.]+)/gm,
+    /^\s*from\s+([A-Za-z0-9_.]+)\s+import/gm
+  ];
+  RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", "/index.ts", "/index.js", ".dart", ".py"];
+});
+
+// src/graph/graph-queries.ts
+var exports_graph_queries = {};
+__export(exports_graph_queries, {
+  getNeighbors: () => getNeighbors,
+  getFileImpact: () => getFileImpact,
+  countEdges: () => countEdges
+});
+function getNeighbors(node, options = {}) {
+  const d = options.db ?? getDatabase();
+  const limit = Math.min(options.limit ?? 20, 100);
+  const pattern = `%${node.replace(/[%_]/g, "\\$&")}%`;
+  const conditions = ["(src_key LIKE ? OR dst_key LIKE ?)"];
+  const params = [pattern, pattern];
+  if (options.rel) {
+    conditions.push("rel = ?");
+    params.push(options.rel);
+  }
+  if (options.project) {
+    conditions.push("project = ?");
+    params.push(options.project);
+  }
+  params.push(limit);
+  return d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
+     FROM graph_edges
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY weight DESC, last_seen DESC
+     LIMIT ?`).all(...params);
+}
+function getFileImpact(file, db) {
+  const d = db ?? getDatabase();
+  const pattern = `%${file.replace(/[%_]/g, "\\$&")}%`;
+  const rows = d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
+     FROM graph_edges
+     WHERE src_key LIKE ? OR dst_key LIKE ?
+     ORDER BY weight DESC
+     LIMIT 200`).all(pattern, pattern);
+  const report = {
+    file,
+    co_edited: [],
+    errors: [],
+    decisions: [],
+    sessions: [],
+    imports: [],
+    imported_by: []
+  };
+  const isTarget = (k) => k.includes(file);
+  for (const e of rows) {
+    switch (e.rel) {
+      case "co_edited": {
+        const other = isTarget(e.src_key) ? e.dst_key : e.src_key;
+        if (report.co_edited.length < 10)
+          report.co_edited.push({ file: other, weight: round(e.weight) });
+        break;
+      }
+      case "error_in":
+        if (isTarget(e.dst_key) && report.errors.length < 10) {
+          report.errors.push({ error: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "decided_about":
+        if (isTarget(e.dst_key) && report.decisions.length < 10) {
+          report.decisions.push({ decision: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "session_touched":
+        if (isTarget(e.dst_key) && report.sessions.length < 10) {
+          report.sessions.push({ session_id: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "imports":
+        if (isTarget(e.src_key) && report.imports.length < 15)
+          report.imports.push(e.dst_key);
+        else if (isTarget(e.dst_key) && report.imported_by.length < 15)
+          report.imported_by.push(e.src_key);
+        break;
+    }
+  }
+  return report;
+}
+function countEdges(db) {
+  const d = db ?? getDatabase();
+  return d.query("SELECT COUNT(*) c FROM graph_edges").get()?.c ?? 0;
+}
+function round(n) {
+  return Math.round(n * 100) / 100;
+}
+var init_graph_queries = __esm(() => {
+  init_schema();
 });
 
 // src/cli/stats.ts
@@ -3179,9 +3924,9 @@ var init_stats = __esm(() => {
 });
 
 // src/cli/main.ts
-import { existsSync as existsSync9, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync2, readdirSync as readdirSync2, unlinkSync } from "fs";
-import { homedir as homedir7 } from "os";
-import { join as join10, resolve, dirname } from "path";
+import { existsSync as existsSync13, mkdirSync as mkdirSync5, readFileSync as readFileSync7, writeFileSync as writeFileSync5, readdirSync as readdirSync3, unlinkSync } from "fs";
+import { homedir as homedir10 } from "os";
+import { join as join14, resolve as resolve2, dirname as dirname2 } from "path";
 
 // src/migration/claude-mem-migrator.ts
 init_schema();
@@ -3473,102 +4218,102 @@ function buildSummaryText(s) {
 }
 
 // src/cli/main.ts
-import { spawnSync as spawnSync3 } from "child_process";
-var CLAUDE_DIR = join10(homedir7(), ".claude");
-var SETTINGS_PATH2 = join10(CLAUDE_DIR, "settings.json");
-var COMMANDS_DIR = join10(CLAUDE_DIR, "commands");
-var PKG_DIR = resolve(dirname(import.meta.dir));
-var STABLE_DIR2 = join10(homedir7(), ".claude-memory-hub");
+import { spawnSync as spawnSync4 } from "child_process";
+var CLAUDE_DIR = join14(homedir10(), ".claude");
+var SETTINGS_PATH2 = join14(CLAUDE_DIR, "settings.json");
+var COMMANDS_DIR = join14(CLAUDE_DIR, "commands");
+var PKG_DIR = resolve2(dirname2(import.meta.dir));
+var STABLE_DIR3 = join14(homedir10(), ".claude-memory-hub");
 function shellPath(p) {
   const normalized = p.replace(/\\/g, "/");
   return normalized.includes(" ") ? `"${normalized}"` : normalized;
 }
 function getBunPath() {
-  const result = spawnSync3(process.platform === "win32" ? "where" : "which", ["bun"], {
+  const result = spawnSync4(process.platform === "win32" ? "where" : "which", ["bun"], {
     encoding: "utf-8"
   });
   const resolved = result.stdout?.trim().split(/\r?\n/)[0]?.trim();
-  if (resolved && existsSync9(resolved))
+  if (resolved && existsSync13(resolved))
     return shellPath(resolved);
   const candidates = [
-    join10(homedir7(), ".bun", "bin", "bun"),
-    join10(homedir7(), ".bun", "bin", "bun.exe")
+    join14(homedir10(), ".bun", "bin", "bun"),
+    join14(homedir10(), ".bun", "bin", "bun.exe")
   ];
   for (const c of candidates) {
-    if (existsSync9(c))
+    if (existsSync13(c))
       return shellPath(c);
   }
   return "bun";
 }
 function copyDistToStableDir() {
-  const srcDist = join10(PKG_DIR, "dist");
-  const destDist = join10(STABLE_DIR2, "dist");
-  if (!existsSync9(srcDist)) {
+  const srcDist = join14(PKG_DIR, "dist");
+  const destDist = join14(STABLE_DIR3, "dist");
+  if (!existsSync13(srcDist)) {
     throw new Error(`dist/ not found at ${srcDist}. Run 'bun run build:all' first.`);
   }
-  const destHooks = join10(destDist, "hooks");
-  mkdirSync3(destHooks, { recursive: true });
-  for (const file of readdirSync2(srcDist)) {
+  const destHooks = join14(destDist, "hooks");
+  mkdirSync5(destHooks, { recursive: true });
+  for (const file of readdirSync3(srcDist)) {
     if (file.endsWith(".js")) {
-      const src = join10(srcDist, file);
-      const dest = join10(destDist, file);
-      writeFileSync2(dest, readFileSync4(src));
+      const src = join14(srcDist, file);
+      const dest = join14(destDist, file);
+      writeFileSync5(dest, readFileSync7(src));
     }
   }
-  const srcHooks = join10(srcDist, "hooks");
-  if (existsSync9(srcHooks)) {
-    for (const file of readdirSync2(srcHooks)) {
+  const srcHooks = join14(srcDist, "hooks");
+  if (existsSync13(srcHooks)) {
+    for (const file of readdirSync3(srcHooks)) {
       if (file.endsWith(".js")) {
-        const src = join10(srcHooks, file);
-        const dest = join10(destHooks, file);
-        writeFileSync2(dest, readFileSync4(src));
+        const src = join14(srcHooks, file);
+        const dest = join14(destHooks, file);
+        writeFileSync5(dest, readFileSync7(src));
       }
     }
   }
-  const srcCmds = join10(PKG_DIR, "commands");
-  if (existsSync9(srcCmds)) {
-    const destCmds = join10(STABLE_DIR2, "commands");
-    mkdirSync3(destCmds, { recursive: true });
-    for (const file of readdirSync2(srcCmds)) {
+  const srcCmds = join14(PKG_DIR, "commands");
+  if (existsSync13(srcCmds)) {
+    const destCmds = join14(STABLE_DIR3, "commands");
+    mkdirSync5(destCmds, { recursive: true });
+    for (const file of readdirSync3(srcCmds)) {
       if (file.endsWith(".md")) {
-        writeFileSync2(join10(destCmds, file), readFileSync4(join10(srcCmds, file)));
+        writeFileSync5(join14(destCmds, file), readFileSync7(join14(srcCmds, file)));
       }
     }
   }
 }
 function getHookPath(hookName) {
-  return shellPath(join10(STABLE_DIR2, "dist", "hooks", `${hookName}.js`));
+  return shellPath(join14(STABLE_DIR3, "dist", "hooks", `${hookName}.js`));
 }
 function getMcpServerPath() {
-  return shellPath(join10(STABLE_DIR2, "dist", "index.js"));
+  return shellPath(join14(STABLE_DIR3, "dist", "index.js"));
 }
 function loadSettings() {
-  if (!existsSync9(SETTINGS_PATH2))
+  if (!existsSync13(SETTINGS_PATH2))
     return {};
   try {
-    return JSON.parse(readFileSync4(SETTINGS_PATH2, "utf-8"));
+    return JSON.parse(readFileSync7(SETTINGS_PATH2, "utf-8"));
   } catch {
     return {};
   }
 }
 function saveSettings(settings) {
-  if (!existsSync9(CLAUDE_DIR))
-    mkdirSync3(CLAUDE_DIR, { recursive: true });
-  writeFileSync2(SETTINGS_PATH2, JSON.stringify(settings, null, 2) + `
+  if (!existsSync13(CLAUDE_DIR))
+    mkdirSync5(CLAUDE_DIR, { recursive: true });
+  writeFileSync5(SETTINGS_PATH2, JSON.stringify(settings, null, 2) + `
 `);
 }
-var CLAUDE_JSON_PATH = join10(homedir7(), ".claude.json");
+var CLAUDE_JSON_PATH = join14(homedir10(), ".claude.json");
 function loadClaudeJson() {
-  if (!existsSync9(CLAUDE_JSON_PATH))
+  if (!existsSync13(CLAUDE_JSON_PATH))
     return {};
   try {
-    return JSON.parse(readFileSync4(CLAUDE_JSON_PATH, "utf-8"));
+    return JSON.parse(readFileSync7(CLAUDE_JSON_PATH, "utf-8"));
   } catch {
     return {};
   }
 }
 function saveClaudeJson(data) {
-  writeFileSync2(CLAUDE_JSON_PATH, JSON.stringify(data, null, 2) + `
+  writeFileSync5(CLAUDE_JSON_PATH, JSON.stringify(data, null, 2) + `
 `);
 }
 function registerMcpInClaudeJson(bunBin, mcpPath) {
@@ -3597,19 +4342,19 @@ function unregisterMcpFromClaudeJson() {
   } catch {}
 }
 function installCommands() {
-  let srcCommands = join10(PKG_DIR, "commands");
-  if (!existsSync9(srcCommands))
-    srcCommands = join10(STABLE_DIR2, "commands");
-  if (!existsSync9(srcCommands))
+  let srcCommands = join14(PKG_DIR, "commands");
+  if (!existsSync13(srcCommands))
+    srcCommands = join14(STABLE_DIR3, "commands");
+  if (!existsSync13(srcCommands))
     return 0;
-  mkdirSync3(COMMANDS_DIR, { recursive: true });
+  mkdirSync5(COMMANDS_DIR, { recursive: true });
   let count = 0;
-  for (const file of readdirSync2(srcCommands)) {
+  for (const file of readdirSync3(srcCommands)) {
     if (!file.endsWith(".md"))
       continue;
-    const src = join10(srcCommands, file);
-    const dest = join10(COMMANDS_DIR, file);
-    writeFileSync2(dest, readFileSync4(src));
+    const src = join14(srcCommands, file);
+    const dest = join14(COMMANDS_DIR, file);
+    writeFileSync5(dest, readFileSync7(src));
     count++;
   }
   return count;
@@ -3617,9 +4362,9 @@ function installCommands() {
 function uninstallCommands() {
   const memCommands = ["mem-search.md", "mem-status.md", "mem-save.md"];
   for (const file of memCommands) {
-    const p = join10(COMMANDS_DIR, file);
+    const p = join14(COMMANDS_DIR, file);
     try {
-      if (existsSync9(p))
+      if (existsSync13(p))
         unlinkSync(p);
     } catch {}
   }
@@ -3639,7 +4384,7 @@ function install() {
 1. Registering MCP server...`);
   const mcpPath = getMcpServerPath();
   const bunBin = getBunPath();
-  const result = spawnSync3("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
+  const result = spawnSync4("claude", ["mcp", "add", "claude-memory-hub", "-s", "user", "--", bunBin, "run", mcpPath], {
     stdio: "inherit"
   });
   if (result.status !== 0) {
@@ -3678,9 +4423,9 @@ function install() {
   }
   saveSettings(settings);
   console.log(`   ${registered} hook(s) registered. (${5 - registered} already existed)`);
-  const dataDir = join10(homedir7(), ".claude-memory-hub");
-  if (!existsSync9(dataDir)) {
-    mkdirSync3(dataDir, { recursive: true, mode: 448 });
+  const dataDir = join14(homedir10(), ".claude-memory-hub");
+  if (!existsSync13(dataDir)) {
+    mkdirSync5(dataDir, { recursive: true, mode: 448 });
     console.log(`
 3. Created data directory: ${dataDir}`);
   } else {
@@ -3725,7 +4470,7 @@ function uninstall() {
   uninstallCommands();
   console.log("Removed slash commands from ~/.claude/commands/");
   unregisterMcpFromClaudeJson();
-  spawnSync3("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
+  spawnSync4("claude", ["mcp", "remove", "claude-memory-hub", "-s", "user"], {
     stdio: "inherit"
   });
   const settings = loadSettings();
@@ -3750,14 +4495,14 @@ function status() {
   const settings = loadSettings();
   const hasMcp = !!settings.mcpServers?.["claude-memory-hub"];
   const hookCount = Object.values(settings.hooks ?? {}).flat().filter((e) => JSON.stringify(e).includes("claude-memory-hub")).length;
-  const dataDir = join10(homedir7(), ".claude-memory-hub");
-  const hasData = existsSync9(join10(dataDir, "memory.db"));
+  const dataDir = join14(homedir10(), ".claude-memory-hub");
+  const hasData = existsSync13(join14(dataDir, "memory.db"));
   console.log(`  MCP server:  ${hasMcp ? "registered" : "not registered"}`);
   console.log(`  Hooks:       ${hookCount}/5 registered`);
   console.log(`  Database:    ${hasData ? "exists" : "not created yet"}`);
   if (hasData) {
-    const { statSync: statSync6 } = __require("fs");
-    const stats = statSync6(join10(dataDir, "memory.db"));
+    const { statSync: statSync7 } = __require("fs");
+    const stats = statSync7(join14(dataDir, "memory.db"));
     console.log(`  DB size:     ${(stats.size / 1024).toFixed(1)} KB`);
   }
   if (!hasMcp || hookCount < 5) {
@@ -3875,6 +4620,56 @@ switch (command) {
     await runDoctor2(process.argv.slice(3));
     break;
   }
+  case "maintenance": {
+    const { runMaintenance: runMaintenance2 } = (init_daemon(), __toCommonJS(exports_daemon));
+    runMaintenance2();
+    break;
+  }
+  case "install-daemon": {
+    const { installDaemon: installDaemon2 } = (init_daemon(), __toCommonJS(exports_daemon));
+    const { spawnSync: spawnSync5 } = __require("child_process");
+    const which = spawnSync5(process.platform === "win32" ? "where" : "which", ["bun"], { encoding: "utf-8" });
+    const bunBin = which.stdout?.trim().split(/\r?\n/)[0] || "/usr/local/bin/bun";
+    installDaemon2(bunBin);
+    break;
+  }
+  case "obsidian": {
+    const sub = process.argv[3];
+    if (sub === "sync") {
+      const { syncObsidianVault: syncObsidianVault2, getVaultRoot: getVaultRoot2 } = (init_obsidian_exporter(), __toCommonJS(exports_obsidian_exporter));
+      const projIdx = process.argv.indexOf("--project");
+      const project = projIdx > -1 ? process.argv[projIdx + 1] : undefined;
+      console.log(`Syncing memory to Obsidian vault: ${getVaultRoot2()}`);
+      const r = syncObsidianVault2({ project });
+      console.log(`Done: ${r.sessions_exported} sessions, ${r.decisions_exported} decisions, ${r.file_notes_exported} file notes across ${r.projects} projects.`);
+      console.log(`Open in Obsidian: "Open folder as vault" \u2192 ${getVaultRoot2()}`);
+    } else {
+      console.log("Usage: claude-memory-hub obsidian sync [--project <name>]");
+      console.log("Vault path: CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT (default ~/Documents/ObsidianVault)");
+    }
+    break;
+  }
+  case "graph": {
+    const sub = process.argv[3];
+    if (sub === "build") {
+      const { backfillAllSessions: backfillAllSessions2 } = (init_edge_builder(), __toCommonJS(exports_edge_builder));
+      console.log("Building graph edges from all stored sessions...");
+      const result = backfillAllSessions2();
+      console.log(`Done: ${result.edges} edge upserts from ${result.sessions} sessions.`);
+    } else if (sub === "scan") {
+      const repoPath = process.argv[4] ?? process.cwd();
+      const { basename: basename2 } = __require("path");
+      const { scanRepoImports: scanRepoImports2 } = (init_code_scanner(), __toCommonJS(exports_code_scanner));
+      console.log(`Scanning imports in ${repoPath}...`);
+      const result = scanRepoImports2(repoPath, basename2(repoPath));
+      console.log(`Done: ${result.edges} import edges from ${result.files_scanned} files.`);
+    } else {
+      const { countEdges: countEdges2 } = (init_graph_queries(), __toCommonJS(exports_graph_queries));
+      console.log(`Graph edges stored: ${countEdges2()}`);
+      console.log("Usage: claude-memory-hub graph build | graph scan [repo-path]");
+    }
+    break;
+  }
   case "stats": {
     const { runStatsCommand: runStatsCommand2 } = (init_stats(), __toCommonJS(exports_stats));
     runStatsCommand2(process.argv.slice(3));
@@ -3933,6 +4728,10 @@ switch (command) {
     console.log("  import      Import JSONL from stdin (--dry-run)");
     console.log("  cleanup     Remove old data (--days N, default 90)");
     console.log("  prune       Remove low-quality summaries (--dry-run)");
+    console.log("  graph       Knowledge graph: graph build | graph scan [repo]");
+    console.log("  obsidian    Export memory to Obsidian vault: obsidian sync [--project X]");
+    console.log("  maintenance Run retention + WAL checkpoint + obsidian sync now");
+    console.log("  install-daemon  Install daily launchd maintenance agent (macOS)");
     console.log(`
 Usage: npx claude-memory-hub <command>`);
     break;

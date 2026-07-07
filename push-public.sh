@@ -23,7 +23,7 @@ npx tsc --noEmit
 
 echo ""
 echo "4. Staging built files..."
-git add -f dist/
+git add -f dist/ commands/
 git add .gitignore .npmignore .github/ README.md CHANGELOG.md LICENSE package.json bun.lock
 
 echo ""

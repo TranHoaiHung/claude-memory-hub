@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.15.0] - 2026-07-08
+
+**Inject once, remember everything: session-baseline injection, entity dedup, knowledge graph, Obsidian export.**
+
+Driven by 30 days of injection telemetry: 1,841 injections (~1.34M tokens) revealed the baseline was re-injected on EVERY prompt — one session logged 1,083 injections (~790K tokens). v0.15.0 restructures injection around the session lifecycle and adds the graph/vault layer on top of the deduplicated data.
+
+### Injection efficiency (migration v8)
+
+- **New SessionStart hook** (`session-start.ts`) — injects the session baseline (recent memory, CLAUDE.md summary, resource advice, awareness hint) ONCE per session via `hookSpecificOutput.additionalContext`. Skips `source: "compact"` (PostCompact covers it).
+- **UserPromptSubmit is now conditional** — per-prompt it only adds: history recall (embedding intent match), memory search results deduplicated against what the session already saw (state file in `proactive/<sid>-inject.json`), and prompt-specific smart match. Baseline sections no longer repeat.
+- **Stop vs SessionEnd fixed** — `Stop` previously ran the full session-end pipeline after EVERY assistant turn (327 transcript re-parses/day observed). Now `Stop` runs a 30ms `stop.js` (batch flush only); transcript parse + summarize + embeddings + graph build moved to the real `SessionEnd` event.
+- Telemetry columns `injected_at` ('session_start' | 'first_prompt' | 'prompt') and `dedup_skipped`.
+
+### Capture hygiene (migration v8)
+
+- **Entity dedup**: UNIQUE(session_id, entity_type, entity_value) + `touch_count`. Repeated touches bump the counter instead of inserting rows. Live DB shrank 43,542 → 15,495 entities (−64%) with touch history preserved.
+- **Recency decay in L3 search**: bm25 rank × 1.5 (<7d) / 1.2 (<30d) / 0.8 (>90d).
+- **Test isolation**: `CLAUDE_MEMORY_HUB_DB` env override + bunfig preload — test runs no longer pollute the production DB (v8 also purges historical `compact-test-*` junk).
+- **Auto-cleanup**: SessionEnd prunes >90d low-value entities + telemetry at most once/week, then WAL-checkpoints.
+
+### Knowledge graph (migration v9)
+
+- `graph_edges` table with relations: `co_edited` (files changed within ±3 prompts, weight 1/(1+distance)), `error_in`, `decided_about` (importance ≥3, same-prompt, capped), `session_touched` (weight = touch_count), `imports` (static regex scan, relative imports only).
+- Edges build incrementally at SessionEnd; `graph build` backfills history; `graph scan [repo]` adds the import graph.
+- New MCP tools: **`memory_graph`** (neighbors by relation) and **`memory_impact`** (one-shot blast-radius view for a file: co-edit cluster, past errors, decisions, sessions).
+
+### Obsidian export
+
+- `obsidian sync [--project X]` — one-way incremental export to `<vault>/MemoryHub/`: Home MOC, per-project MOCs, session notes, decision notes (importance ≥3), hot-file notes (≥3 touches) with `[[wikilinks]]` from graph_edges so Obsidian's graph view mirrors the memory graph. Vault path via `CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT` (default `~/Documents/ObsidianVault`).
+- Auto-sync at SessionEnd behind `CLAUDE_MEMORY_HUB_OBSIDIAN=1`.
+
+### Always-on (migration v10)
+
+- `doctor` now verifies all **7** hook events (SessionStart, UserPromptSubmit, PostToolUse, PreCompact, PostCompact, Stop, SessionEnd) + the two new dist files.
+- `install-daemon` — daily launchd agent (03:30) running `maintenance` (retention, WAL checkpoint, Obsidian sync).
+- **Effectiveness feedback**: PostToolUse marks `injection_log.memory_tool_used = 1` when Claude actually calls a `memory_*` tool — the metric future ranking work tunes against.
+
+### Migration notes
+
+- Migrations v8–v10 run automatically on first hook/CLI invocation. v8 collapses duplicate entities inside a transaction; back up `memory.db` first if paranoid (installer keeps `backups/`).
+- `install.sh` now registers 7 hooks; existing installs: re-run install or update `settings.json` (Stop → `stop.js`, SessionEnd → `session-end.js`, SessionStart → `session-start.js`).
+
+---
+
 ## [0.14.0] - 2026-05-16
 
 **Ship telemetry first, build features on real data.**

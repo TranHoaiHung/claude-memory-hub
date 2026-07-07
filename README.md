@@ -59,9 +59,32 @@ AFTER compact
 ### Cross-Session Memory
 
 Session ends → memory-hub parses the full transcript, summarizes, indexes.
-Next session → past context auto-injected based on what you're working on.
+Next session → the **SessionStart hook injects the baseline once** (recent memory,
+CLAUDE.md summary, resource advice). Per-prompt injection is conditional: history
+recall and fresh search results only, deduplicated against what the session already saw.
 
-No manual prompting. No copy-pasting. Claude just knows.
+No manual prompting. No copy-pasting. No token waste. Claude just knows.
+
+### Token-Efficient by Design (v0.15)
+
+Telemetry on 30 days of real usage showed the old design re-injected ~2,900 chars on
+EVERY prompt (one session: 1,083 injections ≈ 790K tokens). v0.15 injects the baseline
+once per session; later prompts measured at **0 extra chars** unless you explicitly ask
+about past work. `injection_log` tracks `injected_at`, `dedup_skipped`, and
+`memory_tool_used` so effectiveness is measured, not guessed.
+
+### Knowledge Graph (v0.15)
+
+Every session builds edges: which files change together (`co_edited`), where errors
+happened (`error_in`), what decisions concern which files (`decided_about`), plus a
+static import graph (`graph scan`). Ask `memory_impact` before touching a risky file
+to see its blast radius: co-edit cluster, past errors, related decisions, sessions.
+
+### Obsidian Export (v0.15)
+
+`bunx claude-memory-hub obsidian sync` exports sessions, decisions, and hot files as
+markdown notes with `[[wikilinks]]` generated from the graph — Obsidian's graph view
+becomes your coding memory graph. Incremental, idempotent, one-way.
 
 ### Hybrid Search (3 engines)
 
@@ -87,19 +110,20 @@ Layer 3: Path filtering        → .env, *.pem, *.key excluded from tracking
 ### Everything Else
 
 - **Slash commands** — `/mem-search`, `/mem-status`, `/mem-save`
-- **10 MCP tools** — progressive 3-layer search (50→200→500 tokens/result)
+- **13 MCP tools** — progressive 3-layer search (50→200→500 tokens/result) + graph + resource matching
 - **Proactive retrieval** — detects topic shifts, injects relevant context mid-session
+- **Maintenance daemon** — daily launchd agent: retention, WAL checkpoint, Obsidian sync
 - **Browser dashboard** — `bunx claude-memory-hub viewer` at localhost:37888
 - **JSONL export/import** — full backup, incremental, per-table
 - **Multi-agent ready** — subagents share memory via MCP
-- **155 unit tests** — privacy, search, capture, schema, health
+- **213 unit tests** — privacy, search, capture, schema, graph, export, health
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install (registers MCP server + 5 hooks + 3 slash commands)
+# Install (registers MCP server + 7 hooks + 3 slash commands)
 bunx claude-memory-hub install
 
 # Verify
@@ -253,19 +277,19 @@ OverheadReport identifies unused resources + token waste
 ┌─────────────────────────────────────────────────────────────┐
 │                      Claude Code                            │
 │                                                             │
-│  5 Lifecycle Hooks                                          │
+│  7 Lifecycle Hooks                                          │
 │  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ PostToolUse   │  │ PreCompact   │  │ PostCompact  │      │
-│  │ batch queue   │  │ inject       │  │ save summary │      │
-│  └──────┬────────┘  │ priorities   │  └──────┬───────┘      │
-│         │           └──────┬───────┘         │              │
-│  ┌──────┴───────┐          │          ┌──────┴───────┐      │
-│  │UserPrompt    │          │          │ Stop           │    │
-│  │Submit: inject│          │          │ parse transcript│    │
-│  │past context +│          │          │ capture convo  │    │
-│  │save prompt   │          │          │ summarize      │    │
-│  └──────────────┘          │          └────────────────┘    │
-│                            │                                │
+│  │ SessionStart  │  │ PreCompact   │  │ PostCompact  │      │
+│  │ inject base-  │  │ inject       │  │ save summary │      │
+│  │ line ONCE     │  │ priorities   │  └──────┬───────┘      │
+│  └──────┬────────┘  └──────┬───────┘         │              │
+│  ┌──────┴───────┐  ┌───────┴──────┐  ┌───────┴────────┐     │
+│  │UserPrompt    │  │ PostToolUse  │  │ Stop: flush    │     │
+│  │Submit: cond. │  │ batch queue +│  │ (~30ms)        │     │
+│  │inject (dedup)│  │ feedback mark│  │ SessionEnd:    │     │
+│  │+ save prompt │  └──────────────┘  │ parse+summarize│     │
+│  └──────────────┘                    │ +graph+obsidian│     │
+│                                      └────────────────┘     │
 │  MCP Server (stdio, long-lived)                             │
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │ memory_recall        memory_search  (L1 index)      │    │
@@ -273,6 +297,8 @@ OverheadReport identifies unused resources + token waste
 │  │ memory_session_notes memory_fetch   (L3 full)       │    │
 │  │ memory_store         memory_context_budget          │    │
 │  │ memory_conversation  memory_health                  │    │
+│  │ memory_graph         memory_impact                  │    │
+│  │ memory_resources_for_prompt                         │    │
 │  └─────────────────────────────────────────────────────┘    │
 │                                                             │
 │  Resource Intelligence    Browser UI (:37888)               │
@@ -359,6 +385,9 @@ PostToolUse events batched via write-through queue (~3ms per event).
 | `memory_conversation` | Retrieve/search conversation messages | varies |
 | `memory_context_budget` | Token overhead analysis | ~200 |
 | `memory_health` | Database + FTS5 + disk + embeddings status | ~150 |
+| `memory_graph` | Knowledge-graph neighbors: co_edited, error_in, decided_about, imports | varies |
+| `memory_impact` | Blast-radius view for a file: co-edit cluster + errors + decisions + sessions | ~300 |
+| `memory_resources_for_prompt` | Best skills/agents/commands for a prompt (semantic + usage) | varies |
 
 ---
 
@@ -376,6 +405,12 @@ bunx claude-memory-hub export      # Export data as JSONL to stdout
 bunx claude-memory-hub import      # Import JSONL from stdin (--dry-run)
 bunx claude-memory-hub cleanup     # Remove old data (--days N, default 90)
 bunx claude-memory-hub prune       # Remove low-quality summaries (--dry-run)
+bunx claude-memory-hub doctor      # Diagnose install: 7 hooks, dist files, embeddings (--fix)
+bunx claude-memory-hub stats       # Memory report (--injections: telemetry + effectiveness)
+bunx claude-memory-hub graph       # Knowledge graph: graph build | graph scan [repo]
+bunx claude-memory-hub obsidian sync  # Export memory to Obsidian vault [--project X]
+bunx claude-memory-hub maintenance # Retention + WAL checkpoint + Obsidian sync now
+bunx claude-memory-hub install-daemon # Daily 03:30 launchd maintenance agent (macOS)
 ```
 
 ---

@@ -820,6 +820,1025 @@ function sanitizeFtsQuery(query) {
   return [...head, `"${last}"*`].join(" ");
 }
 
+// src/context/resource-registry.ts
+init_logger();
+import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
+import { join as join3, basename, relative } from "path";
+import { homedir as homedir3 } from "os";
+
+// src/context/resource-tracker.ts
+init_schema();
+var SCHEMA_ADDITIONS = `
+CREATE TABLE IF NOT EXISTS resource_usage (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  resource_type TEXT NOT NULL
+    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
+  resource_name TEXT NOT NULL,
+  use_count   INTEGER NOT NULL DEFAULT 1,
+  token_cost  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
+CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
+CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
+`;
+
+class ResourceTracker {
+  db;
+  initialized = false;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  ensureSchema() {
+    if (this.initialized)
+      return;
+    this.db.run(SCHEMA_ADDITIONS);
+    this.initialized = true;
+  }
+  trackUsage(session_id, project, resource_type, resource_name, token_cost = 0) {
+    this.ensureSchema();
+    const existing = this.db.query("SELECT id, use_count FROM resource_usage WHERE session_id = ? AND resource_name = ?").get(session_id, resource_name);
+    if (existing) {
+      this.db.run("UPDATE resource_usage SET use_count = use_count + 1 WHERE id = ?", [existing.id]);
+    } else {
+      this.db.run(`INSERT INTO resource_usage(session_id, project, resource_type, resource_name, use_count, token_cost, created_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)`, [session_id, project, resource_type, resource_name, token_cost, Date.now()]);
+    }
+  }
+  getMostUsedResources(project, resource_type, limit = 10) {
+    this.ensureSchema();
+    if (resource_type) {
+      return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+           FROM resource_usage WHERE project = ? AND resource_type = ?
+           GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, resource_type, limit);
+    }
+    return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
+         FROM resource_usage WHERE project = ?
+         GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, limit);
+  }
+  getRecentlyUsedResources(project, lastNSessions = 5) {
+    this.ensureSchema();
+    return this.db.query(`SELECT resource_type, resource_name, COUNT(DISTINCT session_id) as frequency
+         FROM resource_usage
+         WHERE project = ?
+           AND session_id IN (
+             SELECT DISTINCT session_id FROM resource_usage
+             WHERE project = ?
+             ORDER BY created_at DESC
+             LIMIT ?
+           )
+         GROUP BY resource_type, resource_name
+         ORDER BY frequency DESC, resource_type`).all(project, project, lastNSessions);
+  }
+  estimateTokenBudget(project) {
+    this.ensureSchema();
+    const rows = this.db.query(`SELECT resource_type, SUM(token_cost) as total_tokens, COUNT(DISTINCT resource_name) as count
+         FROM resource_usage
+         WHERE project = ?
+         GROUP BY resource_type`).all(project);
+    const by_type = {};
+    let total = 0;
+    let count = 0;
+    for (const row of rows) {
+      by_type[row.resource_type] = row.total_tokens;
+      total += row.total_tokens;
+      count += row.count;
+    }
+    return { total_token_cost: total, resource_count: count, by_type };
+  }
+}
+
+// src/context/resource-registry.ts
+var log2 = createLogger("resource-registry");
+var CHARS_PER_TOKEN = 3.75;
+var SCAN_TTL_MS = 5 * 60 * 1000;
+var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
+var SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
+var MAX_DIR_WALK_DEPTH = 5;
+
+class ResourceRegistry {
+  resources = new Map;
+  lastScanAt = 0;
+  claudeDir;
+  constructor() {
+    this.claudeDir = join3(homedir3(), ".claude");
+  }
+  scan(cwd) {
+    if (Date.now() - this.lastScanAt < SCAN_TTL_MS && this.resources.size > 0)
+      return;
+    this.resources.clear();
+    try {
+      this.scanSkills(join3(this.claudeDir, "skills"), cwd);
+      this.scanFlatAgents(join3(this.claudeDir, "agents"));
+      this.scanAgentPackages(this.claudeDir);
+      this.scanCommands(join3(this.claudeDir, "commands"), cwd);
+      this.scanWorkflows(join3(this.claudeDir, "workflows"));
+      this.scanClaudeMd(cwd);
+      this.lastScanAt = Date.now();
+    } catch (err) {
+      log2.error("scan failed", { error: String(err) });
+    }
+  }
+  resolve(kind, name) {
+    this.ensureScanned();
+    return this.resources.get(`${kind}:${name}`);
+  }
+  exists(kind, name) {
+    return this.resolve(kind, name) !== undefined;
+  }
+  getAll(kind) {
+    this.ensureScanned();
+    const all = [...this.resources.values()];
+    return kind ? all.filter((r) => r.kind === kind) : all;
+  }
+  async getOverheadReport(project, lastNSessions = 10) {
+    this.ensureScanned();
+    const tracker = new ResourceTracker;
+    const recentSkills = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "skill");
+    const recentAgents = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "agent");
+    const allSkills = this.getAll("skill");
+    const allAgents = this.getAll("agent");
+    const usedSkillNames = new Set(recentSkills.map((r) => r.resource_name));
+    const usedAgentNames = new Set(recentAgents.map((r) => r.resource_name));
+    const unusedSkills = allSkills.filter((s) => !usedSkillNames.has(s.name));
+    const unusedAgents = allAgents.filter((a) => !usedAgentNames.has(a.name));
+    const skillListingTokens = allSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const agentDescTokens = allAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const commandListingTokens = this.getAll("command").reduce((sum, c) => sum + c.listing_tokens, 0);
+    const claudeMdTokens = this.getAll("claude_md").reduce((sum, c) => sum + c.full_tokens, 0);
+    const unusedSkillListingTokens = unusedSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
+    const unusedAgentListingTokens = unusedAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
+    const recommendations = [];
+    if (unusedSkills.length > 0) {
+      recommendations.push(`${unusedSkills.length}/${allSkills.length} skills unused in last ${lastNSessions} sessions (~${unusedSkillListingTokens} listing tokens). Consider project-local or removal.`);
+    }
+    if (unusedAgents.length > 0) {
+      recommendations.push(`${unusedAgents.length}/${allAgents.length} agents unused in last ${lastNSessions} sessions (~${unusedAgentListingTokens} listing tokens).`);
+    }
+    if (claudeMdTokens > 5000) {
+      recommendations.push(`CLAUDE.md chain is ${claudeMdTokens} tokens. Consider consolidating if >5K.`);
+    }
+    return {
+      fixed_overhead: {
+        total_tokens: skillListingTokens + agentDescTokens + commandListingTokens + claudeMdTokens,
+        skill_listings: skillListingTokens,
+        agent_descriptions: agentDescTokens,
+        command_listings: commandListingTokens,
+        claude_md: claudeMdTokens
+      },
+      usage_analysis: {
+        skills_installed: allSkills.length,
+        skills_used_recently: usedSkillNames.size,
+        skills_never_used: unusedSkills.map((s) => s.name),
+        agents_installed: allAgents.length,
+        agents_used_recently: usedAgentNames.size,
+        agents_never_used: unusedAgents.map((a) => a.name)
+      },
+      recommendations,
+      potential_savings: {
+        if_remove_unused_skills: unusedSkillListingTokens,
+        if_remove_unused_agents: unusedAgentListingTokens
+      }
+    };
+  }
+  scanSkills(globalDir, cwd) {
+    this.scanSkillDir(globalDir, "global");
+    if (cwd) {
+      const projectDir = join3(cwd, ".claude", "skills");
+      if (existsSync3(projectDir)) {
+        this.scanSkillDir(projectDir, "project");
+      }
+    }
+  }
+  scanSkillDir(dir, source) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory())
+          continue;
+        const name = entry.name;
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const skillDir = join3(dir, name);
+        const skillFile = this.findPrimaryFile(skillDir, ["SKILL.md", "README.md"]);
+        const listing = this.estimateListingFromSkillDir(skillDir);
+        const fullTokens = skillFile ? this.charsToTokens(this.readFileSize(skillFile)) : 0;
+        const totalTokens = this.estimateDirTokens(skillDir);
+        this.register({
+          kind: "skill",
+          name,
+          path: skillFile ?? skillDir,
+          allPaths: this.listMdFiles(skillDir),
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: fullTokens,
+          total_tokens: totalTokens,
+          source
+        });
+      }
+    } catch (err) {
+      log2.error(`scanSkillDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanFlatAgents(dir) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        if (entry.name === "README.md")
+          continue;
+        const filePath = join3(dir, entry.name);
+        const content = this.readFileHead(filePath, 20);
+        const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        const listing = this.estimateAgentListingTokens(content);
+        this.register({
+          kind: "agent",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: listing,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log2.error(`scanFlatAgents ${dir}`, { error: String(err) });
+    }
+  }
+  scanAgentPackages(claudeDir) {
+    if (!existsSync3(claudeDir))
+      return;
+    try {
+      for (const entry of readdirSync(claudeDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith("agent_"))
+          continue;
+        const packageDir = join3(claudeDir, entry.name);
+        this.scanAgentPackageDir(packageDir);
+      }
+    } catch (err) {
+      log2.error("scanAgentPackages", { error: String(err) });
+    }
+  }
+  scanAgentPackageDir(packageDir) {
+    try {
+      for (const entry of readdirSync(packageDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const subDir = join3(packageDir, entry.name);
+          const agentFile = join3(subDir, "AGENT.md");
+          if (existsSync3(agentFile)) {
+            const content = this.readFileHead(agentFile, 20);
+            const name = this.parseFrontmatterName(content) ?? entry.name;
+            if (!SAFE_NAME_RE.test(name))
+              continue;
+            const listing = this.estimateAgentListingTokens(content);
+            const fullTokens = this.charsToTokens(this.readFileSize(agentFile));
+            const totalTokens = this.estimateDirTokens(subDir);
+            this.register({
+              kind: "agent",
+              name,
+              path: agentFile,
+              allPaths: this.listMdFiles(subDir),
+              category: "variable",
+              listing_tokens: listing,
+              full_tokens: fullTokens,
+              total_tokens: totalTokens,
+              source: "global"
+            });
+          }
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          if (entry.name === "README.md" || entry.name === "SKILL.md")
+            continue;
+          const filePath = join3(packageDir, entry.name);
+          const content = this.readFileHead(filePath, 20);
+          const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
+          if (!SAFE_NAME_RE.test(name))
+            continue;
+          if (this.resources.has(`agent:${name}`))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          this.register({
+            kind: "agent",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateAgentListingTokens(content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source: "global"
+          });
+        }
+      }
+    } catch (err) {
+      log2.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+    }
+  }
+  scanCommands(globalDir, cwd) {
+    if (existsSync3(globalDir))
+      this.scanCommandDir(globalDir, globalDir, "global");
+    if (cwd) {
+      const projectDir = join3(cwd, ".claude", "commands");
+      if (existsSync3(projectDir))
+        this.scanCommandDir(projectDir, projectDir, "project");
+    }
+  }
+  scanCommandDir(dir, baseDir, source) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          this.scanCommandDir(join3(dir, entry.name), baseDir, source);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          const filePath = join3(dir, entry.name);
+          const name = relative(baseDir, filePath).replace(/\.md$/, "");
+          if (!SAFE_COMMAND_NAME_RE.test(name))
+            continue;
+          const fileSize = this.readFileSize(filePath);
+          const content = this.readFileHead(filePath, 3);
+          this.register({
+            kind: "command",
+            name,
+            path: filePath,
+            allPaths: [filePath],
+            category: "variable",
+            listing_tokens: this.estimateCommandListingTokens(name, content),
+            full_tokens: this.charsToTokens(fileSize),
+            total_tokens: this.charsToTokens(fileSize),
+            source
+          });
+        }
+      }
+    } catch (err) {
+      log2.error(`scanCommandDir ${dir}`, { error: String(err) });
+    }
+  }
+  scanWorkflows(dir) {
+    if (!existsSync3(dir))
+      return;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md"))
+          continue;
+        const filePath = join3(dir, entry.name);
+        const name = basename(entry.name, ".md");
+        if (!SAFE_NAME_RE.test(name))
+          continue;
+        const fileSize = this.readFileSize(filePath);
+        this.register({
+          kind: "workflow",
+          name,
+          path: filePath,
+          allPaths: [filePath],
+          category: "variable",
+          listing_tokens: 0,
+          full_tokens: this.charsToTokens(fileSize),
+          total_tokens: this.charsToTokens(fileSize),
+          source: "global"
+        });
+      }
+    } catch (err) {
+      log2.error(`scanWorkflows ${dir}`, { error: String(err) });
+    }
+  }
+  scanClaudeMd(cwd) {
+    const globalFile = join3(this.claudeDir, "CLAUDE.md");
+    if (existsSync3(globalFile)) {
+      const fileSize = this.readFileSize(globalFile);
+      this.register({
+        kind: "claude_md",
+        name: "global",
+        path: globalFile,
+        allPaths: [globalFile],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "global"
+      });
+    }
+    if (!cwd)
+      return;
+    const projectFiles = [
+      join3(cwd, "CLAUDE.md"),
+      join3(cwd, ".claude", "CLAUDE.md")
+    ];
+    for (const file of projectFiles) {
+      if (!existsSync3(file))
+        continue;
+      const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
+      if (!SAFE_COMMAND_NAME_RE.test(relPath))
+        continue;
+      const name = `project:${relPath}`;
+      const fileSize = this.readFileSize(file);
+      this.register({
+        kind: "claude_md",
+        name,
+        path: file,
+        allPaths: [file],
+        category: "fixed",
+        listing_tokens: 0,
+        full_tokens: this.charsToTokens(fileSize),
+        total_tokens: this.charsToTokens(fileSize),
+        source: "project"
+      });
+    }
+  }
+  ensureScanned() {
+    if (this.resources.size === 0 || Date.now() - this.lastScanAt >= SCAN_TTL_MS) {
+      this.scan();
+    }
+  }
+  register(resource) {
+    const key = `${resource.kind}:${resource.name}`;
+    const existing = this.resources.get(key);
+    if (existing && existing.source === "global" && resource.source === "project") {
+      this.resources.set(key, resource);
+    } else if (!existing) {
+      this.resources.set(key, resource);
+    }
+  }
+  parseFrontmatterName(content) {
+    const lines = content.split(`
+`);
+    let inFrontmatter = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed === "---") {
+        if (inFrontmatter)
+          return;
+        inFrontmatter = true;
+        continue;
+      }
+      if (!inFrontmatter)
+        continue;
+      const m = trimmed.match(/^name:\s*["']?([a-zA-Z0-9_\-]+)["']?/);
+      if (m?.[1])
+        return m[1];
+    }
+    return;
+  }
+  findPrimaryFile(dir, candidates) {
+    for (const c of candidates) {
+      const p = join3(dir, c);
+      if (existsSync3(p))
+        return p;
+    }
+    return;
+  }
+  readFileHead(filePath, lines) {
+    try {
+      const content = readFileSync(filePath, "utf-8");
+      return content.split(`
+`).slice(0, lines).join(`
+`);
+    } catch {
+      return "";
+    }
+  }
+  readFileSize(filePath) {
+    try {
+      return statSync(filePath).size;
+    } catch {
+      return 0;
+    }
+  }
+  charsToTokens(chars) {
+    return Math.ceil(chars / CHARS_PER_TOKEN);
+  }
+  estimateListingFromSkillDir(dir) {
+    const skillFile = this.findPrimaryFile(dir, ["SKILL.md", "README.md"]);
+    if (!skillFile)
+      return 30;
+    const head = this.readFileHead(skillFile, 5);
+    const descLine = head.split(`
+`).find((l) => l.startsWith("description:") || l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = descLine?.slice(0, 80).length ?? 20;
+    return Math.ceil((descLen + 30) / CHARS_PER_TOKEN);
+  }
+  estimateAgentListingTokens(headContent) {
+    const lines = headContent.split(`
+`);
+    for (const line of lines) {
+      if (line.startsWith("description:")) {
+        const desc = line.slice(12).trim().slice(0, 150);
+        return Math.ceil((desc.length + 30) / CHARS_PER_TOKEN);
+      }
+    }
+    return 30;
+  }
+  estimateCommandListingTokens(name, headContent) {
+    const firstLine = headContent.split(`
+`).find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
+    const descLen = firstLine?.slice(0, 60).length ?? 10;
+    return Math.ceil((name.length + descLen + 10) / CHARS_PER_TOKEN);
+  }
+  listMdFiles(dir) {
+    const files = [];
+    try {
+      const walk = (d, depth) => {
+        if (depth > MAX_DIR_WALK_DEPTH)
+          return;
+        for (const entry of readdirSync(d, { withFileTypes: true })) {
+          const p = join3(d, entry.name);
+          if (entry.isDirectory())
+            walk(p, depth + 1);
+          else if (entry.isFile() && entry.name.endsWith(".md"))
+            files.push(p);
+        }
+      };
+      walk(dir, 0);
+    } catch {}
+    return files;
+  }
+  estimateDirTokens(dir) {
+    return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
+  }
+}
+var _instance;
+function getResourceRegistry() {
+  if (!_instance)
+    _instance = new ResourceRegistry;
+  return _instance;
+}
+
+// src/context/injection-validator.ts
+init_logger();
+var log3 = createLogger("injection-validator");
+var MAX_CHARS = 8000;
+
+class InjectionValidator {
+  registry;
+  constructor(registry) {
+    this.registry = registry;
+  }
+  validate(rawContext, recommendations) {
+    try {
+      if (!rawContext)
+        return "";
+      let text = rawContext;
+      text = text.replace(/<!--[\s\S]*?-->/g, "");
+      text = text.replace(/<\/?system-reminder>/gi, "");
+      text = text.replace(/<\/?instructions>/gi, "");
+      text = text.trim();
+      if (text.length > MAX_CHARS) {
+        text = text.slice(0, MAX_CHARS) + `
+[...truncated for token efficiency]`;
+      }
+      return text;
+    } catch (err) {
+      log3.error("validation failed, returning empty", { error: String(err) });
+      return "";
+    }
+  }
+  filterAliveRecommendations(recommendations) {
+    return recommendations.filter((r) => {
+      const kind = mapResourceTypeToKind(r.resource_type);
+      if (!kind)
+        return true;
+      const alive = this.registry.exists(kind, r.resource_name);
+      if (!alive) {
+        log3.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
+      }
+      return alive;
+    });
+  }
+}
+function mapResourceTypeToKind(type) {
+  const mapping = {
+    skill: "skill",
+    agent: "agent",
+    command: "command",
+    workflow: "workflow",
+    claude_md: "claude_md",
+    mcp_tool: "mcp_tool",
+    hook: "hook",
+    memory: "memory"
+  };
+  return mapping[type];
+}
+
+// src/context/smart-resource-loader.ts
+var DEFAULT_TOKEN_BUDGET = 30000;
+
+class SmartResourceLoader {
+  tracker;
+  ltStore;
+  registry;
+  constructor(registry) {
+    this.tracker = new ResourceTracker;
+    this.ltStore = new LongTermStore;
+    this.registry = registry ?? getResourceRegistry();
+  }
+  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET, cwd) {
+    this.registry.scan(cwd);
+    const recommendations = [];
+    const recent = this.tracker.getRecentlyUsedResources(project, 5);
+    for (const r of recent) {
+      const tokenCost = this.getTokenCost(r.resource_type, r.resource_name);
+      if (tokenCost === 0)
+        continue;
+      recommendations.push({
+        resource_type: r.resource_type,
+        resource_name: r.resource_name,
+        score: Math.min(100, r.frequency * 20),
+        token_cost: tokenCost,
+        reason: `used in ${r.frequency}/5 recent sessions`
+      });
+    }
+    if (userPrompt.trim()) {
+      const searchResults = this.ltStore.search(userPrompt, 3);
+      for (const result of searchResults) {
+        const files = safeJson(result.files_touched, []);
+        for (const file of files.slice(0, 5)) {
+          const existing = recommendations.find((r) => r.resource_name === file && r.resource_type === "claude_md");
+          if (!existing) {
+            recommendations.push({
+              resource_type: "claude_md",
+              resource_name: file,
+              score: 40,
+              token_cost: this.getTokenCost("claude_md", file),
+              reason: "touched in similar past session"
+            });
+          }
+        }
+      }
+    }
+    recommendations.sort((a, b) => b.score - a.score);
+    let usedTokens = 0;
+    const included = [];
+    const skipped = [];
+    for (const r of recommendations) {
+      if (usedTokens + r.token_cost <= tokenBudget) {
+        included.push(r);
+        usedTokens += r.token_cost;
+      } else {
+        skipped.push(r);
+      }
+    }
+    return {
+      recommendations: included,
+      total_tokens: usedTokens,
+      budget_remaining: tokenBudget - usedTokens,
+      skipped
+    };
+  }
+  formatContextAdvice(plan) {
+    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
+      return "";
+    const lines = [];
+    if (plan.recommendations.length > 0) {
+      lines.push("**Frequently-used resources in this project:**");
+      for (const r of plan.recommendations.slice(0, 5)) {
+        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
+      }
+    }
+    if (plan.skipped.length > 0) {
+      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
+      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
+    }
+    return lines.join(`
+`);
+  }
+  getTokenCost(resourceType, resourceName) {
+    const kind = resourceTypeToKind(resourceType);
+    if (!kind)
+      return 500;
+    const resource = this.registry.resolve(kind, resourceName);
+    return resource?.full_tokens ?? 0;
+  }
+}
+function resourceTypeToKind(type) {
+  const mapping = {
+    skill: "skill",
+    agent: "agent",
+    command: "command",
+    workflow: "workflow",
+    claude_md: "claude_md",
+    mcp_tool: "mcp_tool",
+    hook: "hook",
+    memory: "memory"
+  };
+  return mapping[type];
+}
+function safeJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+// src/context/claude-md-tracker.ts
+init_schema();
+init_logger();
+import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
+import { homedir as homedir4 } from "os";
+import { join as join4, dirname, basename as basename2 } from "path";
+var log4 = createLogger("claude-md-tracker");
+var MAX_WALK_DEPTH = 20;
+var CHARS_PER_TOKEN2 = 3.75;
+var STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+
+class ClaudeMdTracker {
+  db;
+  constructor(db) {
+    this.db = db ?? getDatabase();
+  }
+  scanAndUpdate(cwd, project) {
+    const paths = this.walkToRoot(cwd);
+    const entries = [];
+    for (const filePath of paths) {
+      try {
+        const content = readFileSync2(filePath, "utf-8");
+        const hash = this.computeHash(content);
+        const existing = this.db.query("SELECT content_hash, sections_json, token_cost FROM claude_md_registry WHERE path = ?").get(filePath);
+        if (existing && existing.content_hash === hash) {
+          this.db.run("UPDATE claude_md_registry SET last_seen = ? WHERE path = ?", [Date.now(), filePath]);
+          entries.push({
+            path: filePath,
+            project,
+            contentHash: hash,
+            sections: safeJson2(existing.sections_json, []),
+            tokenCost: existing.token_cost
+          });
+        } else {
+          const sections = this.extractSections(content);
+          const tokenCost = Math.ceil(content.length / CHARS_PER_TOKEN2);
+          const sectionsJson = JSON.stringify(sections);
+          this.db.run(`INSERT INTO claude_md_registry(path, project, content_hash, sections_json, last_seen, token_cost)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(path) DO UPDATE SET
+               project = excluded.project,
+               content_hash = excluded.content_hash,
+               sections_json = excluded.sections_json,
+               last_seen = excluded.last_seen,
+               token_cost = excluded.token_cost`, [filePath, project, hash, sectionsJson, Date.now(), tokenCost]);
+          entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
+        }
+      } catch (err) {
+        log4.error(`Failed to process ${filePath}`, { error: String(err) });
+      }
+    }
+    return entries;
+  }
+  getRegistryForProject(project) {
+    const cutoff = Date.now() - STALE_THRESHOLD_MS;
+    const rows = this.db.query("SELECT path, project, content_hash, sections_json, token_cost FROM claude_md_registry WHERE project = ? AND last_seen > ?").all(project, cutoff);
+    return rows.map((r) => ({
+      path: r.path,
+      project: r.project,
+      contentHash: r.content_hash,
+      sections: safeJson2(r.sections_json, []),
+      tokenCost: r.token_cost
+    }));
+  }
+  filterNonRedundant(entries, cwd) {
+    if (entries.length === 0 || !cwd)
+      return entries;
+    const homeClaudeMd = join4(homedir4(), ".claude", "CLAUDE.md");
+    let projectRootClaudeMd;
+    let dir = cwd;
+    while (true) {
+      const candidate = entries.find((e) => dirname(e.path) === dir);
+      if (candidate) {
+        projectRootClaudeMd = candidate.path;
+        break;
+      }
+      const parent = dirname(dir);
+      if (parent === dir)
+        break;
+      dir = parent;
+    }
+    return entries.filter((e) => {
+      if (e.path === homeClaudeMd)
+        return false;
+      if (e.path === projectRootClaudeMd)
+        return false;
+      return true;
+    });
+  }
+  formatForInjection(entries, maxChars) {
+    if (entries.length === 0)
+      return "";
+    const minimal = `CLAUDE.md: ${entries.map((e) => basename2(dirname(e.path)) + "/" + basename2(e.path)).join(", ")}`;
+    if (maxChars !== undefined && maxChars < 200)
+      return minimal;
+    const compactLines = ["**Active CLAUDE.md rules:**"];
+    for (const e of entries) {
+      compactLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok)`);
+    }
+    const compact = compactLines.join(`
+`);
+    if (maxChars !== undefined && maxChars < 500)
+      return compact;
+    const fullLines = ["**Active CLAUDE.md rules:**"];
+    for (const e of entries) {
+      const headings = e.sections.map((s) => s.heading).join(", ");
+      fullLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok): ${headings || "no sections"}`);
+    }
+    return fullLines.join(`
+`);
+  }
+  computeHash(content) {
+    const hasher = new Bun.CryptoHasher("md5");
+    hasher.update(content);
+    return hasher.digest("hex");
+  }
+  extractSections(content) {
+    const sections = [];
+    const lines = content.split(`
+`);
+    let currentHeading;
+    let currentBody = [];
+    const flush = () => {
+      if (currentHeading) {
+        const body = currentBody.join(`
+`).trim().slice(0, 200);
+        sections.push({ heading: currentHeading, preview: body });
+      }
+    };
+    for (const line of lines) {
+      const m = line.match(/^## (.+)$/);
+      if (m) {
+        flush();
+        currentHeading = m[1].trim();
+        currentBody = [];
+      } else if (currentHeading) {
+        currentBody.push(line);
+      }
+    }
+    flush();
+    return sections;
+  }
+  walkToRoot(startDir) {
+    const paths = [];
+    let current = startDir;
+    let depth = 0;
+    while (depth < MAX_WALK_DEPTH) {
+      const file = join4(current, "CLAUDE.md");
+      if (existsSync4(file))
+        paths.push(file);
+      const dotClaudeFile = join4(current, ".claude", "CLAUDE.md");
+      if (existsSync4(dotClaudeFile))
+        paths.push(dotClaudeFile);
+      const parent = dirname(current);
+      if (parent === current)
+        break;
+      current = parent;
+      depth++;
+    }
+    return paths;
+  }
+}
+function safeJson2(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+// src/context/awareness-hint.ts
+init_schema();
+function buildAwarenessHint(options) {
+  if (options.isCommandInvocation)
+    return "";
+  const db = options.db ?? getDatabase();
+  const stats = collectStats(db, options.project);
+  if (stats.summaries === 0 && stats.messages === 0)
+    return "";
+  if (options.hasMemoryInjected || options.hasRecentConvoInjected) {
+    return shortHint(stats);
+  }
+  return fullHint(stats);
+}
+function shortHint(s) {
+  return [
+    "**\uD83E\uDDE0 Memory hub:** " + `${s.summaries} sessions, ${s.messages} messages stored. ` + "Call `memory_search` or `memory_conversation` for more."
+  ].join(`
+`);
+}
+function fullHint(s) {
+  const lines = [
+    "**\uD83E\uDDE0 Memory hub active**",
+    `_Stored: ${s.summaries} summaries, ${s.messages} messages, ${s.resources} indexed resources` + (s.project_summaries > 0 ? ` (${s.project_summaries} for current project)._` : `._`),
+    "_Before answering questions about prior work, files, decisions, or chat history, " + "call one of:_",
+    "  - `memory_recall` \u2014 search summaries by keyword",
+    "  - `memory_search` \u2014 3-layer progressive search (use for technical terms)",
+    "  - `memory_conversation` \u2014 retrieve raw user/assistant messages",
+    "  - `memory_resources_for_prompt` \u2014 find best skill/agent for the task",
+    `_Do not say "I don't have access to previous chats" \u2014 query first._`
+  ];
+  return lines.join(`
+`);
+}
+function collectStats(db, project) {
+  const summaries = db.query("SELECT COUNT(*) n FROM long_term_summaries").get()?.n ?? 0;
+  const messages = db.query("SELECT COUNT(*) n FROM messages").get()?.n ?? 0;
+  const resources = db.query("SELECT COUNT(*) n FROM resource_descriptions").get()?.n ?? 0;
+  const projectSummaries = db.query("SELECT COUNT(*) n FROM long_term_summaries WHERE project = ?").get(project)?.n ?? 0;
+  return {
+    summaries,
+    messages,
+    resources,
+    project_summaries: projectSummaries
+  };
+}
+
+// src/context/injection-state.ts
+import { existsSync as existsSync5, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3, unlinkSync } from "fs";
+import { join as join5 } from "path";
+import { homedir as homedir5 } from "os";
+var STATE_DIR = join5(homedir5(), ".claude-memory-hub", "proactive");
+function statePath(sessionId) {
+  return join5(STATE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}-inject.json`);
+}
+function loadInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync5(path)) {
+      const parsed = JSON.parse(readFileSync3(path, "utf-8"));
+      return {
+        baselineInjected: parsed.baselineInjected === true,
+        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : []
+      };
+    }
+  } catch {}
+  return { baselineInjected: false, injectedSummaryIds: [] };
+}
+function saveInjectionState(sessionId, state) {
+  try {
+    if (!existsSync5(STATE_DIR)) {
+      mkdirSync3(STATE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+function cleanupInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync5(path))
+      unlinkSync(path);
+  } catch {}
+}
+
+// src/db/injection-telemetry.ts
+init_schema();
+init_logger();
+var log5 = createLogger("injection-telemetry");
+function logInjection(entry, db) {
+  if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
+    return;
+  try {
+    const d = db ?? getDatabase();
+    d.run(`INSERT INTO injection_log(
+         session_id, project, intent, language,
+         prompt_length,
+         smart_match_count, smart_match_top_score,
+         memory_section_chars, claude_md_chars,
+         recent_convo_chars, awareness_hint_chars,
+         total_injection_chars,
+         history_intent_matched, injected_at, dedup_skipped, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+      entry.session_id,
+      entry.project,
+      entry.intent,
+      entry.language,
+      entry.prompt_length,
+      entry.smart_match_count,
+      entry.smart_match_top_score,
+      entry.memory_section_chars,
+      entry.claude_md_chars,
+      entry.recent_convo_chars,
+      entry.awareness_hint_chars,
+      entry.total_injection_chars,
+      entry.history_intent_matched ? 1 : 0,
+      entry.injected_at ?? "prompt",
+      entry.dedup_skipped ?? 0,
+      Date.now()
+    ]);
+  } catch (err) {
+    log5.warn("logInjection failed", { error: String(err) });
+  }
+}
+function pruneInjectionLog(olderThanDays = 90, db) {
+  const d = db ?? getDatabase();
+  const cutoff = Date.now() - olderThanDays * 86400000;
+  const result = d.run(`DELETE FROM injection_log WHERE timestamp < ?`, [cutoff]);
+  return result.changes;
+}
+
 // src/capture/context-enricher.ts
 var CONTEXT_MAX_LENGTH = 500;
 function enrichEntityContext(entity, hook) {
@@ -921,7 +1940,7 @@ function extractCodePatterns(content) {
 
 // src/capture/privacy-filter.ts
 init_logger();
-var log2 = createLogger("privacy-filter");
+var log6 = createLogger("privacy-filter");
 var DEFAULT_PRIVACY_CONFIG = {
   tag_stripping: true,
   auto_detect_secrets: true,
@@ -970,7 +1989,7 @@ function isIgnoredPath(filePath, config = DEFAULT_PRIVACY_CONFIG) {
   const normalized = filePath.replace(/\\/g, "/");
   for (const pattern of config.ignored_paths) {
     if (matchGlob(normalized, pattern)) {
-      log2.debug("Path ignored by privacy filter", { path: filePath, pattern });
+      log6.debug("Path ignored by privacy filter", { path: filePath, pattern });
       return true;
     }
   }
@@ -1013,7 +2032,7 @@ function getCustomPatterns(config) {
         compiled = new RegExp(p, "gi");
         compiledCustomCache.set(p, compiled);
       } catch {
-        log2.warn("Invalid custom privacy pattern", { pattern: p });
+        log6.warn("Invalid custom privacy pattern", { pattern: p });
         continue;
       }
     }
@@ -1040,13 +2059,13 @@ function sanitize(text, config = DEFAULT_PRIVACY_CONFIG) {
 }
 function loadPrivacyConfig() {
   try {
-    const { existsSync: existsSync3, readFileSync } = __require("fs");
-    const { join: join3 } = __require("path");
-    const { homedir: homedir3 } = __require("os");
-    const configPath = join3(homedir3(), ".claude-memory-hub", "privacy.json");
-    if (!existsSync3(configPath))
+    const { existsSync: existsSync6, readFileSync: readFileSync4 } = __require("fs");
+    const { join: join6 } = __require("path");
+    const { homedir: homedir6 } = __require("os");
+    const configPath = join6(homedir6(), ".claude-memory-hub", "privacy.json");
+    if (!existsSync6(configPath))
       return DEFAULT_PRIVACY_CONFIG;
-    const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+    const raw = JSON.parse(readFileSync4(configPath, "utf-8"));
     return {
       tag_stripping: raw.tag_stripping ?? DEFAULT_PRIVACY_CONFIG.tag_stripping,
       auto_detect_secrets: raw.auto_detect_secrets ?? DEFAULT_PRIVACY_CONFIG.auto_detect_secrets,
@@ -1260,896 +2279,9 @@ function extractFileFromBashCmd(cmd) {
   return;
 }
 
-// src/context/resource-tracker.ts
-init_schema();
-var SCHEMA_ADDITIONS = `
-CREATE TABLE IF NOT EXISTS resource_usage (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL,
-  project     TEXT NOT NULL,
-  resource_type TEXT NOT NULL
-    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
-  resource_name TEXT NOT NULL,
-  use_count   INTEGER NOT NULL DEFAULT 1,
-  token_cost  INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
-CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
-CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
-CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
-`;
-
-class ResourceTracker {
-  db;
-  initialized = false;
-  constructor(db) {
-    this.db = db ?? getDatabase();
-  }
-  ensureSchema() {
-    if (this.initialized)
-      return;
-    this.db.run(SCHEMA_ADDITIONS);
-    this.initialized = true;
-  }
-  trackUsage(session_id, project, resource_type, resource_name, token_cost = 0) {
-    this.ensureSchema();
-    const existing = this.db.query("SELECT id, use_count FROM resource_usage WHERE session_id = ? AND resource_name = ?").get(session_id, resource_name);
-    if (existing) {
-      this.db.run("UPDATE resource_usage SET use_count = use_count + 1 WHERE id = ?", [existing.id]);
-    } else {
-      this.db.run(`INSERT INTO resource_usage(session_id, project, resource_type, resource_name, use_count, token_cost, created_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?)`, [session_id, project, resource_type, resource_name, token_cost, Date.now()]);
-    }
-  }
-  getMostUsedResources(project, resource_type, limit = 10) {
-    this.ensureSchema();
-    if (resource_type) {
-      return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
-           FROM resource_usage WHERE project = ? AND resource_type = ?
-           GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, resource_type, limit);
-    }
-    return this.db.query(`SELECT resource_name, SUM(use_count) as total_uses, AVG(token_cost) as avg_tokens
-         FROM resource_usage WHERE project = ?
-         GROUP BY resource_name ORDER BY total_uses DESC LIMIT ?`).all(project, limit);
-  }
-  getRecentlyUsedResources(project, lastNSessions = 5) {
-    this.ensureSchema();
-    return this.db.query(`SELECT resource_type, resource_name, COUNT(DISTINCT session_id) as frequency
-         FROM resource_usage
-         WHERE project = ?
-           AND session_id IN (
-             SELECT DISTINCT session_id FROM resource_usage
-             WHERE project = ?
-             ORDER BY created_at DESC
-             LIMIT ?
-           )
-         GROUP BY resource_type, resource_name
-         ORDER BY frequency DESC, resource_type`).all(project, project, lastNSessions);
-  }
-  estimateTokenBudget(project) {
-    this.ensureSchema();
-    const rows = this.db.query(`SELECT resource_type, SUM(token_cost) as total_tokens, COUNT(DISTINCT resource_name) as count
-         FROM resource_usage
-         WHERE project = ?
-         GROUP BY resource_type`).all(project);
-    const by_type = {};
-    let total = 0;
-    let count = 0;
-    for (const row of rows) {
-      by_type[row.resource_type] = row.total_tokens;
-      total += row.total_tokens;
-      count += row.count;
-    }
-    return { total_token_cost: total, resource_count: count, by_type };
-  }
-}
-
-// src/context/resource-registry.ts
-init_logger();
-import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
-import { join as join3, basename, relative } from "path";
-import { homedir as homedir3 } from "os";
-var log3 = createLogger("resource-registry");
-var CHARS_PER_TOKEN = 3.75;
-var SCAN_TTL_MS = 5 * 60 * 1000;
-var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
-var SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
-var MAX_DIR_WALK_DEPTH = 5;
-
-class ResourceRegistry {
-  resources = new Map;
-  lastScanAt = 0;
-  claudeDir;
-  constructor() {
-    this.claudeDir = join3(homedir3(), ".claude");
-  }
-  scan(cwd) {
-    if (Date.now() - this.lastScanAt < SCAN_TTL_MS && this.resources.size > 0)
-      return;
-    this.resources.clear();
-    try {
-      this.scanSkills(join3(this.claudeDir, "skills"), cwd);
-      this.scanFlatAgents(join3(this.claudeDir, "agents"));
-      this.scanAgentPackages(this.claudeDir);
-      this.scanCommands(join3(this.claudeDir, "commands"), cwd);
-      this.scanWorkflows(join3(this.claudeDir, "workflows"));
-      this.scanClaudeMd(cwd);
-      this.lastScanAt = Date.now();
-    } catch (err) {
-      log3.error("scan failed", { error: String(err) });
-    }
-  }
-  resolve(kind, name) {
-    this.ensureScanned();
-    return this.resources.get(`${kind}:${name}`);
-  }
-  exists(kind, name) {
-    return this.resolve(kind, name) !== undefined;
-  }
-  getAll(kind) {
-    this.ensureScanned();
-    const all = [...this.resources.values()];
-    return kind ? all.filter((r) => r.kind === kind) : all;
-  }
-  async getOverheadReport(project, lastNSessions = 10) {
-    this.ensureScanned();
-    const tracker = new ResourceTracker;
-    const recentSkills = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "skill");
-    const recentAgents = tracker.getRecentlyUsedResources(project, lastNSessions).filter((r) => r.resource_type === "agent");
-    const allSkills = this.getAll("skill");
-    const allAgents = this.getAll("agent");
-    const usedSkillNames = new Set(recentSkills.map((r) => r.resource_name));
-    const usedAgentNames = new Set(recentAgents.map((r) => r.resource_name));
-    const unusedSkills = allSkills.filter((s) => !usedSkillNames.has(s.name));
-    const unusedAgents = allAgents.filter((a) => !usedAgentNames.has(a.name));
-    const skillListingTokens = allSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
-    const agentDescTokens = allAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
-    const commandListingTokens = this.getAll("command").reduce((sum, c) => sum + c.listing_tokens, 0);
-    const claudeMdTokens = this.getAll("claude_md").reduce((sum, c) => sum + c.full_tokens, 0);
-    const unusedSkillListingTokens = unusedSkills.reduce((sum, s) => sum + s.listing_tokens, 0);
-    const unusedAgentListingTokens = unusedAgents.reduce((sum, a) => sum + a.listing_tokens, 0);
-    const recommendations = [];
-    if (unusedSkills.length > 0) {
-      recommendations.push(`${unusedSkills.length}/${allSkills.length} skills unused in last ${lastNSessions} sessions (~${unusedSkillListingTokens} listing tokens). Consider project-local or removal.`);
-    }
-    if (unusedAgents.length > 0) {
-      recommendations.push(`${unusedAgents.length}/${allAgents.length} agents unused in last ${lastNSessions} sessions (~${unusedAgentListingTokens} listing tokens).`);
-    }
-    if (claudeMdTokens > 5000) {
-      recommendations.push(`CLAUDE.md chain is ${claudeMdTokens} tokens. Consider consolidating if >5K.`);
-    }
-    return {
-      fixed_overhead: {
-        total_tokens: skillListingTokens + agentDescTokens + commandListingTokens + claudeMdTokens,
-        skill_listings: skillListingTokens,
-        agent_descriptions: agentDescTokens,
-        command_listings: commandListingTokens,
-        claude_md: claudeMdTokens
-      },
-      usage_analysis: {
-        skills_installed: allSkills.length,
-        skills_used_recently: usedSkillNames.size,
-        skills_never_used: unusedSkills.map((s) => s.name),
-        agents_installed: allAgents.length,
-        agents_used_recently: usedAgentNames.size,
-        agents_never_used: unusedAgents.map((a) => a.name)
-      },
-      recommendations,
-      potential_savings: {
-        if_remove_unused_skills: unusedSkillListingTokens,
-        if_remove_unused_agents: unusedAgentListingTokens
-      }
-    };
-  }
-  scanSkills(globalDir, cwd) {
-    this.scanSkillDir(globalDir, "global");
-    if (cwd) {
-      const projectDir = join3(cwd, ".claude", "skills");
-      if (existsSync3(projectDir)) {
-        this.scanSkillDir(projectDir, "project");
-      }
-    }
-  }
-  scanSkillDir(dir, source) {
-    if (!existsSync3(dir))
-      return;
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isDirectory())
-          continue;
-        const name = entry.name;
-        if (!SAFE_NAME_RE.test(name))
-          continue;
-        const skillDir = join3(dir, name);
-        const skillFile = this.findPrimaryFile(skillDir, ["SKILL.md", "README.md"]);
-        const listing = this.estimateListingFromSkillDir(skillDir);
-        const fullTokens = skillFile ? this.charsToTokens(this.readFileSize(skillFile)) : 0;
-        const totalTokens = this.estimateDirTokens(skillDir);
-        this.register({
-          kind: "skill",
-          name,
-          path: skillFile ?? skillDir,
-          allPaths: this.listMdFiles(skillDir),
-          category: "variable",
-          listing_tokens: listing,
-          full_tokens: fullTokens,
-          total_tokens: totalTokens,
-          source
-        });
-      }
-    } catch (err) {
-      log3.error(`scanSkillDir ${dir}`, { error: String(err) });
-    }
-  }
-  scanFlatAgents(dir) {
-    if (!existsSync3(dir))
-      return;
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".md"))
-          continue;
-        if (entry.name === "README.md")
-          continue;
-        const filePath = join3(dir, entry.name);
-        const content = this.readFileHead(filePath, 20);
-        const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
-        if (!SAFE_NAME_RE.test(name))
-          continue;
-        const fileSize = this.readFileSize(filePath);
-        const listing = this.estimateAgentListingTokens(content);
-        this.register({
-          kind: "agent",
-          name,
-          path: filePath,
-          allPaths: [filePath],
-          category: "variable",
-          listing_tokens: listing,
-          full_tokens: this.charsToTokens(fileSize),
-          total_tokens: this.charsToTokens(fileSize),
-          source: "global"
-        });
-      }
-    } catch (err) {
-      log3.error(`scanFlatAgents ${dir}`, { error: String(err) });
-    }
-  }
-  scanAgentPackages(claudeDir) {
-    if (!existsSync3(claudeDir))
-      return;
-    try {
-      for (const entry of readdirSync(claudeDir, { withFileTypes: true })) {
-        if (!entry.isDirectory() || !entry.name.startsWith("agent_"))
-          continue;
-        const packageDir = join3(claudeDir, entry.name);
-        this.scanAgentPackageDir(packageDir);
-      }
-    } catch (err) {
-      log3.error("scanAgentPackages", { error: String(err) });
-    }
-  }
-  scanAgentPackageDir(packageDir) {
-    try {
-      for (const entry of readdirSync(packageDir, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          const subDir = join3(packageDir, entry.name);
-          const agentFile = join3(subDir, "AGENT.md");
-          if (existsSync3(agentFile)) {
-            const content = this.readFileHead(agentFile, 20);
-            const name = this.parseFrontmatterName(content) ?? entry.name;
-            if (!SAFE_NAME_RE.test(name))
-              continue;
-            const listing = this.estimateAgentListingTokens(content);
-            const fullTokens = this.charsToTokens(this.readFileSize(agentFile));
-            const totalTokens = this.estimateDirTokens(subDir);
-            this.register({
-              kind: "agent",
-              name,
-              path: agentFile,
-              allPaths: this.listMdFiles(subDir),
-              category: "variable",
-              listing_tokens: listing,
-              full_tokens: fullTokens,
-              total_tokens: totalTokens,
-              source: "global"
-            });
-          }
-        } else if (entry.isFile() && entry.name.endsWith(".md")) {
-          if (entry.name === "README.md" || entry.name === "SKILL.md")
-            continue;
-          const filePath = join3(packageDir, entry.name);
-          const content = this.readFileHead(filePath, 20);
-          const name = this.parseFrontmatterName(content) ?? basename(entry.name, ".md");
-          if (!SAFE_NAME_RE.test(name))
-            continue;
-          if (this.resources.has(`agent:${name}`))
-            continue;
-          const fileSize = this.readFileSize(filePath);
-          this.register({
-            kind: "agent",
-            name,
-            path: filePath,
-            allPaths: [filePath],
-            category: "variable",
-            listing_tokens: this.estimateAgentListingTokens(content),
-            full_tokens: this.charsToTokens(fileSize),
-            total_tokens: this.charsToTokens(fileSize),
-            source: "global"
-          });
-        }
-      }
-    } catch (err) {
-      log3.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
-    }
-  }
-  scanCommands(globalDir, cwd) {
-    if (existsSync3(globalDir))
-      this.scanCommandDir(globalDir, globalDir, "global");
-    if (cwd) {
-      const projectDir = join3(cwd, ".claude", "commands");
-      if (existsSync3(projectDir))
-        this.scanCommandDir(projectDir, projectDir, "project");
-    }
-  }
-  scanCommandDir(dir, baseDir, source) {
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          this.scanCommandDir(join3(dir, entry.name), baseDir, source);
-        } else if (entry.isFile() && entry.name.endsWith(".md")) {
-          const filePath = join3(dir, entry.name);
-          const name = relative(baseDir, filePath).replace(/\.md$/, "");
-          if (!SAFE_COMMAND_NAME_RE.test(name))
-            continue;
-          const fileSize = this.readFileSize(filePath);
-          const content = this.readFileHead(filePath, 3);
-          this.register({
-            kind: "command",
-            name,
-            path: filePath,
-            allPaths: [filePath],
-            category: "variable",
-            listing_tokens: this.estimateCommandListingTokens(name, content),
-            full_tokens: this.charsToTokens(fileSize),
-            total_tokens: this.charsToTokens(fileSize),
-            source
-          });
-        }
-      }
-    } catch (err) {
-      log3.error(`scanCommandDir ${dir}`, { error: String(err) });
-    }
-  }
-  scanWorkflows(dir) {
-    if (!existsSync3(dir))
-      return;
-    try {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".md"))
-          continue;
-        const filePath = join3(dir, entry.name);
-        const name = basename(entry.name, ".md");
-        if (!SAFE_NAME_RE.test(name))
-          continue;
-        const fileSize = this.readFileSize(filePath);
-        this.register({
-          kind: "workflow",
-          name,
-          path: filePath,
-          allPaths: [filePath],
-          category: "variable",
-          listing_tokens: 0,
-          full_tokens: this.charsToTokens(fileSize),
-          total_tokens: this.charsToTokens(fileSize),
-          source: "global"
-        });
-      }
-    } catch (err) {
-      log3.error(`scanWorkflows ${dir}`, { error: String(err) });
-    }
-  }
-  scanClaudeMd(cwd) {
-    const globalFile = join3(this.claudeDir, "CLAUDE.md");
-    if (existsSync3(globalFile)) {
-      const fileSize = this.readFileSize(globalFile);
-      this.register({
-        kind: "claude_md",
-        name: "global",
-        path: globalFile,
-        allPaths: [globalFile],
-        category: "fixed",
-        listing_tokens: 0,
-        full_tokens: this.charsToTokens(fileSize),
-        total_tokens: this.charsToTokens(fileSize),
-        source: "global"
-      });
-    }
-    if (!cwd)
-      return;
-    const projectFiles = [
-      join3(cwd, "CLAUDE.md"),
-      join3(cwd, ".claude", "CLAUDE.md")
-    ];
-    for (const file of projectFiles) {
-      if (!existsSync3(file))
-        continue;
-      const relPath = relative(cwd, file).replace(/[^a-zA-Z0-9_\-:.\/]/g, "_");
-      if (!SAFE_COMMAND_NAME_RE.test(relPath))
-        continue;
-      const name = `project:${relPath}`;
-      const fileSize = this.readFileSize(file);
-      this.register({
-        kind: "claude_md",
-        name,
-        path: file,
-        allPaths: [file],
-        category: "fixed",
-        listing_tokens: 0,
-        full_tokens: this.charsToTokens(fileSize),
-        total_tokens: this.charsToTokens(fileSize),
-        source: "project"
-      });
-    }
-  }
-  ensureScanned() {
-    if (this.resources.size === 0 || Date.now() - this.lastScanAt >= SCAN_TTL_MS) {
-      this.scan();
-    }
-  }
-  register(resource) {
-    const key = `${resource.kind}:${resource.name}`;
-    const existing = this.resources.get(key);
-    if (existing && existing.source === "global" && resource.source === "project") {
-      this.resources.set(key, resource);
-    } else if (!existing) {
-      this.resources.set(key, resource);
-    }
-  }
-  parseFrontmatterName(content) {
-    const lines = content.split(`
-`);
-    let inFrontmatter = false;
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed === "---") {
-        if (inFrontmatter)
-          return;
-        inFrontmatter = true;
-        continue;
-      }
-      if (!inFrontmatter)
-        continue;
-      const m = trimmed.match(/^name:\s*["']?([a-zA-Z0-9_\-]+)["']?/);
-      if (m?.[1])
-        return m[1];
-    }
-    return;
-  }
-  findPrimaryFile(dir, candidates) {
-    for (const c of candidates) {
-      const p = join3(dir, c);
-      if (existsSync3(p))
-        return p;
-    }
-    return;
-  }
-  readFileHead(filePath, lines) {
-    try {
-      const content = readFileSync(filePath, "utf-8");
-      return content.split(`
-`).slice(0, lines).join(`
-`);
-    } catch {
-      return "";
-    }
-  }
-  readFileSize(filePath) {
-    try {
-      return statSync(filePath).size;
-    } catch {
-      return 0;
-    }
-  }
-  charsToTokens(chars) {
-    return Math.ceil(chars / CHARS_PER_TOKEN);
-  }
-  estimateListingFromSkillDir(dir) {
-    const skillFile = this.findPrimaryFile(dir, ["SKILL.md", "README.md"]);
-    if (!skillFile)
-      return 30;
-    const head = this.readFileHead(skillFile, 5);
-    const descLine = head.split(`
-`).find((l) => l.startsWith("description:") || l.trim() && !l.startsWith("#") && !l.startsWith("---"));
-    const descLen = descLine?.slice(0, 80).length ?? 20;
-    return Math.ceil((descLen + 30) / CHARS_PER_TOKEN);
-  }
-  estimateAgentListingTokens(headContent) {
-    const lines = headContent.split(`
-`);
-    for (const line of lines) {
-      if (line.startsWith("description:")) {
-        const desc = line.slice(12).trim().slice(0, 150);
-        return Math.ceil((desc.length + 30) / CHARS_PER_TOKEN);
-      }
-    }
-    return 30;
-  }
-  estimateCommandListingTokens(name, headContent) {
-    const firstLine = headContent.split(`
-`).find((l) => l.trim() && !l.startsWith("#") && !l.startsWith("---"));
-    const descLen = firstLine?.slice(0, 60).length ?? 10;
-    return Math.ceil((name.length + descLen + 10) / CHARS_PER_TOKEN);
-  }
-  listMdFiles(dir) {
-    const files = [];
-    try {
-      const walk = (d, depth) => {
-        if (depth > MAX_DIR_WALK_DEPTH)
-          return;
-        for (const entry of readdirSync(d, { withFileTypes: true })) {
-          const p = join3(d, entry.name);
-          if (entry.isDirectory())
-            walk(p, depth + 1);
-          else if (entry.isFile() && entry.name.endsWith(".md"))
-            files.push(p);
-        }
-      };
-      walk(dir, 0);
-    } catch {}
-    return files;
-  }
-  estimateDirTokens(dir) {
-    return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
-  }
-}
-var _instance;
-function getResourceRegistry() {
-  if (!_instance)
-    _instance = new ResourceRegistry;
-  return _instance;
-}
-
-// src/context/smart-resource-loader.ts
-var DEFAULT_TOKEN_BUDGET = 30000;
-
-class SmartResourceLoader {
-  tracker;
-  ltStore;
-  registry;
-  constructor(registry) {
-    this.tracker = new ResourceTracker;
-    this.ltStore = new LongTermStore;
-    this.registry = registry ?? getResourceRegistry();
-  }
-  buildContextPlan(project, userPrompt, tokenBudget = DEFAULT_TOKEN_BUDGET, cwd) {
-    this.registry.scan(cwd);
-    const recommendations = [];
-    const recent = this.tracker.getRecentlyUsedResources(project, 5);
-    for (const r of recent) {
-      const tokenCost = this.getTokenCost(r.resource_type, r.resource_name);
-      if (tokenCost === 0)
-        continue;
-      recommendations.push({
-        resource_type: r.resource_type,
-        resource_name: r.resource_name,
-        score: Math.min(100, r.frequency * 20),
-        token_cost: tokenCost,
-        reason: `used in ${r.frequency}/5 recent sessions`
-      });
-    }
-    if (userPrompt.trim()) {
-      const searchResults = this.ltStore.search(userPrompt, 3);
-      for (const result of searchResults) {
-        const files = safeJson(result.files_touched, []);
-        for (const file of files.slice(0, 5)) {
-          const existing = recommendations.find((r) => r.resource_name === file && r.resource_type === "claude_md");
-          if (!existing) {
-            recommendations.push({
-              resource_type: "claude_md",
-              resource_name: file,
-              score: 40,
-              token_cost: this.getTokenCost("claude_md", file),
-              reason: "touched in similar past session"
-            });
-          }
-        }
-      }
-    }
-    recommendations.sort((a, b) => b.score - a.score);
-    let usedTokens = 0;
-    const included = [];
-    const skipped = [];
-    for (const r of recommendations) {
-      if (usedTokens + r.token_cost <= tokenBudget) {
-        included.push(r);
-        usedTokens += r.token_cost;
-      } else {
-        skipped.push(r);
-      }
-    }
-    return {
-      recommendations: included,
-      total_tokens: usedTokens,
-      budget_remaining: tokenBudget - usedTokens,
-      skipped
-    };
-  }
-  formatContextAdvice(plan) {
-    if (plan.recommendations.length === 0 && plan.skipped.length === 0)
-      return "";
-    const lines = [];
-    if (plan.recommendations.length > 0) {
-      lines.push("**Frequently-used resources in this project:**");
-      for (const r of plan.recommendations.slice(0, 5)) {
-        lines.push(`  - ${r.resource_type}:${r.resource_name} (${r.reason})`);
-      }
-    }
-    if (plan.skipped.length > 0) {
-      const totalSkippedTokens = plan.skipped.reduce((sum, s) => sum + s.token_cost, 0);
-      lines.push(`${plan.skipped.length} resource(s) rarely used (~${totalSkippedTokens} tokens overhead).`);
-    }
-    return lines.join(`
-`);
-  }
-  getTokenCost(resourceType, resourceName) {
-    const kind = resourceTypeToKind(resourceType);
-    if (!kind)
-      return 500;
-    const resource = this.registry.resolve(kind, resourceName);
-    return resource?.full_tokens ?? 0;
-  }
-}
-function resourceTypeToKind(type) {
-  const mapping = {
-    skill: "skill",
-    agent: "agent",
-    command: "command",
-    workflow: "workflow",
-    claude_md: "claude_md",
-    mcp_tool: "mcp_tool",
-    hook: "hook",
-    memory: "memory"
-  };
-  return mapping[type];
-}
-function safeJson(text, fallback) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return fallback;
-  }
-}
-
-// src/context/injection-validator.ts
-init_logger();
-var log4 = createLogger("injection-validator");
-var MAX_CHARS = 8000;
-
-class InjectionValidator {
-  registry;
-  constructor(registry) {
-    this.registry = registry;
-  }
-  validate(rawContext, recommendations) {
-    try {
-      if (!rawContext)
-        return "";
-      let text = rawContext;
-      text = text.replace(/<!--[\s\S]*?-->/g, "");
-      text = text.replace(/<\/?system-reminder>/gi, "");
-      text = text.replace(/<\/?instructions>/gi, "");
-      text = text.trim();
-      if (text.length > MAX_CHARS) {
-        text = text.slice(0, MAX_CHARS) + `
-[...truncated for token efficiency]`;
-      }
-      return text;
-    } catch (err) {
-      log4.error("validation failed, returning empty", { error: String(err) });
-      return "";
-    }
-  }
-  filterAliveRecommendations(recommendations) {
-    return recommendations.filter((r) => {
-      const kind = mapResourceTypeToKind(r.resource_type);
-      if (!kind)
-        return true;
-      const alive = this.registry.exists(kind, r.resource_name);
-      if (!alive) {
-        log4.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
-      }
-      return alive;
-    });
-  }
-}
-function mapResourceTypeToKind(type) {
-  const mapping = {
-    skill: "skill",
-    agent: "agent",
-    command: "command",
-    workflow: "workflow",
-    claude_md: "claude_md",
-    mcp_tool: "mcp_tool",
-    hook: "hook",
-    memory: "memory"
-  };
-  return mapping[type];
-}
-
-// src/context/claude-md-tracker.ts
-init_schema();
-init_logger();
-import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
-import { homedir as homedir4 } from "os";
-import { join as join4, dirname, basename as basename2 } from "path";
-var log5 = createLogger("claude-md-tracker");
-var MAX_WALK_DEPTH = 20;
-var CHARS_PER_TOKEN2 = 3.75;
-var STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
-
-class ClaudeMdTracker {
-  db;
-  constructor(db) {
-    this.db = db ?? getDatabase();
-  }
-  scanAndUpdate(cwd, project) {
-    const paths = this.walkToRoot(cwd);
-    const entries = [];
-    for (const filePath of paths) {
-      try {
-        const content = readFileSync2(filePath, "utf-8");
-        const hash = this.computeHash(content);
-        const existing = this.db.query("SELECT content_hash, sections_json, token_cost FROM claude_md_registry WHERE path = ?").get(filePath);
-        if (existing && existing.content_hash === hash) {
-          this.db.run("UPDATE claude_md_registry SET last_seen = ? WHERE path = ?", [Date.now(), filePath]);
-          entries.push({
-            path: filePath,
-            project,
-            contentHash: hash,
-            sections: safeJson2(existing.sections_json, []),
-            tokenCost: existing.token_cost
-          });
-        } else {
-          const sections = this.extractSections(content);
-          const tokenCost = Math.ceil(content.length / CHARS_PER_TOKEN2);
-          const sectionsJson = JSON.stringify(sections);
-          this.db.run(`INSERT INTO claude_md_registry(path, project, content_hash, sections_json, last_seen, token_cost)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(path) DO UPDATE SET
-               project = excluded.project,
-               content_hash = excluded.content_hash,
-               sections_json = excluded.sections_json,
-               last_seen = excluded.last_seen,
-               token_cost = excluded.token_cost`, [filePath, project, hash, sectionsJson, Date.now(), tokenCost]);
-          entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
-        }
-      } catch (err) {
-        log5.error(`Failed to process ${filePath}`, { error: String(err) });
-      }
-    }
-    return entries;
-  }
-  getRegistryForProject(project) {
-    const cutoff = Date.now() - STALE_THRESHOLD_MS;
-    const rows = this.db.query("SELECT path, project, content_hash, sections_json, token_cost FROM claude_md_registry WHERE project = ? AND last_seen > ?").all(project, cutoff);
-    return rows.map((r) => ({
-      path: r.path,
-      project: r.project,
-      contentHash: r.content_hash,
-      sections: safeJson2(r.sections_json, []),
-      tokenCost: r.token_cost
-    }));
-  }
-  filterNonRedundant(entries, cwd) {
-    if (entries.length === 0 || !cwd)
-      return entries;
-    const homeClaudeMd = join4(homedir4(), ".claude", "CLAUDE.md");
-    let projectRootClaudeMd;
-    let dir = cwd;
-    while (true) {
-      const candidate = entries.find((e) => dirname(e.path) === dir);
-      if (candidate) {
-        projectRootClaudeMd = candidate.path;
-        break;
-      }
-      const parent = dirname(dir);
-      if (parent === dir)
-        break;
-      dir = parent;
-    }
-    return entries.filter((e) => {
-      if (e.path === homeClaudeMd)
-        return false;
-      if (e.path === projectRootClaudeMd)
-        return false;
-      return true;
-    });
-  }
-  formatForInjection(entries, maxChars) {
-    if (entries.length === 0)
-      return "";
-    const minimal = `CLAUDE.md: ${entries.map((e) => basename2(dirname(e.path)) + "/" + basename2(e.path)).join(", ")}`;
-    if (maxChars !== undefined && maxChars < 200)
-      return minimal;
-    const compactLines = ["**Active CLAUDE.md rules:**"];
-    for (const e of entries) {
-      compactLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok)`);
-    }
-    const compact = compactLines.join(`
-`);
-    if (maxChars !== undefined && maxChars < 500)
-      return compact;
-    const fullLines = ["**Active CLAUDE.md rules:**"];
-    for (const e of entries) {
-      const headings = e.sections.map((s) => s.heading).join(", ");
-      fullLines.push(`- ${basename2(dirname(e.path))}/${basename2(e.path)} (~${e.tokenCost} tok): ${headings || "no sections"}`);
-    }
-    return fullLines.join(`
-`);
-  }
-  computeHash(content) {
-    const hasher = new Bun.CryptoHasher("md5");
-    hasher.update(content);
-    return hasher.digest("hex");
-  }
-  extractSections(content) {
-    const sections = [];
-    const lines = content.split(`
-`);
-    let currentHeading;
-    let currentBody = [];
-    const flush = () => {
-      if (currentHeading) {
-        const body = currentBody.join(`
-`).trim().slice(0, 200);
-        sections.push({ heading: currentHeading, preview: body });
-      }
-    };
-    for (const line of lines) {
-      const m = line.match(/^## (.+)$/);
-      if (m) {
-        flush();
-        currentHeading = m[1].trim();
-        currentBody = [];
-      } else if (currentHeading) {
-        currentBody.push(line);
-      }
-    }
-    flush();
-    return sections;
-  }
-  walkToRoot(startDir) {
-    const paths = [];
-    let current = startDir;
-    let depth = 0;
-    while (depth < MAX_WALK_DEPTH) {
-      const file = join4(current, "CLAUDE.md");
-      if (existsSync4(file))
-        paths.push(file);
-      const dotClaudeFile = join4(current, ".claude", "CLAUDE.md");
-      if (existsSync4(dotClaudeFile))
-        paths.push(dotClaudeFile);
-      const parent = dirname(current);
-      if (parent === current)
-        break;
-      current = parent;
-      depth++;
-    }
-    return paths;
-  }
-}
-function safeJson2(text, fallback) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return fallback;
-  }
-}
-
 // src/context/prompt-analyzer.ts
-import { existsSync as existsSync5, readdirSync as readdirSync2, statSync as statSync2 } from "fs";
-import { join as join5 } from "path";
+import { existsSync as existsSync6, readdirSync as readdirSync2, statSync as statSync2 } from "fs";
+import { join as join6 } from "path";
 var INTENT_PATTERNS = [
   { intent: "debug", re: /\b(bug|error|crash|fail|broken|not work|fix|debug|exception|stack ?trace|loi|s\u1EEDa|sua|hong|loi)\b/i },
   { intent: "design", re: /\b(design|ui|ux|layout|figma|component|wireframe|mockup|style|color|theme|thiet ke|thi\u1EBFt k\u1EBF)\b/i },
@@ -2248,7 +2380,7 @@ function scanCwdSignals(cwd) {
     is_mobile: false,
     primary_language: null
   };
-  if (!cwd || !existsSync5(cwd)) {
+  if (!cwd || !existsSync6(cwd)) {
     CWD_CACHE.set(cwd, { signals, ts: Date.now() });
     return signals;
   }
@@ -2260,11 +2392,11 @@ function scanCwdSignals(cwd) {
   return signals;
 }
 function detectFromManifest(cwd, s) {
-  const has = (rel) => existsSync5(join5(cwd, rel));
+  const has = (rel) => existsSync6(join6(cwd, rel));
   if (has("package.json")) {
     s.has_typescript = has("tsconfig.json") || has("tsconfig.base.json");
     try {
-      const pkg = JSON.parse(__require("fs").readFileSync(join5(cwd, "package.json"), "utf-8"));
+      const pkg = JSON.parse(__require("fs").readFileSync(join6(cwd, "package.json"), "utf-8"));
       const deps = { ...pkg.dependencies ?? {}, ...pkg.devDependencies ?? {} };
       if (deps["react-native"] || deps["expo"])
         s.has_react_native = true;
@@ -2302,7 +2434,7 @@ function detectFromExtensions(cwd, s) {
       break;
     if (name.startsWith("."))
       continue;
-    const p = join5(cwd, name);
+    const p = join6(cwd, name);
     try {
       const stat = statSync2(p);
       if (stat.isFile()) {
@@ -2365,7 +2497,7 @@ init_schema();
 
 // src/search/embedding-model.ts
 init_logger();
-var log6 = createLogger("embedding-model");
+var log7 = createLogger("embedding-model");
 var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 var EMBEDDING_DIM = 384;
 class EmbeddingModel {
@@ -2382,7 +2514,7 @@ class EmbeddingModel {
       const result = await this.pipeline(text, { pooling: "mean", normalize: true });
       return new Float32Array(result.data);
     } catch (err) {
-      log6.error("embed failed", { error: String(err) });
+      log7.error("embed failed", { error: String(err) });
       return null;
     }
   }
@@ -2438,9 +2570,9 @@ class EmbeddingModel {
       env.allowRemoteModels = true;
       const t0 = Date.now();
       this.pipeline = await pipeline("feature-extraction", MODEL_NAME, { dtype: "fp32" });
-      log6.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+      log7.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
     } catch (err) {
-      log6.warn("Embedding model unavailable", { error: String(err) });
+      log7.warn("Embedding model unavailable", { error: String(err) });
       this.available = false;
     }
   }
@@ -2490,7 +2622,7 @@ function cosineSimilarity(a, b) {
 
 // src/context/resource-matcher.ts
 init_logger();
-var log7 = createLogger("resource-matcher");
+var log8 = createLogger("resource-matcher");
 var CONTEXT_BOOSTS = [
   { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
   { when: (s) => s.has_kotlin, names: ["android-developer", "kotlin", "compose"] },
@@ -2559,7 +2691,7 @@ async function matchResourcesForPrompt(prompt, analysis, opts) {
       return b.score - a.score;
     return (KIND_ORDER[a.kind] ?? 99) - (KIND_ORDER[b.kind] ?? 99);
   });
-  log7.info("matched resources", {
+  log8.info("matched resources", {
     candidates: all.length,
     above_threshold: filtered.length,
     ms: Date.now() - t0
@@ -2729,99 +2861,6 @@ function compactWhitespace(s) {
   return s.replace(/\s+/g, " ").trim();
 }
 
-// src/context/awareness-hint.ts
-init_schema();
-function buildAwarenessHint(options) {
-  if (options.isCommandInvocation)
-    return "";
-  const db = options.db ?? getDatabase();
-  const stats = collectStats(db, options.project);
-  if (stats.summaries === 0 && stats.messages === 0)
-    return "";
-  if (options.hasMemoryInjected || options.hasRecentConvoInjected) {
-    return shortHint(stats);
-  }
-  return fullHint(stats);
-}
-function shortHint(s) {
-  return [
-    "**\uD83E\uDDE0 Memory hub:** " + `${s.summaries} sessions, ${s.messages} messages stored. ` + "Call `memory_search` or `memory_conversation` for more."
-  ].join(`
-`);
-}
-function fullHint(s) {
-  const lines = [
-    "**\uD83E\uDDE0 Memory hub active**",
-    `_Stored: ${s.summaries} summaries, ${s.messages} messages, ${s.resources} indexed resources` + (s.project_summaries > 0 ? ` (${s.project_summaries} for current project)._` : `._`),
-    "_Before answering questions about prior work, files, decisions, or chat history, " + "call one of:_",
-    "  - `memory_recall` \u2014 search summaries by keyword",
-    "  - `memory_search` \u2014 3-layer progressive search (use for technical terms)",
-    "  - `memory_conversation` \u2014 retrieve raw user/assistant messages",
-    "  - `memory_resources_for_prompt` \u2014 find best skill/agent for the task",
-    `_Do not say "I don't have access to previous chats" \u2014 query first._`
-  ];
-  return lines.join(`
-`);
-}
-function collectStats(db, project) {
-  const summaries = db.query("SELECT COUNT(*) n FROM long_term_summaries").get()?.n ?? 0;
-  const messages = db.query("SELECT COUNT(*) n FROM messages").get()?.n ?? 0;
-  const resources = db.query("SELECT COUNT(*) n FROM resource_descriptions").get()?.n ?? 0;
-  const projectSummaries = db.query("SELECT COUNT(*) n FROM long_term_summaries WHERE project = ?").get(project)?.n ?? 0;
-  return {
-    summaries,
-    messages,
-    resources,
-    project_summaries: projectSummaries
-  };
-}
-
-// src/db/injection-telemetry.ts
-init_schema();
-init_logger();
-var log8 = createLogger("injection-telemetry");
-function logInjection(entry, db) {
-  if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
-    return;
-  try {
-    const d = db ?? getDatabase();
-    d.run(`INSERT INTO injection_log(
-         session_id, project, intent, language,
-         prompt_length,
-         smart_match_count, smart_match_top_score,
-         memory_section_chars, claude_md_chars,
-         recent_convo_chars, awareness_hint_chars,
-         total_injection_chars,
-         history_intent_matched, injected_at, dedup_skipped, timestamp
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-      entry.session_id,
-      entry.project,
-      entry.intent,
-      entry.language,
-      entry.prompt_length,
-      entry.smart_match_count,
-      entry.smart_match_top_score,
-      entry.memory_section_chars,
-      entry.claude_md_chars,
-      entry.recent_convo_chars,
-      entry.awareness_hint_chars,
-      entry.total_injection_chars,
-      entry.history_intent_matched ? 1 : 0,
-      entry.injected_at ?? "prompt",
-      entry.dedup_skipped ?? 0,
-      Date.now()
-    ]);
-  } catch (err) {
-    log8.warn("logInjection failed", { error: String(err) });
-  }
-}
-function pruneInjectionLog(olderThanDays = 90, db) {
-  const d = db ?? getDatabase();
-  const cutoff = Date.now() - olderThanDays * 86400000;
-  const result = d.run(`DELETE FROM injection_log WHERE timestamp < ?`, [cutoff]);
-  return result.changes;
-}
-
 // src/capture/smart-truncate.ts
 var MIN_USEFUL_RATIO = 0.8;
 var MARKER = `
@@ -2859,43 +2898,6 @@ var ROLE_CAPS = {
 };
 function capForRole(role) {
   return ROLE_CAPS[role];
-}
-
-// src/context/injection-state.ts
-import { existsSync as existsSync6, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3, unlinkSync } from "fs";
-import { join as join6 } from "path";
-import { homedir as homedir5 } from "os";
-var STATE_DIR = join6(homedir5(), ".claude-memory-hub", "proactive");
-function statePath(sessionId) {
-  return join6(STATE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}-inject.json`);
-}
-function loadInjectionState(sessionId) {
-  try {
-    const path = statePath(sessionId);
-    if (existsSync6(path)) {
-      const parsed = JSON.parse(readFileSync3(path, "utf-8"));
-      return {
-        baselineInjected: parsed.baselineInjected === true,
-        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : []
-      };
-    }
-  } catch {}
-  return { baselineInjected: false, injectedSummaryIds: [] };
-}
-function saveInjectionState(sessionId, state) {
-  try {
-    if (!existsSync6(STATE_DIR)) {
-      mkdirSync3(STATE_DIR, { recursive: true, mode: 448 });
-    }
-    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
-  } catch {}
-}
-function cleanupInjectionState(sessionId) {
-  try {
-    const path = statePath(sessionId);
-    if (existsSync6(path))
-      unlinkSync(path);
-  } catch {}
 }
 
 // src/capture/hook-handler.ts
@@ -3183,253 +3185,99 @@ function projectFromCwd(cwd) {
   return basename3(cwd);
 }
 
-// src/capture/batch-queue.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync as unlinkSync2, statSync as statSync3 } from "fs";
-import { join as join7 } from "path";
-import { homedir as homedir6 } from "os";
-init_logger();
-var log9 = createLogger("batch-queue");
-var DATA_DIR = join7(homedir6(), ".claude-memory-hub");
-var BATCH_DIR = join7(DATA_DIR, "batch");
-var QUEUE_PATH = join7(BATCH_DIR, "queue.jsonl");
-var LOCK_PATH = join7(BATCH_DIR, "queue.lock");
-var MAX_QUEUE_SIZE = 100 * 1024;
-var LOCK_STALE_MS = 30000;
-function enqueueEvent(event) {
-  try {
-    ensureBatchDir();
-    const line = JSON.stringify(event) + `
-`;
-    appendFileSync2(QUEUE_PATH, line, "utf-8");
-  } catch (err) {
-    log9.error("enqueue failed", { error: String(err) });
-    throw err;
-  }
-}
-function tryFlush() {
-  try {
-    if (!existsSync7(QUEUE_PATH))
-      return false;
-    const stat = statSync3(QUEUE_PATH);
-    if (stat.size === 0)
-      return false;
-    if (!tryAcquireLock())
-      return false;
-    try {
-      flushQueue();
-      return true;
-    } finally {
-      releaseLock();
-    }
-  } catch (err) {
-    log9.error("flush failed", { error: String(err) });
-    return false;
-  }
-}
-function flushQueue() {
-  const content = readFileSync4(QUEUE_PATH, "utf-8").trim();
-  if (!content)
-    return;
-  const events = [];
-  for (const line of content.split(`
-`)) {
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-      log9.warn("skipping malformed queue line");
-    }
-  }
-  if (events.length === 0)
-    return;
+// src/capture/session-start-handler.ts
+async function handleSessionStart(hook, project) {
+  if (hook.source === "compact")
+    return { additionalContext: "" };
   const store = new SessionStore;
-  const tracker = new ResourceTracker;
-  const registry = getResourceRegistry();
-  const db = store["db"];
-  db.transaction(() => {
-    for (const event of events) {
-      store.upsertSession({
-        id: event.session.id,
-        project: event.session.project,
-        started_at: event.session.started_at,
-        status: "active"
-      });
-      for (const entity of event.entities) {
-        store.insertEntity({ ...entity, project: event.session.project });
-      }
-      if (event.resources) {
-        for (const r of event.resources) {
-          const resource = registry.resolve(r.type, r.name);
-          tracker.trackUsage(event.session.id, event.session.project, r.type, r.name, r.tokenCost ?? resource?.full_tokens ?? 0);
-        }
-      }
-    }
-  })();
-  writeFileSync2(QUEUE_PATH, "", "utf-8");
-  log9.info("batch flushed", { events: events.length });
-}
-function tryAcquireLock() {
-  try {
-    if (existsSync7(LOCK_PATH)) {
-      const lockContent = readFileSync4(LOCK_PATH, "utf-8").trim();
-      const [pidStr, timestampStr] = lockContent.split(":");
-      const lockTime = Number(timestampStr);
-      if (Date.now() - lockTime < LOCK_STALE_MS) {
-        const pid = Number(pidStr);
-        try {
-          process.kill(pid, 0);
-          return false;
-        } catch {}
-      }
-    }
-    writeFileSync2(LOCK_PATH, `${process.pid}:${Date.now()}`, "utf-8");
-    return true;
-  } catch {
-    return false;
-  }
-}
-function releaseLock() {
-  try {
-    unlinkSync2(LOCK_PATH);
-  } catch {}
-}
-function ensureBatchDir() {
-  if (!existsSync7(BATCH_DIR)) {
-    mkdirSync4(BATCH_DIR, { recursive: true, mode: 448 });
-  }
-}
-function isBatchEnabled() {
-  const mode = process.env["CLAUDE_MEMORY_HUB_BATCH"] ?? "auto";
-  return mode !== "disabled";
-}
-
-// src/retrieval/proactive-retrieval.ts
-import { existsSync as existsSync8, readFileSync as readFileSync5, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5 } from "fs";
-import { join as join8 } from "path";
-import { homedir as homedir7 } from "os";
-init_logger();
-var log10 = createLogger("proactive-retrieval");
-var DATA_DIR2 = join8(homedir7(), ".claude-memory-hub");
-var PROACTIVE_DIR = join8(DATA_DIR2, "proactive");
-var TOOL_CALL_INTERVAL = 15;
-var MAX_INJECTION_CHARS = 3000;
-function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse) {
-  const state = loadState(sessionId);
-  state.toolCallCount++;
-  const filePath = extractFilePath(toolName, toolInput);
-  if (filePath) {
-    state.recentFiles = [...new Set([filePath, ...state.recentFiles])].slice(0, 20);
-  }
-  const shouldTrigger = state.toolCallCount % TOOL_CALL_INTERVAL === 0 || toolName === "Bash" && typeof toolResponse.exit_code === "number" && toolResponse.exit_code !== 0 && state.toolCallCount > 5;
-  if (!shouldTrigger) {
-    saveState(sessionId, state);
-    return { shouldInject: false };
-  }
-  const currentTopic = detectTopic(state.recentFiles);
-  if (!currentTopic || state.injectedTopics.includes(currentTopic)) {
-    saveState(sessionId, state);
-    return { shouldInject: false };
-  }
   const ltStore = new LongTermStore;
-  const results = ltStore.search(currentTopic, 2);
-  if (results.length === 0) {
-    state.injectedTopics.push(currentTopic);
-    saveState(sessionId, state);
-    return { shouldInject: false };
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    status: "active"
+  });
+  let recent = ltStore.getRecentSummaries(project, 3);
+  if (recent.length === 0)
+    recent = ltStore.getRecentSummariesAll(3);
+  let memoryHint = "";
+  const total = ltStore.countSummaries();
+  if (recent.length > 0 && total > recent.length) {
+    memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
   }
-  const lines = [`**Relevant past context** (topic: ${currentTopic}):`];
-  for (const r of results) {
-    const date = new Date(r.created_at).toLocaleDateString();
-    lines.push(`- [${date}] ${r.summary.slice(0, 400)}`);
-    const files = safeJson4(r.files_touched, []);
-    if (files.length > 0)
-      lines.push(`  Files: ${files.slice(0, 3).join(", ")}`);
-  }
-  let context = lines.join(`
-`);
-  if (context.length > MAX_INJECTION_CHARS) {
-    context = context.slice(0, MAX_INJECTION_CHARS) + `
-[...truncated]`;
-  }
-  state.injectedTopics.push(currentTopic);
-  state.lastInjectionAt = Date.now();
-  saveState(sessionId, state);
-  log10.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
-  return { shouldInject: true, additionalContext: context };
-}
-function cleanupProactiveState(sessionId) {
-  const path = statePath2(sessionId);
+  const memorySection = buildMemorySection(recent, memoryHint);
+  const registry = getResourceRegistry();
+  const validator = new InjectionValidator(registry);
+  let advice = "";
+  let mdSummary = "";
+  let overheadWarning = "";
   try {
-    if (existsSync8(path)) {
-      const { unlinkSync: unlinkSync3 } = __require("fs");
-      unlinkSync3(path);
+    registry.scan(hook.cwd);
+    const loader = new SmartResourceLoader(registry);
+    const plan = loader.buildContextPlan(project, "", 30000, hook.cwd);
+    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+    advice = loader.formatContextAdvice(plan);
+  } catch {}
+  if (hook.cwd) {
+    try {
+      const mdTracker = new ClaudeMdTracker;
+      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+      const tracker = new ResourceTracker;
+      for (const entry of mdEntries) {
+        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      }
+      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+      mdSummary = mdTracker.formatForInjection(injectableEntries);
+    } catch {}
+  }
+  try {
+    const overhead = await registry.getOverheadReport(project);
+    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+    if (unusedTokens > 1e4) {
+      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
     }
   } catch {}
-}
-function detectTopic(recentFiles) {
-  if (recentFiles.length < 3)
-    return null;
-  const dirs = recentFiles.map((f) => f.split("/").slice(0, -1).join("/")).filter(Boolean);
-  const dirCounts = new Map;
-  for (const d of dirs) {
-    const parts = d.split("/").filter(Boolean);
-    const leaf = parts[parts.length - 1];
-    if (leaf && leaf !== "src" && leaf !== "lib" && leaf !== "utils") {
-      dirCounts.set(leaf, (dirCounts.get(leaf) ?? 0) + 1);
-    }
-  }
-  let bestTopic = null;
-  let bestCount = 0;
-  for (const [topic, count] of dirCounts) {
-    if (count > bestCount) {
-      bestTopic = topic;
-      bestCount = count;
-    }
-  }
-  const fileNames = recentFiles.map((f) => f.split("/").pop() ?? "").filter(Boolean);
-  const keywords = ["auth", "payment", "user", "api", "database", "config", "test", "migration", "deploy", "search"];
-  for (const kw of keywords) {
-    const matches = fileNames.filter((f) => f.toLowerCase().includes(kw));
-    if (matches.length >= 2)
-      return kw;
-  }
-  return bestTopic;
-}
-function statePath2(sessionId) {
-  return join8(PROACTIVE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
-}
-function loadState(sessionId) {
-  const path = statePath2(sessionId);
+  let awarenessHint = "";
   try {
-    if (existsSync8(path)) {
-      return JSON.parse(readFileSync5(path, "utf-8"));
-    }
+    awarenessHint = buildAwarenessHint({
+      project,
+      isCommandInvocation: false,
+      hasMemoryInjected: memorySection.length > 0,
+      hasRecentConvoInjected: false
+    });
   } catch {}
-  return { toolCallCount: 0, lastInjectionAt: 0, injectedTopics: [], recentFiles: [] };
-}
-function saveState(sessionId, state) {
+  const safeContext = validator.validate(fitWithinBudget(memorySection, "", awarenessHint, mdSummary, "", advice, overheadWarning));
+  const state = loadInjectionState(hook.session_id);
+  state.baselineInjected = true;
+  state.injectedSummaryIds = [
+    ...new Set([...state.injectedSummaryIds, ...recent.map((r) => r.session_id)])
+  ];
+  saveInjectionState(hook.session_id, state);
   try {
-    if (!existsSync8(PROACTIVE_DIR)) {
-      mkdirSync5(PROACTIVE_DIR, { recursive: true, mode: 448 });
-    }
-    writeFileSync3(statePath2(sessionId), JSON.stringify(state), "utf-8");
+    logInjection({
+      session_id: hook.session_id,
+      project,
+      intent: "session_start",
+      language: null,
+      prompt_length: 0,
+      smart_match_count: 0,
+      smart_match_top_score: 0,
+      memory_section_chars: memorySection.length,
+      claude_md_chars: mdSummary.length,
+      recent_convo_chars: 0,
+      awareness_hint_chars: awarenessHint.length,
+      total_injection_chars: safeContext.length,
+      history_intent_matched: false,
+      injected_at: "session_start",
+      dedup_skipped: 0
+    });
   } catch {}
-}
-function extractFilePath(toolName, toolInput) {
-  if (toolName === "Read" || toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit") {
-    const fp = toolInput.file_path;
-    return typeof fp === "string" ? fp : undefined;
-  }
-  return;
-}
-function safeJson4(text, fallback) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return fallback;
-  }
+  return { additionalContext: safeContext };
 }
 
-// src/hooks-entry/post-tool-use.ts
+// src/hooks-entry/session-start.ts
 async function main() {
   if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
     return;
@@ -3442,43 +3290,16 @@ async function main() {
   } catch {
     return;
   }
-  const project = projectFromCwd(process.env["CLAUDE_CWD"] ?? process.cwd());
-  if (isBatchEnabled()) {
-    try {
-      const entities = extractEntities(hook);
-      const resources = [];
-      if (hook.tool_name === "Skill") {
-        const skill = typeof hook.tool_input?.skill === "string" ? hook.tool_input.skill : undefined;
-        if (skill)
-          resources.push({ type: "skill", name: skill });
+  const project = projectFromCwd(hook.cwd ?? process.env["CLAUDE_CWD"] ?? process.cwd());
+  const { additionalContext } = await handleSessionStart(hook, project);
+  if (additionalContext) {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext
       }
-      if (hook.tool_name === "Agent") {
-        const agent = typeof hook.tool_input?.subagent_type === "string" ? hook.tool_input.subagent_type : undefined;
-        if (agent)
-          resources.push({ type: "agent", name: agent });
-      }
-      if (hook.tool_name.startsWith("mcp__")) {
-        resources.push({ type: "mcp_tool", name: hook.tool_name });
-      }
-      enqueueEvent({
-        session: { id: hook.session_id, project, started_at: Date.now() },
-        entities,
-        resources: resources.length > 0 ? resources : undefined,
-        timestamp: Date.now()
-      });
-      tryFlush();
-    } catch {
-      await handlePostToolUse(hook, project);
-    }
-  } else {
-    await handlePostToolUse(hook, project);
-  }
-  try {
-    const result = evaluateProactiveInjection(hook.session_id, hook.tool_name, hook.tool_input ?? {}, hook.tool_response ?? {});
-    if (result.shouldInject && result.additionalContext) {
-      process.stdout.write(JSON.stringify({ additionalContext: result.additionalContext }) + `
+    }) + `
 `);
-    }
-  } catch {}
+  }
 }
 main().catch(() => {}).finally(() => process.exit(0));

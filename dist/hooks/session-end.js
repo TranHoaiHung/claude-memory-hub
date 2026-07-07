@@ -16,28 +16,22 @@ var __toESM = (mod, isNodeMode, target) => {
       });
   return to;
 };
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, {
+      get: all[name],
+      enumerable: true,
+      configurable: true,
+      set: (newValue) => all[name] = () => newValue
+    });
+};
+var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
 var __require = import.meta.require;
-
-// src/db/schema.ts
-import { Database } from "bun:sqlite";
-import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
-import { homedir as homedir2 } from "os";
-import { join as join2 } from "path";
 
 // src/logger/index.ts
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-var LEVEL_PRIORITY = {
-  debug: 0,
-  info: 1,
-  warn: 2,
-  error: 3
-};
-var LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
-var LOG_FILE = join(LOG_DIR, "memory-hub.log");
-var MAX_LOG_SIZE = 5 * 1024 * 1024;
-var _minLevel = process.env.CMH_LOG_LEVEL || "info";
 function shouldLog(level) {
   return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[_minLevel];
 }
@@ -85,146 +79,43 @@ function createLogger(module) {
     error: (msg, data) => log("error", msg, data)
   };
 }
-var logger = createLogger("core");
+var LEVEL_PRIORITY, LOG_DIR, LOG_FILE, MAX_LOG_SIZE, _minLevel, logger;
+var init_logger = __esm(() => {
+  LEVEL_PRIORITY = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3
+  };
+  LOG_DIR = join(homedir(), ".claude-memory-hub", "logs");
+  LOG_FILE = join(LOG_DIR, "memory-hub.log");
+  MAX_LOG_SIZE = 5 * 1024 * 1024;
+  _minLevel = process.env.CMH_LOG_LEVEL || "info";
+  logger = createLogger("core");
+});
 
 // src/db/schema.ts
-var log = createLogger("schema");
+var exports_schema = {};
+__export(exports_schema, {
+  initDatabase: () => initDatabase,
+  getDbPath: () => getDbPath,
+  getDatabase: () => getDatabase,
+  closeDatabase: () => closeDatabase
+});
+import { Database } from "bun:sqlite";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2 } from "fs";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
 function getDbPath() {
+  const override = process.env["CLAUDE_MEMORY_HUB_DB"];
+  if (override)
+    return override;
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
   }
   return join2(dir, "memory.db");
 }
-var CREATE_TABLES = `
--- Migration version tracking
-CREATE TABLE IF NOT EXISTS schema_versions (
-  version     INTEGER PRIMARY KEY,
-  applied_at  INTEGER NOT NULL
-);
-
--- L2: Session lifecycle
-CREATE TABLE IF NOT EXISTS sessions (
-  id          TEXT PRIMARY KEY,
-  project     TEXT NOT NULL,
-  started_at  INTEGER NOT NULL,
-  ended_at    INTEGER,
-  user_prompt TEXT,
-  status      TEXT NOT NULL DEFAULT 'active'
-    CHECK(status IN ('active', 'completed', 'failed'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
-CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
-
--- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
-CREATE TABLE IF NOT EXISTS entities (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  project       TEXT NOT NULL,
-  tool_name     TEXT NOT NULL,
-  entity_type   TEXT NOT NULL
-    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
-  entity_value  TEXT NOT NULL,
-  context       TEXT,
-  importance    INTEGER NOT NULL DEFAULT 1
-    CHECK(importance BETWEEN 1 AND 5),
-  created_at    INTEGER NOT NULL,
-  prompt_number INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
-CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
-CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
-CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
-CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
-
--- L2: Manual session notes (from MCP memory_store tool or summarizer)
-CREATE TABLE IF NOT EXISTS session_notes (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  content     TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
-
--- L3: Cross-session persistent summaries
-CREATE TABLE IF NOT EXISTS long_term_summaries (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id    TEXT NOT NULL UNIQUE,
-  project       TEXT NOT NULL,
-  summary       TEXT NOT NULL,
-  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
-  token_savings INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
-CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
-
--- L3: FTS5 virtual table for semantic search across summaries
--- porter stemming + unicode61 handles English technical content well
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
-  session_id    UNINDEXED,
-  project,
-  summary,
-  files_touched,
-  decisions,
-  content       = 'long_term_summaries',
-  content_rowid = 'id',
-  tokenize      = 'porter unicode61'
-);
-
--- Keep FTS5 index in sync with content table via triggers
-CREATE TRIGGER IF NOT EXISTS fts_memories_insert
-  AFTER INSERT ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
-    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
-  END;
-
-CREATE TRIGGER IF NOT EXISTS fts_memories_update
-  AFTER UPDATE ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
-    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
-    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
-    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
-  END;
-
-CREATE TRIGGER IF NOT EXISTS fts_memories_delete
-  AFTER DELETE ON long_term_summaries BEGIN
-    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
-    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
-  END;
-
--- V2: Health monitoring
-CREATE TABLE IF NOT EXISTS health_checks (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  component   TEXT NOT NULL,
-  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
-  message     TEXT,
-  latency_ms  INTEGER,
-  checked_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
-
--- V2: TF-IDF vector index for semantic search
-CREATE TABLE IF NOT EXISTS tfidf_index (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
-  doc_id      INTEGER NOT NULL,
-  term        TEXT NOT NULL,
-  tf          REAL NOT NULL,
-  idf         REAL NOT NULL DEFAULT 0.0
-);
-
-CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
-CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
-`;
 function initDatabase(db) {
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA synchronous = NORMAL");
@@ -471,8 +362,72 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (7, ?)", [Date.now()]);
     log.info("Migration v7 complete");
   }
+  if (currentVersion < 8) {
+    log.info("Applying migration v8: entity dedup + touch_count, injection source tracking");
+    db.transaction(() => {
+      db.run(`DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM long_term_summaries WHERE session_id IN (SELECT id FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%')`);
+      db.run(`DELETE FROM sessions WHERE project = 'p' OR id LIKE 'compact-test-%' OR id LIKE 'test-%'`);
+      try {
+        db.run("ALTER TABLE entities ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 1");
+      } catch {}
+      db.run(`
+        CREATE TEMP TABLE entity_dedup AS
+          SELECT MIN(id) AS keep_id, COUNT(*) AS c, MAX(importance) AS max_imp, MAX(created_at) AS last_seen
+          FROM entities GROUP BY session_id, entity_type, entity_value
+      `);
+      db.run(`
+        UPDATE entities SET
+          touch_count = (SELECT c FROM entity_dedup WHERE keep_id = entities.id),
+          importance  = (SELECT max_imp FROM entity_dedup WHERE keep_id = entities.id),
+          created_at  = (SELECT last_seen FROM entity_dedup WHERE keep_id = entities.id)
+        WHERE id IN (SELECT keep_id FROM entity_dedup WHERE c > 1)
+      `);
+      db.run(`DELETE FROM entities WHERE id NOT IN (SELECT keep_id FROM entity_dedup)`);
+      db.run(`DROP TABLE entity_dedup`);
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_dedup ON entities(session_id, entity_type, entity_value)`);
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN injected_at TEXT NOT NULL DEFAULT 'prompt'");
+      } catch {}
+      try {
+        db.run("ALTER TABLE injection_log ADD COLUMN dedup_skipped INTEGER NOT NULL DEFAULT 0");
+      } catch {}
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (8, ?)", [Date.now()]);
+    log.info("Migration v8 complete");
+  }
+  if (currentVersion < 9) {
+    log.info("Applying migration v9: graph_edges for entity/code graph");
+    db.run(`
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project    TEXT NOT NULL,
+        src_type   TEXT NOT NULL CHECK(src_type IN ('file','error','decision','session')),
+        src_key    TEXT NOT NULL,
+        dst_type   TEXT NOT NULL CHECK(dst_type IN ('file','error','decision','session')),
+        dst_key    TEXT NOT NULL,
+        rel        TEXT NOT NULL CHECK(rel IN ('co_edited','error_in','decided_about','session_touched','imports')),
+        weight     REAL NOT NULL DEFAULT 1,
+        first_seen INTEGER NOT NULL,
+        last_seen  INTEGER NOT NULL,
+        UNIQUE(project, src_type, src_key, dst_type, dst_key, rel)
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_src ON graph_edges(project, src_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_dst ON graph_edges(project, dst_key)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_graph_rel ON graph_edges(rel)`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (9, ?)", [Date.now()]);
+    log.info("Migration v9 complete");
+  }
+  if (currentVersion < 10) {
+    log.info("Applying migration v10: injection effectiveness feedback");
+    try {
+      db.run("ALTER TABLE injection_log ADD COLUMN memory_tool_used INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
+    log.info("Migration v10 complete");
+  }
 }
-var _db = null;
 function getDatabase() {
   if (!_db) {
     const path = getDbPath();
@@ -481,8 +436,511 @@ function getDatabase() {
   }
   return _db;
 }
+function closeDatabase() {
+  if (_db) {
+    _db.close();
+    _db = null;
+  }
+}
+var log, CREATE_TABLES = `
+-- Migration version tracking
+CREATE TABLE IF NOT EXISTS schema_versions (
+  version     INTEGER PRIMARY KEY,
+  applied_at  INTEGER NOT NULL
+);
+
+-- L2: Session lifecycle
+CREATE TABLE IF NOT EXISTS sessions (
+  id          TEXT PRIMARY KEY,
+  project     TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  user_prompt TEXT,
+  status      TEXT NOT NULL DEFAULT 'active'
+    CHECK(status IN ('active', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_project    ON sessions(project);
+CREATE INDEX IF NOT EXISTS idx_sessions_started    ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions(status);
+
+-- L2: Entity capture from tool events (no XML \u2014 direct hook metadata)
+CREATE TABLE IF NOT EXISTS entities (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  project       TEXT NOT NULL,
+  tool_name     TEXT NOT NULL,
+  entity_type   TEXT NOT NULL
+    CHECK(entity_type IN ('file_read','file_modified','file_created','error','decision')),
+  entity_value  TEXT NOT NULL,
+  context       TEXT,
+  importance    INTEGER NOT NULL DEFAULT 1
+    CHECK(importance BETWEEN 1 AND 5),
+  created_at    INTEGER NOT NULL,
+  prompt_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_session    ON entities(session_id);
+CREATE INDEX IF NOT EXISTS idx_entities_project    ON entities(project);
+CREATE INDEX IF NOT EXISTS idx_entities_type       ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_value      ON entities(entity_value);
+CREATE INDEX IF NOT EXISTS idx_entities_created    ON entities(created_at DESC);
+
+-- L2: Manual session notes (from MCP memory_store tool or summarizer)
+CREATE TABLE IF NOT EXISTS session_notes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  content     TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_session ON session_notes(session_id);
+
+-- L3: Cross-session persistent summaries
+CREATE TABLE IF NOT EXISTS long_term_summaries (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id    TEXT NOT NULL UNIQUE,
+  project       TEXT NOT NULL,
+  summary       TEXT NOT NULL,
+  files_touched TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  decisions     TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  errors_fixed  TEXT NOT NULL DEFAULT '[]',  -- JSON array
+  token_savings INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lts_project  ON long_term_summaries(project);
+CREATE INDEX IF NOT EXISTS idx_lts_created  ON long_term_summaries(created_at DESC);
+
+-- L3: FTS5 virtual table for semantic search across summaries
+-- porter stemming + unicode61 handles English technical content well
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
+  session_id    UNINDEXED,
+  project,
+  summary,
+  files_touched,
+  decisions,
+  content       = 'long_term_summaries',
+  content_rowid = 'id',
+  tokenize      = 'porter unicode61'
+);
+
+-- Keep FTS5 index in sync with content table via triggers
+CREATE TRIGGER IF NOT EXISTS fts_memories_insert
+  AFTER INSERT ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_update
+  AFTER UPDATE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+    INSERT INTO fts_memories(rowid, session_id, project, summary, files_touched, decisions)
+    VALUES (new.id, new.session_id, new.project, new.summary, new.files_touched, new.decisions);
+  END;
+
+CREATE TRIGGER IF NOT EXISTS fts_memories_delete
+  AFTER DELETE ON long_term_summaries BEGIN
+    INSERT INTO fts_memories(fts_memories, rowid, session_id, project, summary, files_touched, decisions)
+    VALUES ('delete', old.id, old.session_id, old.project, old.summary, old.files_touched, old.decisions);
+  END;
+
+-- V2: Health monitoring
+CREATE TABLE IF NOT EXISTS health_checks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  component   TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK(status IN ('ok','degraded','error')),
+  message     TEXT,
+  latency_ms  INTEGER,
+  checked_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_component ON health_checks(component, checked_at DESC);
+
+-- V2: TF-IDF vector index for semantic search
+CREATE TABLE IF NOT EXISTS tfidf_index (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_type    TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note')),
+  doc_id      INTEGER NOT NULL,
+  term        TEXT NOT NULL,
+  tf          REAL NOT NULL,
+  idf         REAL NOT NULL DEFAULT 0.0
+);
+
+CREATE INDEX IF NOT EXISTS idx_tfidf_term ON tfidf_index(term);
+CREATE INDEX IF NOT EXISTS idx_tfidf_doc  ON tfidf_index(doc_type, doc_id);
+`, _db = null;
+var init_schema = __esm(() => {
+  init_logger();
+  log = createLogger("schema");
+});
+
+// src/graph/edge-builder.ts
+var exports_edge_builder = {};
+__export(exports_edge_builder, {
+  buildSessionEdges: () => buildSessionEdges,
+  backfillAllSessions: () => backfillAllSessions
+});
+function buildSessionEdges(sessionId, project, db) {
+  const d = db ?? getDatabase();
+  let edges = 0;
+  const entities = d.query("SELECT * FROM entities WHERE session_id = ? ORDER BY prompt_number ASC, created_at ASC").all(sessionId);
+  if (entities.length === 0)
+    return { edges: 0 };
+  const upsert = d.prepare(`INSERT INTO graph_edges(project, src_type, src_key, dst_type, dst_key, rel, weight, first_seen, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project, src_type, src_key, dst_type, dst_key, rel) DO UPDATE SET
+       weight    = weight + excluded.weight,
+       last_seen = excluded.last_seen`);
+  const now = Date.now();
+  const modified = entities.filter((e) => e.entity_type === "file_modified" || e.entity_type === "file_created").sort((a, b) => (b.touch_count ?? 1) - (a.touch_count ?? 1)).slice(0, MAX_FILES_PER_SESSION);
+  d.transaction(() => {
+    for (let i = 0;i < modified.length; i++) {
+      for (let j = i + 1;j < modified.length; j++) {
+        const a = modified[i];
+        const b = modified[j];
+        if (a.entity_value === b.entity_value)
+          continue;
+        const dist = Math.abs(a.prompt_number - b.prompt_number);
+        if (dist > PROMPT_WINDOW)
+          continue;
+        const [src, dst] = a.entity_value < b.entity_value ? [a.entity_value, b.entity_value] : [b.entity_value, a.entity_value];
+        upsert.run(project, "file", key(src), "file", key(dst), "co_edited", 1 / (1 + dist), now, now);
+        edges++;
+      }
+    }
+    const errors = entities.filter((e) => e.entity_type === "error");
+    for (const err of errors) {
+      const target = [...modified].filter((f) => f.prompt_number <= err.prompt_number).sort((x, y) => y.prompt_number - x.prompt_number)[0];
+      if (!target)
+        continue;
+      upsert.run(project, "error", key(err.entity_value), "file", key(target.entity_value), "error_in", 1, now, now);
+      edges++;
+    }
+    const decisions = entities.filter((e) => (e.entity_type === "decision" || e.entity_type === "observation") && e.importance >= 3).slice(0, 10);
+    for (const dec of decisions) {
+      let linked = 0;
+      for (const f of modified) {
+        if (Math.abs(f.prompt_number - dec.prompt_number) > 1)
+          continue;
+        if (++linked > 5)
+          break;
+        upsert.run(project, "decision", key(dec.entity_value), "file", key(f.entity_value), "decided_about", 1, now, now);
+        edges++;
+      }
+    }
+    const touched = entities.filter((e) => e.entity_type.startsWith("file_"));
+    for (const f of touched) {
+      upsert.run(project, "session", sessionId, "file", key(f.entity_value), "session_touched", f.touch_count ?? 1, now, now);
+      edges++;
+    }
+  })();
+  return { edges };
+}
+function backfillAllSessions(db) {
+  const d = db ?? getDatabase();
+  const sessions = d.query("SELECT id, project FROM sessions").all();
+  let total = 0;
+  for (const s of sessions) {
+    try {
+      total += buildSessionEdges(s.id, s.project, d).edges;
+    } catch (err) {
+      log16.warn("edge build failed for session", { session: s.id, error: String(err) });
+    }
+  }
+  log16.info("graph backfill complete", { sessions: sessions.length, edges: total });
+  return { sessions: sessions.length, edges: total };
+}
+function key(value) {
+  return value.length <= KEY_MAX_CHARS ? value : value.slice(0, KEY_MAX_CHARS);
+}
+var log16, PROMPT_WINDOW = 3, MAX_FILES_PER_SESSION = 40, KEY_MAX_CHARS = 160;
+var init_edge_builder = __esm(() => {
+  init_schema();
+  init_logger();
+  log16 = createLogger("edge-builder");
+});
+
+// src/export/obsidian-notes.ts
+function safeName(name) {
+  return name.replace(/[\\/:*?"<>|#^[\]]/g, "-").trim() || "unknown";
+}
+function slug(text, maxWords = 6) {
+  return safeName(text.split(/\s+/).slice(0, maxWords).join(" ").toLowerCase()).slice(0, 60);
+}
+function fileNoteName(filePath) {
+  const base = safeName(filePath.split("/").pop() ?? "file");
+  return `${base}-${hash8(filePath)}.md`;
+}
+function isoDate(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+function hash8(text) {
+  let h = 5381;
+  for (let i = 0;i < text.length; i++) {
+    h = (h << 5) + h + text.charCodeAt(i) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+function parseJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+function renderSessionNote(row, d) {
+  const files = parseJson(row.files_touched, []);
+  const decisions = parseJson(row.decisions, []);
+  const errors = parseJson(row.errors_fixed, []);
+  const lines = [
+    "---",
+    `type: session`,
+    `project: "${row.project}"`,
+    `session_id: ${row.session_id}`,
+    `date: ${isoDate(row.created_at)}`,
+    `tags: [memory-hub, session]`,
+    "---",
+    "",
+    `# Session ${isoDate(row.created_at)} \u2014 [[${safeName(row.project)}]]`,
+    "",
+    row.summary,
+    ""
+  ];
+  if (files.length > 0) {
+    lines.push("## Files touched");
+    for (const f of files.slice(0, 15))
+      lines.push(`- ${fileLink(f, d)}`);
+    lines.push("");
+  }
+  if (decisions.length > 0) {
+    lines.push("## Decisions");
+    for (const dec of decisions.slice(0, 10))
+      lines.push(`- ${dec}`);
+    lines.push("");
+  }
+  if (errors.length > 0) {
+    lines.push("## Errors fixed");
+    for (const e of errors.slice(0, 10))
+      lines.push(`- ${e}`);
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+function renderDecisionNote(row) {
+  return [
+    "---",
+    `type: decision`,
+    `project: "${row.project}"`,
+    `importance: ${row.importance}`,
+    `date: ${isoDate(row.created_at)}`,
+    `session_id: ${row.session_id}`,
+    `tags: [memory-hub, decision]`,
+    "---",
+    "",
+    `# ${row.entity_value.slice(0, 120)}`,
+    "",
+    `Project: [[${safeName(row.project)}]]`,
+    "",
+    row.entity_value,
+    row.context ? `
+> ${row.context}` : "",
+    ""
+  ].join(`
+`);
+}
+function renderFileNote(f, d) {
+  const lines = [
+    "---",
+    `type: file`,
+    `project: "${f.project}"`,
+    `path: "${f.entity_value}"`,
+    `touches: ${f.touches}`,
+    `tags: [memory-hub, file]`,
+    "---",
+    "",
+    `# ${f.entity_value.split("/").pop()}`,
+    "",
+    `\`${f.entity_value}\``,
+    "",
+    `Project: [[${safeName(f.project)}]] \xB7 edited ${f.touches}\xD7 \xB7 last ${isoDate(f.last_seen)}`,
+    ""
+  ];
+  const edges = d.query(`SELECT src_key, dst_key, weight FROM graph_edges
+     WHERE rel = 'co_edited' AND (src_key = ? OR dst_key = ?)
+     ORDER BY weight DESC LIMIT 8`).all(f.entity_value, f.entity_value);
+  if (edges.length > 0) {
+    lines.push("## Usually edited together with");
+    for (const e of edges) {
+      const other = e.src_key === f.entity_value ? e.dst_key : e.src_key;
+      lines.push(`- [[${fileNoteName(other).replace(/\.md$/, "")}]] (${e.weight.toFixed(1)})`);
+    }
+    lines.push("");
+  }
+  const errors = d.query(`SELECT src_key FROM graph_edges WHERE rel = 'error_in' AND dst_key = ? ORDER BY weight DESC LIMIT 5`).all(f.entity_value);
+  if (errors.length > 0) {
+    lines.push("## Past errors here");
+    for (const e of errors)
+      lines.push(`- ${e.src_key}`);
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+function renderProjectMoc(project, d) {
+  const recent = d.query(`SELECT session_id, summary, created_at FROM long_term_summaries
+     WHERE project = ? ORDER BY created_at DESC LIMIT 20`).all(project);
+  const lines = [
+    "---",
+    `type: project`,
+    `tags: [memory-hub, project]`,
+    "---",
+    "",
+    `# ${project}`,
+    "",
+    "## Recent sessions"
+  ];
+  for (const s of recent) {
+    lines.push(`- [[${isoDate(s.created_at)} ${s.session_id.slice(0, 8)}]] \u2014 ${s.summary.slice(0, 100).replace(/\n/g, " ")}`);
+  }
+  lines.push("", `[[Home]]`);
+  return lines.join(`
+`);
+}
+function renderHome(projects) {
+  const lines = [
+    "---",
+    `tags: [memory-hub, moc]`,
+    "---",
+    "",
+    "# \uD83E\uDDE0 Memory Hub",
+    "",
+    "Knowledge exported from Claude Code sessions. One-way sync \u2014 edits here are not written back (yet).",
+    "",
+    "## Projects"
+  ];
+  for (const p of projects) {
+    lines.push(`- [[${safeName(p.project)}]] (${p.sessions} sessions)`);
+  }
+  return lines.join(`
+`);
+}
+function fileLink(filePath, d) {
+  try {
+    const hot = d.query(`SELECT COUNT(*) c FROM graph_edges WHERE rel = 'co_edited' AND (src_key = ? OR dst_key = ?)`).get(filePath, filePath);
+    if ((hot?.c ?? 0) > 0)
+      return `[[${fileNoteName(filePath).replace(/\.md$/, "")}]]`;
+  } catch {}
+  return `\`${filePath}\``;
+}
+
+// src/export/obsidian-exporter.ts
+var exports_obsidian_exporter = {};
+__export(exports_obsidian_exporter, {
+  syncObsidianVault: () => syncObsidianVault,
+  getVaultRoot: () => getVaultRoot
+});
+import { existsSync as existsSync11, mkdirSync as mkdirSync6, readFileSync as readFileSync7, writeFileSync as writeFileSync5 } from "fs";
+import { join as join10 } from "path";
+import { homedir as homedir9 } from "os";
+function getVaultRoot() {
+  return process.env["CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT"] ?? DEFAULT_VAULT;
+}
+function syncObsidianVault(options = {}) {
+  const d = options.db ?? getDatabase();
+  const root = join10(getVaultRoot(), SUBFOLDER);
+  ensureDir(root);
+  ensureDir(join10(root, "_meta"));
+  const state = loadSyncState(root);
+  const result = {
+    vault: root,
+    sessions_exported: 0,
+    decisions_exported: 0,
+    file_notes_exported: 0,
+    projects: 0
+  };
+  const summaryRows = d.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+     FROM long_term_summaries
+     WHERE created_at > ?${options.project ? " AND project = ?" : ""}
+     ORDER BY created_at ASC`).all(...options.project ? [state.last_summary_at, options.project] : [state.last_summary_at]);
+  for (const row of summaryRows) {
+    const dir = join10(root, "Projects", safeName(row.project), "Sessions");
+    ensureDir(dir);
+    writeFileSync5(join10(dir, `${isoDate(row.created_at)} ${row.session_id.slice(0, 8)}.md`), renderSessionNote(row, d), "utf-8");
+    result.sessions_exported++;
+    state.last_summary_at = Math.max(state.last_summary_at, row.created_at);
+  }
+  const decisionRows = d.query(`SELECT id, project, entity_value, context, importance, created_at, session_id
+     FROM entities
+     WHERE entity_type IN ('decision','observation') AND importance >= 3 AND created_at > ?
+       ${options.project ? "AND project = ?" : ""}
+     ORDER BY created_at ASC LIMIT 500`).all(...options.project ? [state.last_decision_at, options.project] : [state.last_decision_at]);
+  for (const row of decisionRows) {
+    const dir = join10(root, "Projects", safeName(row.project), "Decisions");
+    ensureDir(dir);
+    writeFileSync5(join10(dir, `${row.id} ${slug(row.entity_value)}.md`), renderDecisionNote(row), "utf-8");
+    result.decisions_exported++;
+    state.last_decision_at = Math.max(state.last_decision_at, row.created_at);
+  }
+  const hotFiles = d.query(`SELECT project, entity_value, SUM(touch_count) touches, MAX(created_at) last_seen
+     FROM entities
+     WHERE entity_type IN ('file_modified','file_created')
+       ${options.project ? "AND project = ?" : ""}
+     GROUP BY project, entity_value
+     HAVING touches >= ?
+     ORDER BY touches DESC LIMIT 300`).all(...options.project ? [options.project, FILE_NOTE_MIN_TOUCHES] : [FILE_NOTE_MIN_TOUCHES]);
+  for (const f of hotFiles) {
+    const dir = join10(root, "Files", safeName(f.project));
+    ensureDir(dir);
+    writeFileSync5(join10(dir, fileNoteName(f.entity_value)), renderFileNote(f, d), "utf-8");
+    result.file_notes_exported++;
+  }
+  const projects = d.query(`SELECT project, COUNT(*) sessions FROM long_term_summaries GROUP BY project ORDER BY MAX(created_at) DESC`).all();
+  result.projects = projects.length;
+  for (const p of projects) {
+    if (options.project && p.project !== options.project)
+      continue;
+    const dir = join10(root, "Projects", safeName(p.project));
+    if (!existsSync11(dir))
+      continue;
+    writeFileSync5(join10(dir, `${safeName(p.project)}.md`), renderProjectMoc(p.project, d), "utf-8");
+  }
+  writeFileSync5(join10(root, "Home.md"), renderHome(projects), "utf-8");
+  saveSyncState(root, state);
+  log17.info("obsidian sync complete", { ...result });
+  return result;
+}
+function loadSyncState(root) {
+  try {
+    const parsed = JSON.parse(readFileSync7(join10(root, "_meta", "sync-state.json"), "utf-8"));
+    return {
+      last_summary_at: parsed.last_summary_at ?? 0,
+      last_decision_at: parsed.last_decision_at ?? 0
+    };
+  } catch {
+    return { last_summary_at: 0, last_decision_at: 0 };
+  }
+}
+function saveSyncState(root, state) {
+  writeFileSync5(join10(root, "_meta", "sync-state.json"), JSON.stringify(state, null, 2), "utf-8");
+}
+function ensureDir(dir) {
+  if (!existsSync11(dir))
+    mkdirSync6(dir, { recursive: true });
+}
+var log17, DEFAULT_VAULT, SUBFOLDER = "MemoryHub", FILE_NOTE_MIN_TOUCHES = 3;
+var init_obsidian_exporter = __esm(() => {
+  init_schema();
+  init_logger();
+  log17 = createLogger("obsidian-exporter");
+  DEFAULT_VAULT = join10(homedir9(), "Documents", "ObsidianVault");
+});
 
 // src/db/session-store.ts
+init_schema();
+
 class SessionStore {
   db;
   constructor(db) {
@@ -516,7 +974,12 @@ class SessionStore {
         return -1;
     }
     const result = this.db.run(`INSERT INTO entities(session_id, project, tool_name, entity_type, entity_value, context, importance, created_at, prompt_number)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, entity_type, entity_value) DO UPDATE SET
+         touch_count = touch_count + 1,
+         created_at  = excluded.created_at,
+         importance  = MAX(entities.importance, excluded.importance),
+         context     = COALESCE(excluded.context, entities.context)`, [
       entity.session_id,
       entity.project,
       entity.tool_name,
@@ -622,6 +1085,8 @@ class SessionStore {
 }
 
 // src/db/long-term-store.ts
+init_schema();
+
 class LongTermStore {
   db;
   constructor(db) {
@@ -659,14 +1124,15 @@ class LongTermStore {
     if (!safeQuery)
       return [];
     try {
-      return this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
+      const candidates = this.db.query(`SELECT lts.session_id, lts.project, lts.summary,
                   lts.files_touched, lts.decisions, lts.errors_fixed,
                   lts.created_at, rank
            FROM fts_memories
            JOIN long_term_summaries lts ON lts.id = fts_memories.rowid
            WHERE fts_memories MATCH ?
            ORDER BY rank
-           LIMIT ?`).all(safeQuery, limit);
+           LIMIT ?`).all(safeQuery, Math.max(limit * 3, 9));
+      return candidates.map((r) => ({ ...r, rank: (r.rank ?? 0) * recencyBoost(r.created_at) })).sort((a, b) => a.rank - b.rank).slice(0, limit);
     } catch {
       return this.fallbackSearch(query, limit);
     }
@@ -696,6 +1162,16 @@ class LongTermStore {
          WHERE files_touched LIKE ?
          ORDER BY created_at DESC LIMIT ?`).all(`%${escaped}%`, limit);
   }
+}
+function recencyBoost(createdAt) {
+  const ageDays = (Date.now() - createdAt) / 86400000;
+  if (ageDays < 7)
+    return 1.5;
+  if (ageDays < 30)
+    return 1.2;
+  if (ageDays < 90)
+    return 1;
+  return 0.8;
 }
 function sanitizeFtsQuery(query) {
   const words = query.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/["*^()]/g, "")).filter((w) => w.length > 1);
@@ -806,6 +1282,7 @@ function extractCodePatterns(content) {
 }
 
 // src/capture/privacy-filter.ts
+init_logger();
 var log2 = createLogger("privacy-filter");
 var DEFAULT_PRIVACY_CONFIG = {
   tag_stripping: true,
@@ -1146,6 +1623,7 @@ function extractFileFromBashCmd(cmd) {
 }
 
 // src/context/resource-tracker.ts
+init_schema();
 var SCHEMA_ADDITIONS = `
 CREATE TABLE IF NOT EXISTS resource_usage (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1231,6 +1709,7 @@ class ResourceTracker {
 }
 
 // src/context/resource-registry.ts
+init_logger();
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
@@ -1805,6 +2284,7 @@ function safeJson(text, fallback) {
 }
 
 // src/context/injection-validator.ts
+init_logger();
 var log4 = createLogger("injection-validator");
 var MAX_CHARS = 8000;
 
@@ -1860,6 +2340,8 @@ function mapResourceTypeToKind(type) {
 }
 
 // src/context/claude-md-tracker.ts
+init_schema();
+init_logger();
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
 import { homedir as homedir4 } from "os";
 import { join as join4, dirname, basename as basename2 } from "path";
@@ -2240,7 +2722,11 @@ function pickPrimary(s) {
   return null;
 }
 
+// src/context/resource-embedding-search.ts
+init_schema();
+
 // src/search/embedding-model.ts
+init_logger();
 var log6 = createLogger("embedding-model");
 var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
 var EMBEDDING_DIM = 384;
@@ -2365,6 +2851,7 @@ function cosineSimilarity(a, b) {
 }
 
 // src/context/resource-matcher.ts
+init_logger();
 var log7 = createLogger("resource-matcher");
 var CONTEXT_BOOSTS = [
   { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
@@ -2558,6 +3045,7 @@ function cosine(a, b) {
 }
 
 // src/context/conversation-injector.ts
+init_schema();
 var MAX_MESSAGES_PER_SECTION = 6;
 var PER_MESSAGE_PREVIEW_CHARS = 240;
 function buildRecentConversationSection(currentSessionId, project, injectedDb) {
@@ -2604,6 +3092,7 @@ function compactWhitespace(s) {
 }
 
 // src/context/awareness-hint.ts
+init_schema();
 function buildAwarenessHint(options) {
   if (options.isCommandInvocation)
     return "";
@@ -2650,6 +3139,8 @@ function collectStats(db, project) {
 }
 
 // src/db/injection-telemetry.ts
+init_schema();
+init_logger();
 var log8 = createLogger("injection-telemetry");
 function logInjection(entry, db) {
   if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
@@ -2663,8 +3154,8 @@ function logInjection(entry, db) {
          memory_section_chars, claude_md_chars,
          recent_convo_chars, awareness_hint_chars,
          total_injection_chars,
-         history_intent_matched, timestamp
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         history_intent_matched, injected_at, dedup_skipped, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
       entry.session_id,
       entry.project,
       entry.intent,
@@ -2678,11 +3169,19 @@ function logInjection(entry, db) {
       entry.awareness_hint_chars,
       entry.total_injection_chars,
       entry.history_intent_matched ? 1 : 0,
+      entry.injected_at ?? "prompt",
+      entry.dedup_skipped ?? 0,
       Date.now()
     ]);
   } catch (err) {
     log8.warn("logInjection failed", { error: String(err) });
   }
+}
+function pruneInjectionLog(olderThanDays = 90, db) {
+  const d = db ?? getDatabase();
+  const cutoff = Date.now() - olderThanDays * 86400000;
+  const result = d.run(`DELETE FROM injection_log WHERE timestamp < ?`, [cutoff]);
+  return result.changes;
 }
 
 // src/capture/smart-truncate.ts
@@ -2724,6 +3223,43 @@ function capForRole(role) {
   return ROLE_CAPS[role];
 }
 
+// src/context/injection-state.ts
+import { existsSync as existsSync6, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3, unlinkSync } from "fs";
+import { join as join6 } from "path";
+import { homedir as homedir5 } from "os";
+var STATE_DIR = join6(homedir5(), ".claude-memory-hub", "proactive");
+function statePath(sessionId) {
+  return join6(STATE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}-inject.json`);
+}
+function loadInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync6(path)) {
+      const parsed = JSON.parse(readFileSync3(path, "utf-8"));
+      return {
+        baselineInjected: parsed.baselineInjected === true,
+        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : []
+      };
+    }
+  } catch {}
+  return { baselineInjected: false, injectedSummaryIds: [] };
+}
+function saveInjectionState(sessionId, state) {
+  try {
+    if (!existsSync6(STATE_DIR)) {
+      mkdirSync3(STATE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+function cleanupInjectionState(sessionId) {
+  try {
+    const path = statePath(sessionId);
+    if (existsSync6(path))
+      unlinkSync(path);
+  } catch {}
+}
+
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
@@ -2759,6 +3295,13 @@ async function handlePostToolUse(hook, project) {
   }
   if (hook.tool_name.startsWith("mcp__")) {
     tracker.trackUsage(hook.session_id, project, "mcp_tool", hook.tool_name);
+    if (hook.tool_name.startsWith("mcp__claude-memory-hub__")) {
+      try {
+        const { getDatabase: getDatabase2 } = await Promise.resolve().then(() => (init_schema(), exports_schema));
+        getDatabase2().run(`UPDATE injection_log SET memory_tool_used = 1
+           WHERE id = (SELECT id FROM injection_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1)`, [hook.session_id]);
+      } catch {}
+    }
   }
 }
 async function handleUserPromptSubmit(hook, project) {
@@ -2788,50 +3331,82 @@ async function handleUserPromptSubmit(hook, project) {
   const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
-  let results = ltStore.search(hook.prompt, 3);
-  let memoryHint = "";
-  if (results.length === 0) {
-    const recent = ltStore.getRecentSummariesAll(3);
-    if (recent.length > 0) {
-      results = recent.map((r) => ({
-        session_id: r.session_id,
-        project: r.project,
-        summary: r.summary,
-        files_touched: r.files_touched,
-        decisions: r.decisions,
-        errors_fixed: r.errors_fixed,
-        created_at: r.created_at,
-        rank: 0
-      }));
-      const total = ltStore.countSummaries();
-      memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+  const state = loadInjectionState(hook.session_id);
+  const baselineDone = state.baselineInjected;
+  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
+  let recentConvoSection = "";
+  let historyIntentMatched = false;
+  try {
+    if ((hook.prompt?.length ?? 0) >= 6) {
+      const intent = await detectHistoryIntent(hook.prompt ?? "");
+      historyIntentMatched = intent.match;
+      if (intent.match) {
+        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
+      }
     }
+  } catch {}
+  let results = [];
+  let memoryHint = "";
+  let dedupSkipped = 0;
+  if (!baselineDone || historyIntentMatched) {
+    results = ltStore.search(hook.prompt, 3);
+    if (results.length === 0) {
+      const recent = ltStore.getRecentSummariesAll(3);
+      if (recent.length > 0) {
+        results = recent.map((r) => ({
+          session_id: r.session_id,
+          project: r.project,
+          summary: r.summary,
+          files_touched: r.files_touched,
+          decisions: r.decisions,
+          errors_fixed: r.errors_fixed,
+          created_at: r.created_at,
+          rank: 0
+        }));
+        const total = ltStore.countSummaries();
+        memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+      }
+    }
+    const beforeDedup = results.length;
+    results = results.filter((r) => !state.injectedSummaryIds.includes(r.session_id));
+    dedupSkipped = beforeDedup - results.length;
   }
   const registry = getResourceRegistry();
-  registry.scan(hook.cwd);
-  const validator = new InjectionValidator(registry);
-  const loader = new SmartResourceLoader(registry);
-  const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
-  plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
-  plan.skipped = validator.filterAliveRecommendations(plan.skipped);
-  const advice = loader.formatContextAdvice(plan);
+  let advice = "";
   let mdSummary = "";
-  if (hook.cwd) {
+  let overheadWarning = "";
+  const validator = new InjectionValidator(registry);
+  if (!baselineDone) {
+    registry.scan(hook.cwd);
+    const loader = new SmartResourceLoader(registry);
+    const plan = loader.buildContextPlan(project, hook.prompt, 30000, hook.cwd);
+    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+    advice = loader.formatContextAdvice(plan);
+    if (hook.cwd) {
+      try {
+        const mdTracker = new ClaudeMdTracker;
+        const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+        const tracker = new ResourceTracker;
+        for (const entry of mdEntries) {
+          tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+        }
+        const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+        mdSummary = mdTracker.formatForInjection(injectableEntries);
+      } catch {}
+    }
     try {
-      const mdTracker = new ClaudeMdTracker;
-      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      const tracker = new ResourceTracker;
-      for (const entry of mdEntries) {
-        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      const overhead = await registry.getOverheadReport(project);
+      const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+      if (unusedTokens > 1e4) {
+        const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+        overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
       }
-      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
-      mdSummary = mdTracker.formatForInjection(injectableEntries);
     } catch {}
   }
   let smartMatchSection = "";
   let smartMatchCount = 0;
   let smartMatchTopScore = 0;
-  const promptAnalysis = analyzePrompt(hook.prompt ?? "", hook.cwd ?? "");
   try {
     if (!promptAnalysis.is_command_invocation && (hook.prompt?.length ?? 0) >= 10) {
       const matches = await matchResourcesForPrompt(hook.prompt ?? "", promptAnalysis, {
@@ -2845,37 +3420,24 @@ async function handleUserPromptSubmit(hook, project) {
         smartMatchSection = formatSmartMatch(matches);
     }
   } catch {}
-  let recentConvoSection = "";
-  let historyIntentMatched = false;
-  try {
-    if ((hook.prompt?.length ?? 0) >= 6) {
-      const intent = await detectHistoryIntent(hook.prompt ?? "");
-      historyIntentMatched = intent.match;
-      if (intent.match) {
-        recentConvoSection = buildRecentConversationSection(hook.session_id, project);
-      }
-    }
-  } catch {}
-  let overheadWarning = "";
-  try {
-    const overhead = await registry.getOverheadReport(project);
-    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
-    if (unusedTokens > 1e4) {
-      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
-      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
-    }
-  } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
-  try {
-    awarenessHint = buildAwarenessHint({
-      project,
-      isCommandInvocation: promptAnalysis.is_command_invocation,
-      hasMemoryInjected: memorySection.length > 0,
-      hasRecentConvoInjected: recentConvoSection.length > 0
-    });
-  } catch {}
+  if (!baselineDone || memorySection.length > 0 || recentConvoSection.length > 0) {
+    try {
+      awarenessHint = buildAwarenessHint({
+        project,
+        isCommandInvocation: promptAnalysis.is_command_invocation,
+        hasMemoryInjected: memorySection.length > 0,
+        hasRecentConvoInjected: recentConvoSection.length > 0
+      });
+    } catch {}
+  }
   const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  state.baselineInjected = true;
+  if (results.length > 0) {
+    state.injectedSummaryIds = [...new Set([...state.injectedSummaryIds, ...results.map((r) => r.session_id)])];
+  }
+  saveInjectionState(hook.session_id, state);
   try {
     logInjection({
       session_id: hook.session_id,
@@ -2890,7 +3452,9 @@ async function handleUserPromptSubmit(hook, project) {
       recent_convo_chars: recentConvoSection.length,
       awareness_hint_chars: awarenessHint.length,
       total_injection_chars: safeContext.length,
-      history_intent_matched: historyIntentMatched
+      history_intent_matched: historyIntentMatched,
+      injected_at: baselineDone ? "prompt" : "first_prompt",
+      dedup_skipped: dedupSkipped
     });
   } catch {}
   return { additionalContext: safeContext };
@@ -2982,13 +3546,14 @@ function projectFromCwd(cwd) {
 }
 
 // src/capture/transcript-parser.ts
-import { createReadStream, existsSync as existsSync6, statSync as statSync3 } from "fs";
+init_logger();
+import { createReadStream, existsSync as existsSync7, statSync as statSync3 } from "fs";
 import { createInterface } from "readline";
 var log9 = createLogger("transcript-parser");
 var MAX_FILE_SIZE = 50 * 1024 * 1024;
 var MAX_MESSAGES = 200;
 async function parseTranscript(transcriptPath, sessionId, project) {
-  if (!transcriptPath || !existsSync6(transcriptPath)) {
+  if (!transcriptPath || !existsSync7(transcriptPath)) {
     log9.info("Transcript not found, skipping", { path: transcriptPath });
     return [];
   }
@@ -3120,6 +3685,7 @@ function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
 }
 
 // src/summarizer/cli-summarizer.ts
+init_logger();
 var log10 = createLogger("cli-summarizer");
 var MAX_PROMPT_CHARS = 6000;
 var MAX_OUTPUT_CHARS = 2000;
@@ -3241,6 +3807,7 @@ async function attemptCliCall(prompt, timeout, attempt) {
 }
 
 // src/summarizer/session-summarizer.ts
+init_logger();
 var log11 = createLogger("session-summarizer");
 
 class SessionSummarizer {
@@ -3319,6 +3886,8 @@ function estimateTokenSavings(fileCount, errorCount, noteCount) {
 }
 
 // src/search/semantic-search.ts
+init_schema();
+init_logger();
 var log12 = createLogger("semantic-search");
 async function indexEmbedding(docType, docId, text, db) {
   const vector = await embeddingModel.embed(text);
@@ -3334,12 +3903,13 @@ async function indexEmbedding(docType, docId, text, db) {
 }
 
 // src/retrieval/proactive-retrieval.ts
-import { existsSync as existsSync7, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3 } from "fs";
-import { join as join6 } from "path";
-import { homedir as homedir5 } from "os";
+import { existsSync as existsSync8, readFileSync as readFileSync4, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4 } from "fs";
+import { join as join7 } from "path";
+import { homedir as homedir6 } from "os";
+init_logger();
 var log13 = createLogger("proactive-retrieval");
-var DATA_DIR = join6(homedir5(), ".claude-memory-hub");
-var PROACTIVE_DIR = join6(DATA_DIR, "proactive");
+var DATA_DIR = join7(homedir6(), ".claude-memory-hub");
+var PROACTIVE_DIR = join7(DATA_DIR, "proactive");
 var TOOL_CALL_INTERVAL = 15;
 var MAX_INJECTION_CHARS = 3000;
 function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse) {
@@ -3387,11 +3957,11 @@ function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse
   return { shouldInject: true, additionalContext: context };
 }
 function cleanupProactiveState(sessionId) {
-  const path = statePath(sessionId);
+  const path = statePath2(sessionId);
   try {
-    if (existsSync7(path)) {
-      const { unlinkSync } = __require("fs");
-      unlinkSync(path);
+    if (existsSync8(path)) {
+      const { unlinkSync: unlinkSync2 } = __require("fs");
+      unlinkSync2(path);
     }
   } catch {}
 }
@@ -3424,24 +3994,24 @@ function detectTopic(recentFiles) {
   }
   return bestTopic;
 }
-function statePath(sessionId) {
-  return join6(PROACTIVE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+function statePath2(sessionId) {
+  return join7(PROACTIVE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
 }
 function loadState(sessionId) {
-  const path = statePath(sessionId);
+  const path = statePath2(sessionId);
   try {
-    if (existsSync7(path)) {
-      return JSON.parse(readFileSync3(path, "utf-8"));
+    if (existsSync8(path)) {
+      return JSON.parse(readFileSync4(path, "utf-8"));
     }
   } catch {}
   return { toolCallCount: 0, lastInjectionAt: 0, injectedTopics: [], recentFiles: [] };
 }
 function saveState(sessionId, state) {
   try {
-    if (!existsSync7(PROACTIVE_DIR)) {
-      mkdirSync3(PROACTIVE_DIR, { recursive: true, mode: 448 });
+    if (!existsSync8(PROACTIVE_DIR)) {
+      mkdirSync4(PROACTIVE_DIR, { recursive: true, mode: 448 });
     }
-    writeFileSync(statePath(sessionId), JSON.stringify(state), "utf-8");
+    writeFileSync2(statePath2(sessionId), JSON.stringify(state), "utf-8");
   } catch {}
 }
 function extractFilePath(toolName, toolInput) {
@@ -3459,15 +4029,55 @@ function safeJson4(text, fallback) {
   }
 }
 
+// src/health/auto-cleanup.ts
+init_schema();
+import { existsSync as existsSync9, readFileSync as readFileSync5, writeFileSync as writeFileSync3 } from "fs";
+import { join as join8 } from "path";
+import { homedir as homedir7 } from "os";
+init_logger();
+var log14 = createLogger("auto-cleanup");
+var CADENCE_DAYS = 7;
+var RETENTION_DAYS = 90;
+var MARKER_PATH = join8(homedir7(), ".claude-memory-hub", "last-cleanup.json");
+function maybeRunAutoCleanup() {
+  try {
+    if (!isDue())
+      return;
+    const db = getDatabase();
+    const cutoff = Date.now() - RETENTION_DAYS * 86400000;
+    const entities = db.run(`DELETE FROM entities
+       WHERE created_at < ? AND importance <= 1 AND entity_type = 'file_read'`, [cutoff]).changes;
+    const injections = pruneInjectionLog(RETENTION_DAYS, db);
+    const healthChecks = db.run(`DELETE FROM health_checks WHERE checked_at < ?`, [cutoff]).changes;
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    writeFileSync3(MARKER_PATH, JSON.stringify({ last_run: Date.now() }), "utf-8");
+    log14.info("auto-cleanup complete", { entities, injections, healthChecks });
+  } catch (err) {
+    log14.warn("auto-cleanup failed", { error: String(err) });
+  }
+}
+function isDue() {
+  try {
+    if (!existsSync9(MARKER_PATH))
+      return true;
+    const parsed = JSON.parse(readFileSync5(MARKER_PATH, "utf-8"));
+    const last = typeof parsed.last_run === "number" ? parsed.last_run : 0;
+    return Date.now() - last > CADENCE_DAYS * 86400000;
+  } catch {
+    return true;
+  }
+}
+
 // src/capture/batch-queue.ts
-import { existsSync as existsSync8, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync4 } from "fs";
-import { join as join7 } from "path";
-import { homedir as homedir6 } from "os";
-var log14 = createLogger("batch-queue");
-var DATA_DIR2 = join7(homedir6(), ".claude-memory-hub");
-var BATCH_DIR = join7(DATA_DIR2, "batch");
-var QUEUE_PATH = join7(BATCH_DIR, "queue.jsonl");
-var LOCK_PATH = join7(BATCH_DIR, "queue.lock");
+import { existsSync as existsSync10, mkdirSync as mkdirSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync4, appendFileSync as appendFileSync2, unlinkSync as unlinkSync2, statSync as statSync4 } from "fs";
+import { join as join9 } from "path";
+import { homedir as homedir8 } from "os";
+init_logger();
+var log15 = createLogger("batch-queue");
+var DATA_DIR2 = join9(homedir8(), ".claude-memory-hub");
+var BATCH_DIR = join9(DATA_DIR2, "batch");
+var QUEUE_PATH = join9(BATCH_DIR, "queue.jsonl");
+var LOCK_PATH = join9(BATCH_DIR, "queue.lock");
 var MAX_QUEUE_SIZE = 100 * 1024;
 var LOCK_STALE_MS = 30000;
 function enqueueEvent(event) {
@@ -3477,13 +4087,13 @@ function enqueueEvent(event) {
 `;
     appendFileSync2(QUEUE_PATH, line, "utf-8");
   } catch (err) {
-    log14.error("enqueue failed", { error: String(err) });
+    log15.error("enqueue failed", { error: String(err) });
     throw err;
   }
 }
 function tryFlush() {
   try {
-    if (!existsSync8(QUEUE_PATH))
+    if (!existsSync10(QUEUE_PATH))
       return false;
     const stat = statSync4(QUEUE_PATH);
     if (stat.size === 0)
@@ -3497,12 +4107,12 @@ function tryFlush() {
       releaseLock();
     }
   } catch (err) {
-    log14.error("flush failed", { error: String(err) });
+    log15.error("flush failed", { error: String(err) });
     return false;
   }
 }
 function flushQueue() {
-  const content = readFileSync4(QUEUE_PATH, "utf-8").trim();
+  const content = readFileSync6(QUEUE_PATH, "utf-8").trim();
   if (!content)
     return;
   const events = [];
@@ -3511,7 +4121,7 @@ function flushQueue() {
     try {
       events.push(JSON.parse(line));
     } catch {
-      log14.warn("skipping malformed queue line");
+      log15.warn("skipping malformed queue line");
     }
   }
   if (events.length === 0)
@@ -3539,13 +4149,13 @@ function flushQueue() {
       }
     }
   })();
-  writeFileSync2(QUEUE_PATH, "", "utf-8");
-  log14.info("batch flushed", { events: events.length });
+  writeFileSync4(QUEUE_PATH, "", "utf-8");
+  log15.info("batch flushed", { events: events.length });
 }
 function tryAcquireLock() {
   try {
-    if (existsSync8(LOCK_PATH)) {
-      const lockContent = readFileSync4(LOCK_PATH, "utf-8").trim();
+    if (existsSync10(LOCK_PATH)) {
+      const lockContent = readFileSync6(LOCK_PATH, "utf-8").trim();
       const [pidStr, timestampStr] = lockContent.split(":");
       const lockTime = Number(timestampStr);
       if (Date.now() - lockTime < LOCK_STALE_MS) {
@@ -3556,7 +4166,7 @@ function tryAcquireLock() {
         } catch {}
       }
     }
-    writeFileSync2(LOCK_PATH, `${process.pid}:${Date.now()}`, "utf-8");
+    writeFileSync4(LOCK_PATH, `${process.pid}:${Date.now()}`, "utf-8");
     return true;
   } catch {
     return false;
@@ -3564,12 +4174,12 @@ function tryAcquireLock() {
 }
 function releaseLock() {
   try {
-    unlinkSync(LOCK_PATH);
+    unlinkSync2(LOCK_PATH);
   } catch {}
 }
 function ensureBatchDir() {
-  if (!existsSync8(BATCH_DIR)) {
-    mkdirSync4(BATCH_DIR, { recursive: true, mode: 448 });
+  if (!existsSync10(BATCH_DIR)) {
+    mkdirSync5(BATCH_DIR, { recursive: true, mode: 448 });
   }
 }
 function isBatchEnabled() {
@@ -3596,6 +4206,7 @@ async function main() {
     tryFlush();
   } catch {}
   cleanupProactiveState(hook.session_id);
+  cleanupInjectionState(hook.session_id);
   if (hook.transcript_path) {
     try {
       const store2 = new SessionStore;
@@ -3614,6 +4225,17 @@ async function main() {
       const text = [summary.summary, summary.files_touched, summary.decisions].join(" ");
       indexEmbedding("summary", summary.id, text).catch(() => {});
     }
+    try {
+      const { buildSessionEdges: buildSessionEdges2 } = await Promise.resolve().then(() => (init_edge_builder(), exports_edge_builder));
+      buildSessionEdges2(hook.session_id, project);
+    } catch {}
+    if (process.env["CLAUDE_MEMORY_HUB_OBSIDIAN"] === "1") {
+      try {
+        const { syncObsidianVault: syncObsidianVault2 } = await Promise.resolve().then(() => (init_obsidian_exporter(), exports_obsidian_exporter));
+        syncObsidianVault2({ project });
+      } catch {}
+    }
   }
+  maybeRunAutoCleanup();
 }
 main().catch(() => {}).finally(() => process.exit(0));
