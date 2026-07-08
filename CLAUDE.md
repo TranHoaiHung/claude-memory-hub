@@ -1,6 +1,6 @@
 # claude-memory-hub
 
-Persistent memory system for Claude Code. MCP server + 7 lifecycle hooks + 3 slash commands + SQLite FTS5 + semantic embeddings + knowledge graph + Obsidian export + privacy filtering.
+Persistent memory system for Claude Code. MCP server + 7 lifecycle hooks + 3 slash commands + SQLite FTS5 + semantic embeddings + knowledge graph + two-way Obsidian vault (export + curated read-back) + privacy filtering.
 
 ## Project Structure
 
@@ -63,16 +63,16 @@ commands/           Slash commands (installed to ~/.claude/commands/)
 
 - **Zero external services**: everything runs locally, no Docker/Chroma/Python
 - **Graceful degradation**: if optional dep missing (embeddings), silently falls back
-- **Hook scripts are short-lived**: stdin -> process -> exit. Must be fast (<100ms for UserPromptSubmit)
+- **Hook scripts are thin transports**: stdin -> POST to persistent worker (port 37889, warm DB + model, ~50ms) -> exit. Worker unreachable → identical in-process fallback via `worker/hook-dispatch.ts`. The worker auto-spawns on demand and is never a single point of failure.
 - **MCP server is long-lived**: stdio transport, owns L1 WorkingMemory
 - **Never throw in hooks**: catch all errors, log, continue. Hooks must not crash Claude Code
 - **ResourceRegistry is the single source of truth**: for resource existence, token costs, overhead analysis
 
 ## Database
 
-SQLite at `~/.claude-memory-hub/memory.db` (override: `CLAUDE_MEMORY_HUB_DB`, tests use this via `bunfig.toml` preload). WAL mode. Current SCHEMA_VERSION = 10.
+SQLite at `~/.claude-memory-hub/memory.db` (override: `CLAUDE_MEMORY_HUB_DB`, tests use this via `bunfig.toml` preload). WAL mode. Current SCHEMA_VERSION = 12.
 
-Key tables: sessions, entities (UNIQUE(session_id, entity_type, entity_value) + touch_count since v8), session_notes, messages (conversation capture with FTS5 via fts_messages), long_term_summaries, resource_usage (8 types), fts_memories (FTS5), tfidf_index, embeddings (BLOB vectors), claude_md_registry, health_checks, injection_log (telemetry + injected_at/dedup_skipped/memory_tool_used), graph_edges (co_edited, error_in, decided_about, session_touched, imports).
+Key tables: sessions, entities (UNIQUE(session_id, entity_type, entity_value) + touch_count since v8), session_notes, messages (conversation capture with FTS5 via fts_messages), long_term_summaries, resource_usage (8 types), fts_memories (FTS5), tfidf_index, embeddings (BLOB vectors), claude_md_registry, health_checks, injection_log (telemetry + injected_at/dedup_skipped/memory_tool_used), graph_edges (co_edited, error_in, decided_about, session_touched, imports), curated_notes + fts_curated (Obsidian read-back — user-authored Notes/ + user-edited exported notes, injected as highest-trust memory).
 
 ## Dual-Repo Setup
 
@@ -85,7 +85,7 @@ Key tables: sessions, entities (UNIQUE(session_id, entity_type, entity_value) + 
 ## Build
 
 ```bash
-bun run build:all    # builds index.js + cli.js + 5 hook scripts
+bun run build:all    # builds index.js + cli.js + 7 hook scripts + worker.js
 ```
 
 `@huggingface/transformers` marked as `--external` in build to avoid bundling 90MB model into dist/.
@@ -110,6 +110,8 @@ bun run build:all    # builds index.js + cli.js + 5 hook scripts
 | CLAUDE_MEMORY_HUB_EMBEDDINGS | auto | Embedding mode (auto/disabled) |
 | CLAUDE_MEMORY_HUB_SKIP_HOOKS | - | Suppress hooks (internal) |
 | CLAUDE_MEMORY_HUB_DB | ~/.claude-memory-hub/memory.db | Database path override (tests/CI) |
+| CLAUDE_MEMORY_HUB_WORKER | auto | Set to `disabled` to force in-process hook dispatch |
+| CLAUDE_MEMORY_HUB_WORKER_PORT | 37889 | Persistent worker port |
 | CLAUDE_MEMORY_HUB_OBSIDIAN | - | Set to 1 to auto-sync Obsidian vault at SessionEnd |
 | CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT | ~/Documents/ObsidianVault | Obsidian vault path (export goes to MemoryHub/ inside it) |
 | CMH_LOG_LEVEL | info | Log verbosity |
