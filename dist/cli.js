@@ -1427,96 +1427,67 @@ var init_search_workflow = __esm(() => {
   log6 = createLogger("search-workflow");
 });
 
-// src/ui/viewer.ts
-var exports_viewer = {};
-__export(exports_viewer, {
-  startViewer: () => startViewer
-});
-async function handleApi(url) {
+// src/ui/graph-api.ts
+function buildGraphPayload(url) {
   const db = getDatabase();
-  const path = url.pathname;
-  try {
-    if (path === "/api/health") {
-      return json(runHealthCheck(db));
-    }
-    if (path === "/api/stats") {
-      const sessions = db.prepare("SELECT COUNT(*) as c FROM sessions").get()?.c ?? 0;
-      const entities = db.prepare("SELECT COUNT(*) as c FROM entities").get()?.c ?? 0;
-      const summaries = db.prepare("SELECT COUNT(*) as c FROM long_term_summaries").get()?.c ?? 0;
-      const notes = db.prepare("SELECT COUNT(*) as c FROM session_notes").get()?.c ?? 0;
-      return json({ sessions, entities, summaries, notes });
-    }
-    if (path === "/api/search") {
-      const query = url.searchParams.get("q") || "";
-      const limit = parseInt(url.searchParams.get("limit") || "20");
-      const offset = parseInt(url.searchParams.get("offset") || "0");
-      const project = url.searchParams.get("project");
-      return json(await searchIndex(query, { limit, offset, ...project ? { project } : {} }, db));
-    }
-    if (path === "/api/sessions") {
-      const limit = parseInt(url.searchParams.get("limit") || "50");
-      const offset = parseInt(url.searchParams.get("offset") || "0");
-      const rows = db.prepare("SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?").all(limit, offset);
-      return json(rows);
-    }
-    if (path === "/api/summaries") {
-      const limit = parseInt(url.searchParams.get("limit") || "50");
-      const offset = parseInt(url.searchParams.get("offset") || "0");
-      const rows = db.prepare("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
-      return json(rows);
-    }
-    if (path === "/api/entities") {
-      const sessionId = url.searchParams.get("session_id");
-      const limit = parseInt(url.searchParams.get("limit") || "100");
-      const offset = parseInt(url.searchParams.get("offset") || "0");
-      if (sessionId) {
-        const rows2 = db.prepare("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?").all(sessionId, limit, offset);
-        return json(rows2);
-      }
-      const rows = db.prepare("SELECT * FROM entities ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
-      return json(rows);
-    }
-    return json({ error: "Not found" }, 404);
-  } catch (e) {
-    log7.error("API error", { path, error: String(e) });
-    return json({ error: String(e) }, 500);
+  const project = url.searchParams.get("project");
+  const relsParam = url.searchParams.get("rels");
+  const rels = relsParam ? relsParam.split(",").filter((r) => ALL_RELS.includes(r)) : ALL_RELS;
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || String(DEFAULT_EDGE_LIMIT)), MAX_EDGE_LIMIT);
+  if (rels.length === 0)
+    return { nodes: [], edges: [], total_edges: 0, shown_edges: 0 };
+  const relPlaceholders = rels.map(() => "?").join(",");
+  const conditions = [`rel IN (${relPlaceholders})`];
+  const params = [...rels];
+  if (project) {
+    conditions.push("project = ?");
+    params.push(project);
   }
-}
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-  });
-}
-function startViewer() {
-  const server = Bun.serve({
-    port: PORT,
-    fetch(req) {
-      try {
-        const url = new URL(req.url);
-        if (url.pathname.startsWith("/api/"))
-          return handleApi(url);
-        return new Response(HTML, { headers: { "Content-Type": "text/html" } });
-      } catch (e) {
-        log7.error("Server fetch error", { error: String(e) });
-        return new Response(JSON.stringify({ error: String(e) }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" }
-        });
-      }
-    },
-    error(err) {
-      log7.error("Server error", { error: String(err) });
-      return new Response(JSON.stringify({ error: String(err) }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" }
-      });
+  const total = db.prepare(`SELECT COUNT(*) as c FROM graph_edges WHERE ${conditions.join(" AND ")}`).get(...params)?.c ?? 0;
+  params.push(limit);
+  const rows = db.prepare(`SELECT src_type, src_key, dst_type, dst_key, rel, weight
+     FROM graph_edges WHERE ${conditions.join(" AND ")}
+     ORDER BY weight DESC LIMIT ?`).all(...params);
+  const nodeIndex = new Map;
+  const nodes = [];
+  const edges = [];
+  const intern = (type, key) => {
+    const id = `${type}:${key}`;
+    const existing = nodeIndex.get(id);
+    if (existing !== undefined) {
+      nodes[existing].degree++;
+      return existing;
     }
-  });
-  console.log(`claude-memory-hub viewer running at http://localhost:${server.port}`);
-  log7.info("Viewer started", { port: server.port });
+    const idx = nodes.length;
+    nodeIndex.set(id, idx);
+    nodes.push({ id: key, type, label: nodeLabel(type, key), degree: 1 });
+    return idx;
+  };
+  for (const r of rows) {
+    edges.push({
+      s: intern(r.src_type, r.src_key),
+      d: intern(r.dst_type, r.dst_key),
+      rel: r.rel,
+      w: Math.round(r.weight * 100) / 100
+    });
+  }
+  return { nodes, edges, total_edges: total, shown_edges: edges.length };
 }
-var log7, PORT = 37888, HTML = `<!DOCTYPE html>
+function nodeLabel(type, key) {
+  if (type === "file")
+    return key.split("/").pop() ?? key;
+  if (type === "session")
+    return key.slice(0, 8);
+  return key.length > 42 ? key.slice(0, 39) + "\u2026" : key;
+}
+var DEFAULT_EDGE_LIMIT = 400, MAX_EDGE_LIMIT = 1200, ALL_RELS;
+var init_graph_api = __esm(() => {
+  init_schema();
+  ALL_RELS = ["co_edited", "imports", "session_touched", "error_in", "decided_about"];
+});
+
+// src/ui/viewer-page.ts
+var VIEWER_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1552,7 +1523,7 @@ var log7, PORT = 37888, HTML = `<!DOCTYPE html>
 body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; min-height: 100vh; }
 
 /* Layout */
-.app { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+.app { max-width: 1180px; margin: 0 auto; padding: 32px 24px; }
 
 /* Header */
 .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 32px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
@@ -1602,7 +1573,6 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
 .card-meta { font-size: 12px; color: var(--text-muted); display: flex; gap: 12px; flex-wrap: wrap; }
 .card-content { font-size: 13.5px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; line-height: 1.65; max-height: 200px; overflow: hidden; position: relative; }
 .card-content.expanded { max-height: none; }
-.card-expand { background: none; border: none; color: var(--accent); font-size: 12px; cursor: pointer; margin-top: 6px; padding: 0; }
 
 /* Pagination */
 .pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 24px; }
@@ -1616,11 +1586,45 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
 .empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.3; }
 .empty-text { font-size: 14px; }
 
+/* Graph view */
+#graphView { display: none; }
+.graph-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.graph-controls select, .graph-controls input[type=text] { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); padding: 8px 12px; font-size: 13px; outline: none; }
+.graph-controls select:focus, .graph-controls input[type=text]:focus { border-color: var(--accent); }
+.graph-controls input[type=text] { width: 180px; }
+.rel-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 500; cursor: pointer; border: 1px solid var(--border); color: var(--text-muted); background: var(--surface); transition: all var(--transition); user-select: none; }
+.rel-chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+.rel-chip.on { color: var(--text); border-color: var(--border-light); background: var(--card); }
+.rel-chip.on .dot.co_edited { background: var(--blue); }
+.rel-chip.on .dot.imports { background: var(--accent-light); }
+.rel-chip.on .dot.session_touched { background: var(--yellow); }
+.rel-chip.on .dot.error_in { background: var(--red); }
+.rel-chip.on .dot.decided_about { background: var(--green); }
+.graph-meta { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+.graph-wrap { position: relative; background: radial-gradient(ellipse at 50% 40%, #12121c 0%, var(--bg) 75%); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+#gCanvas { display: block; width: 100%; height: 620px; cursor: grab; }
+#gCanvas.dragging { cursor: grabbing; }
+.graph-legend { position: absolute; left: 14px; bottom: 12px; display: flex; gap: 14px; font-size: 11px; color: var(--text-muted); pointer-events: none; }
+.graph-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.graph-legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.graph-hint { position: absolute; right: 14px; bottom: 12px; font-size: 11px; color: var(--text-muted); pointer-events: none; }
+.graph-panel { position: absolute; top: 12px; right: 12px; width: 320px; max-height: calc(100% - 24px); overflow-y: auto; background: rgba(18,18,26,0.94); border: 1px solid var(--border-light); border-radius: var(--radius); padding: 16px; backdrop-filter: blur(8px); }
+.graph-panel h3 { font-size: 13px; font-weight: 600; word-break: break-all; margin-bottom: 4px; }
+.graph-panel .gp-path { font-size: 11px; color: var(--text-muted); word-break: break-all; margin-bottom: 10px; }
+.graph-panel h4 { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 12px 0 6px; }
+.graph-panel ul { list-style: none; }
+.graph-panel li { font-size: 12px; color: var(--text-secondary); padding: 3px 0; word-break: break-all; }
+.graph-panel li.clickable { cursor: pointer; }
+.graph-panel li.clickable:hover { color: var(--accent-light); }
+.graph-panel .gp-close { position: absolute; top: 10px; right: 12px; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 16px; }
+.graph-panel .gp-w { color: var(--text-muted); font-size: 11px; }
+
 /* Responsive */
 @media (max-width: 768px) {
   .stats { grid-template-columns: repeat(2, 1fr); }
   .app { padding: 16px; }
   .header { flex-direction: column; align-items: flex-start; gap: 12px; }
+  .graph-panel { width: calc(100% - 24px); }
 }
 </style>
 </head>
@@ -1636,7 +1640,7 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
 
   <div class="stats" id="stats"></div>
 
-  <div class="search-wrap">
+  <div class="search-wrap" id="searchWrap">
     <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
     <input id="searchInput" type="text" placeholder="Search memories, files, decisions..." />
   </div>
@@ -1645,14 +1649,39 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
     <button class="tab active" data-tab="summaries">Summaries <span class="count" id="cnt-summaries"></span></button>
     <button class="tab" data-tab="sessions">Sessions <span class="count" id="cnt-sessions"></span></button>
     <button class="tab" data-tab="entities">Entities <span class="count" id="cnt-entities"></span></button>
+    <button class="tab" data-tab="graph">Graph <span class="count" id="cnt-graph"></span></button>
   </div>
 
   <div id="results"></div>
 
-  <div class="pagination">
+  <div class="pagination" id="pagination">
     <button class="pg-btn" id="prevBtn" disabled>Previous</button>
     <span class="pg-info" id="pageInfo"></span>
     <button class="pg-btn" id="nextBtn">Next</button>
+  </div>
+
+  <div id="graphView">
+    <div class="graph-controls">
+      <select id="gProject"><option value="">All projects</option></select>
+      <span class="rel-chip on" data-rel="co_edited"><i class="dot co_edited"></i>co-edited</span>
+      <span class="rel-chip on" data-rel="imports"><i class="dot imports"></i>imports</span>
+      <span class="rel-chip on" data-rel="error_in"><i class="dot error_in"></i>errors</span>
+      <span class="rel-chip on" data-rel="decided_about"><i class="dot decided_about"></i>decisions</span>
+      <span class="rel-chip" data-rel="session_touched"><i class="dot session_touched"></i>sessions</span>
+      <input id="gFilter" type="text" placeholder="Highlight nodes..." />
+      <span class="graph-meta" id="gMeta"></span>
+    </div>
+    <div class="graph-wrap">
+      <canvas id="gCanvas"></canvas>
+      <div class="graph-legend">
+        <span><i style="background:#60a5fa"></i>file</span>
+        <span><i style="background:#facc15"></i>session</span>
+        <span><i style="background:#4ade80"></i>decision</span>
+        <span><i style="background:#f87171"></i>error</span>
+      </div>
+      <div class="graph-hint">drag to pan &middot; scroll to zoom &middot; click a node &middot; double-click to fit</div>
+      <div class="graph-panel" id="gPanel" hidden></div>
+    </div>
   </div>
 </div>
 
@@ -1694,7 +1723,7 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
       }).join("");
     }
     return data.map(function(e) {
-      return '<div class="card"><div class="card-header"><span class="card-type type-' + (e.entity_type || "entity") + '">' + esc(e.entity_type) + '</span><div class="card-meta"><span>' + fmtDate(e.created_at) + '</span><span>' + esc(e.tool_name) + '</span><span>imp: ' + e.importance + '</span></div></div><div class="card-content">' + esc(e.entity_value) + (e.context ? "\\n" + esc(e.context) : "") + '</div></div>';
+      return '<div class="card"><div class="card-header"><span class="card-type type-' + (e.entity_type || "entity") + '">' + esc(e.entity_type) + '</span><div class="card-meta"><span>' + fmtDate(e.created_at) + '</span><span>' + esc(e.tool_name) + '</span><span>imp: ' + e.importance + '</span><span>touches: ' + (e.touch_count || 1) + '</span></div></div><div class="card-content">' + esc(e.entity_value) + (e.context ? "\\n" + esc(e.context) : "") + '</div></div>';
     }).join("");
   }
 
@@ -1729,6 +1758,309 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
     });
   }
 
+  // ==========================================================================
+  // Graph tab \u2014 Obsidian-style force-directed canvas (zero dependencies)
+  // ==========================================================================
+
+  var G = {
+    nodes: [], edges: [], alpha: 0,
+    tx: 0, ty: 0, k: 1,
+    drag: null, panStart: null, moved: false,
+    hover: -1, sel: -1,
+    raf: 0, inited: false,
+    colors: { file: "#60a5fa", session: "#facc15", decision: "#4ade80", error: "#f87171" },
+    edgeColors: { co_edited: "96,165,250", imports: "157,143,255", session_touched: "250,204,21", error_in: "248,113,113", decided_about: "74,222,128" }
+  };
+
+  function gCanvas() { return document.getElementById("gCanvas"); }
+
+  function gResize() {
+    var c = gCanvas(), dpr = window.devicePixelRatio || 1;
+    var w = c.clientWidth, h = c.clientHeight;
+    c.width = w * dpr; c.height = h * dpr;
+    c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function activeRels() {
+    var rels = [];
+    document.querySelectorAll(".rel-chip.on").forEach(function(ch){ rels.push(ch.getAttribute("data-rel")); });
+    return rels;
+  }
+
+  function gLoad() {
+    var proj = document.getElementById("gProject").value;
+    var rels = activeRels();
+    document.getElementById("gMeta").textContent = "loading...";
+    api("/api/graph?limit=400&rels=" + rels.join(",") + (proj ? "&project=" + encodeURIComponent(proj) : "")).then(function(data) {
+      if (!data || !data.nodes) { document.getElementById("gMeta").textContent = "no data"; return; }
+      var c = gCanvas(), w = c.clientWidth, h = c.clientHeight;
+      G.nodes = data.nodes.map(function(n, i) {
+        var angle = (i / data.nodes.length) * Math.PI * 2;
+        var r = Math.min(w, h) * 0.32 * (0.4 + Math.random() * 0.6);
+        return { id: n.id, type: n.type, label: n.label, degree: n.degree,
+                 x: w/2 + Math.cos(angle) * r, y: h/2 + Math.sin(angle) * r, vx: 0, vy: 0 };
+      });
+      G.edges = data.edges;
+      G.alpha = 1; G.sel = -1; G.hover = -1;
+      G.tx = 0; G.ty = 0; G.k = 1;
+      G.pendingFit = true;
+      document.getElementById("gPanel").hidden = true;
+      document.getElementById("gMeta").textContent = data.nodes.length + " nodes / " + data.shown_edges + " of " + data.total_edges + " edges";
+      if (!G.raf) gLoop();
+    });
+  }
+
+  function gTick() {
+    var nodes = G.nodes, edges = G.edges, n = nodes.length;
+    if (n === 0) return;
+    var c = gCanvas(), cx = c.clientWidth / 2, cy = c.clientHeight / 2;
+    var i, j, dx, dy, d2, d, f;
+
+    // Repulsion (capped O(n^2) \u2014 payload limits nodes to a few hundred)
+    for (i = 0; i < n; i++) {
+      var a = nodes[i];
+      for (j = i + 1; j < n; j++) {
+        var b = nodes[j];
+        dx = a.x - b.x; dy = a.y - b.y;
+        d2 = dx*dx + dy*dy;
+        if (d2 > 40000) continue;
+        if (d2 < 1) { d2 = 1; dx = (Math.random() - 0.5); dy = (Math.random() - 0.5); }
+        f = 320 / d2 * G.alpha;
+        a.vx += dx * f; a.vy += dy * f;
+        b.vx -= dx * f; b.vy -= dy * f;
+      }
+    }
+    // Springs along edges
+    for (i = 0; i < edges.length; i++) {
+      var e = edges[i], s = nodes[e.s], t = nodes[e.d];
+      dx = t.x - s.x; dy = t.y - s.y;
+      d = Math.sqrt(dx*dx + dy*dy) || 1;
+      var rest = 55;
+      f = (d - rest) / d * 0.012 * Math.min(e.w, 4) * G.alpha * 8;
+      s.vx += dx * f; s.vy += dy * f;
+      t.vx -= dx * f; t.vy -= dy * f;
+    }
+    // Gravity + integrate (velocity clamped so nodes never get ejected)
+    for (i = 0; i < n; i++) {
+      var p = nodes[i];
+      p.vx += (cx - p.x) * 0.009 * G.alpha;
+      p.vy += (cy - p.y) * 0.009 * G.alpha;
+      if (G.drag && G.drag.idx === i) { p.vx = 0; p.vy = 0; continue; }
+      p.vx = Math.max(-6, Math.min(6, p.vx * 0.85));
+      p.vy = Math.max(-6, Math.min(6, p.vy * 0.85));
+      p.x += p.vx; p.y += p.vy;
+    }
+    G.alpha *= 0.99;
+    // Fit once the layout has roughly formed, well before the sim fully cools
+    if (G.pendingFit && G.alpha < 0.25) { G.pendingFit = false; gFitView(); }
+    if (G.alpha < 0.005) G.alpha = 0;
+  }
+
+  // Fit all nodes into the visible canvas (called once the layout settles)
+  function gFitView() {
+    var nodes = G.nodes;
+    if (nodes.length === 0) return;
+    var c = gCanvas(), w = c.clientWidth, h = c.clientHeight;
+    var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    for (var i = 0; i < nodes.length; i++) {
+      var p = nodes[i];
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    var pad = 60;
+    var spanX = Math.max(maxX - minX, 1), spanY = Math.max(maxY - minY, 1);
+    G.k = Math.min((w - pad * 2) / spanX, (h - pad * 2) / spanY, 2.2);
+    G.tx = w / 2 - (minX + spanX / 2) * G.k;
+    G.ty = h / 2 - (minY + spanY / 2) * G.k;
+  }
+
+  function gDraw() {
+    var c = gCanvas(), ctx = c.getContext("2d");
+    var w = c.clientWidth, h = c.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+    ctx.save();
+    ctx.translate(G.tx, G.ty);
+    ctx.scale(G.k, G.k);
+
+    var filter = document.getElementById("gFilter").value.trim().toLowerCase();
+    var nodes = G.nodes, edges = G.edges, i;
+
+    // Edges
+    for (i = 0; i < edges.length; i++) {
+      var e = edges[i], s = nodes[e.s], t = nodes[e.d];
+      var emph = (G.sel === e.s || G.sel === e.d || G.hover === e.s || G.hover === e.d);
+      ctx.strokeStyle = "rgba(" + (G.edgeColors[e.rel] || "148,148,168") + "," + (emph ? 0.55 : 0.16) + ")";
+      ctx.lineWidth = Math.min(0.5 + Math.sqrt(e.w) * 0.35, 2.5) * (emph ? 1.4 : 1);
+      ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y); ctx.stroke();
+    }
+
+    // Nodes
+    for (i = 0; i < nodes.length; i++) {
+      var p = nodes[i];
+      var r = 2.5 + Math.sqrt(p.degree) * 1.2;
+      var dim = filter && p.label.toLowerCase().indexOf(filter) === -1 && p.id.toLowerCase().indexOf(filter) === -1;
+      var active = (i === G.hover || i === G.sel) || (filter && !dim);
+      ctx.globalAlpha = dim ? 0.12 : 1;
+      if (active) { ctx.shadowColor = G.colors[p.type] || "#9494a8"; ctx.shadowBlur = 14; }
+      ctx.fillStyle = G.colors[p.type] || "#9494a8";
+      ctx.beginPath(); ctx.arc(p.x, p.y, i === G.sel ? r + 2 : r, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+
+      var showLabel = active || p.degree >= 8 || G.k > 1.5;
+      if (showLabel && !dim) {
+        ctx.font = (i === G.sel || i === G.hover ? "600 " : "") + "10px Inter, sans-serif";
+        ctx.fillStyle = i === G.sel || i === G.hover ? "#e4e4ef" : "rgba(148,148,168,0.85)";
+        ctx.fillText(p.label, p.x + r + 4, p.y + 3);
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  function gLoop() {
+    gTick();
+    gDraw();
+    G.raf = requestAnimationFrame(gLoop);
+  }
+
+  function gToWorld(mx, my) {
+    return { x: (mx - G.tx) / G.k, y: (my - G.ty) / G.k };
+  }
+
+  function gHit(mx, my) {
+    var p = gToWorld(mx, my);
+    for (var i = G.nodes.length - 1; i >= 0; i--) {
+      var n = G.nodes[i];
+      var r = 2.5 + Math.sqrt(n.degree) * 1.2 + 3;
+      var dx = n.x - p.x, dy = n.y - p.y;
+      if (dx*dx + dy*dy <= r*r) return i;
+    }
+    return -1;
+  }
+
+  function gShowPanel(idx) {
+    var n = G.nodes[idx];
+    var panel = document.getElementById("gPanel");
+    var head = '<button class="gp-close" id="gpClose">&times;</button>' +
+      '<span class="card-type type-' + (n.type === "file" ? "file_modified" : n.type) + '">' + n.type + '</span>' +
+      '<h3 style="margin-top:8px">' + esc(n.label) + '</h3>' +
+      '<div class="gp-path">' + esc(n.id) + '</div>' +
+      '<div class="gp-w">' + n.degree + ' connections</div>';
+    panel.innerHTML = head;
+    panel.hidden = false;
+
+    if (n.type === "file") {
+      api("/api/impact?file=" + encodeURIComponent(n.id)).then(function(imp) {
+        if (!imp || imp.error) return;
+        var html = "";
+        function section(title, items, fmt) {
+          if (!items || items.length === 0) return "";
+          return "<h4>" + title + "</h4><ul>" + items.slice(0, 8).map(fmt).join("") + "</ul>";
+        }
+        html += section("Usually edited with", imp.co_edited, function(x){ return '<li class="clickable" data-goto="' + esc(x.file) + '">' + esc(x.file.split("/").pop()) + ' <span class="gp-w">(' + x.weight + ')</span></li>'; });
+        html += section("Past errors here", imp.errors, function(x){ return "<li>" + esc(x.error) + "</li>"; });
+        html += section("Decisions", imp.decisions, function(x){ return "<li>" + esc(x.decision) + "</li>"; });
+        html += section("Imports", imp.imports, function(x){ return "<li>" + esc(x.split("/").pop()) + "</li>"; });
+        html += section("Imported by", imp.imported_by, function(x){ return "<li>" + esc(x.split("/").pop()) + "</li>"; });
+        html += section("Sessions", imp.sessions, function(x){ return "<li>" + esc(x.session_id.slice(0, 8)) + ' <span class="gp-w">(' + x.weight + ' touches)</span></li>'; });
+        panel.innerHTML = head + html;
+        panel.querySelectorAll("[data-goto]").forEach(function(li) {
+          li.addEventListener("click", function() {
+            var target = this.getAttribute("data-goto");
+            for (var i = 0; i < G.nodes.length; i++) {
+              if (G.nodes[i].id === target) { G.sel = i; gShowPanel(i); gCenterOn(i); return; }
+            }
+          });
+        });
+        bindClose();
+      });
+    }
+    bindClose();
+    function bindClose() {
+      var btn = document.getElementById("gpClose");
+      if (btn) btn.addEventListener("click", function(){ panel.hidden = true; G.sel = -1; });
+    }
+  }
+
+  function gCenterOn(idx) {
+    var c = gCanvas(), n = G.nodes[idx];
+    G.tx = c.clientWidth / 2 - n.x * G.k;
+    G.ty = c.clientHeight / 2 - n.y * G.k;
+  }
+
+  function initGraph() {
+    if (G.inited) return;
+    G.inited = true;
+    gResize();
+    window.addEventListener("resize", gResize);
+
+    api("/api/graph/projects").then(function(projects) {
+      var sel = document.getElementById("gProject");
+      (projects || []).forEach(function(p) {
+        var opt = document.createElement("option");
+        opt.value = p.project; opt.textContent = p.project + " (" + p.edges + ")";
+        sel.appendChild(opt);
+      });
+    });
+
+    var c = gCanvas();
+    c.addEventListener("mousedown", function(ev) {
+      var rect = c.getBoundingClientRect();
+      var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+      var idx = gHit(mx, my);
+      G.moved = false;
+      if (idx >= 0) { G.drag = { idx: idx }; G.alpha = Math.max(G.alpha, 0.25); }
+      else { G.panStart = { mx: mx, my: my, tx: G.tx, ty: G.ty }; }
+      c.classList.add("dragging");
+    });
+    c.addEventListener("mousemove", function(ev) {
+      var rect = c.getBoundingClientRect();
+      var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+      if (G.drag) {
+        var p = gToWorld(mx, my);
+        G.nodes[G.drag.idx].x = p.x; G.nodes[G.drag.idx].y = p.y;
+        G.alpha = Math.max(G.alpha, 0.2); G.moved = true;
+      } else if (G.panStart) {
+        G.tx = G.panStart.tx + (mx - G.panStart.mx);
+        G.ty = G.panStart.ty + (my - G.panStart.my);
+        if (Math.abs(mx - G.panStart.mx) + Math.abs(my - G.panStart.my) > 4) G.moved = true;
+      } else {
+        G.hover = gHit(mx, my);
+        c.style.cursor = G.hover >= 0 ? "pointer" : "grab";
+      }
+    });
+    window.addEventListener("mouseup", function(ev) {
+      var rect = c.getBoundingClientRect();
+      var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+      if (!G.moved) {
+        var idx = gHit(mx, my);
+        if (idx >= 0) { G.sel = idx; gShowPanel(idx); }
+        else if (G.drag === null && G.panStart !== null) { G.sel = -1; document.getElementById("gPanel").hidden = true; }
+      }
+      G.drag = null; G.panStart = null;
+      c.classList.remove("dragging");
+    });
+    c.addEventListener("dblclick", function() { gFitView(); });
+    c.addEventListener("wheel", function(ev) {
+      ev.preventDefault();
+      var rect = c.getBoundingClientRect();
+      var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+      var factor = ev.deltaY < 0 ? 1.12 : 0.89;
+      var nk = Math.min(Math.max(G.k * factor, 0.25), 5);
+      // Zoom around cursor
+      G.tx = mx - (mx - G.tx) * (nk / G.k);
+      G.ty = my - (my - G.ty) * (nk / G.k);
+      G.k = nk;
+    }, { passive: false });
+
+    document.getElementById("gProject").addEventListener("change", gLoad);
+    document.querySelectorAll(".rel-chip").forEach(function(ch) {
+      ch.addEventListener("click", function() { this.classList.toggle("on"); gLoad(); });
+    });
+
+    gLoad();
+  }
+
   // Tab click handlers
   document.querySelectorAll("[data-tab]").forEach(function(btn) {
     btn.addEventListener("click", function() {
@@ -1736,7 +2068,13 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
       currentOffset = 0;
       document.querySelectorAll(".tab").forEach(function(b){ b.classList.remove("active"); });
       this.classList.add("active");
-      loadTab();
+      var isGraph = currentTab === "graph";
+      document.getElementById("results").style.display = isGraph ? "none" : "flex";
+      document.getElementById("pagination").style.display = isGraph ? "none" : "flex";
+      document.getElementById("searchWrap").style.display = isGraph ? "none" : "block";
+      document.getElementById("graphView").style.display = isGraph ? "block" : "none";
+      if (isGraph) { initGraph(); gResize(); }
+      else loadTab();
     });
   });
 
@@ -1748,8 +2086,8 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
   document.getElementById("searchInput").addEventListener("keydown", function(e){ if (e.key === "Enter") doSearch(); });
 
   // Init
-  Promise.all([api("/api/stats"), api("/api/health")]).then(function(res) {
-    var stats = res[0], health = res[1];
+  Promise.all([api("/api/stats"), api("/api/health"), api("/api/graph/projects")]).then(function(res) {
+    var stats = res[0], health = res[1], gprojects = res[2];
 
     document.getElementById("stats").innerHTML = ["sessions","entities","summaries","notes"].map(function(k) {
       return '<div class="stat-card"><div class="stat-value">' + (stats[k] || 0) + '</div><div class="stat-label">' + k + '</div></div>';
@@ -1758,11 +2096,23 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
     var cntS = document.getElementById("cnt-summaries"); if(cntS) cntS.textContent = stats.summaries || "";
     var cntSe = document.getElementById("cnt-sessions"); if(cntSe) cntSe.textContent = stats.sessions || "";
     var cntE = document.getElementById("cnt-entities"); if(cntE) cntE.textContent = stats.entities || "";
+    var cntG = document.getElementById("cnt-graph");
+    if (cntG && gprojects && gprojects.length) {
+      var totalEdges = 0;
+      gprojects.forEach(function(p){ totalEdges += p.edges; });
+      cntG.textContent = totalEdges;
+    }
 
     if (health && health.checks) {
       document.getElementById("health").innerHTML = health.checks.map(function(c) {
         return '<span class="badge badge-' + c.status + '">' + c.component + '</span>';
       }).join("");
+    }
+
+    // Deep link: /#graph opens the graph tab directly
+    if (location.hash === "#graph") {
+      var gtab = document.querySelector('[data-tab="graph"]');
+      if (gtab) { gtab.click(); return; }
     }
 
     loadTab();
@@ -1771,11 +2121,207 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
 </script>
 </body>
 </html>`;
+
+// src/graph/graph-queries.ts
+var exports_graph_queries = {};
+__export(exports_graph_queries, {
+  getNeighbors: () => getNeighbors,
+  getFileImpact: () => getFileImpact,
+  countEdges: () => countEdges
+});
+function getNeighbors(node, options = {}) {
+  const d = options.db ?? getDatabase();
+  const limit = Math.min(options.limit ?? 20, 100);
+  const pattern = `%${node.replace(/[%_]/g, "\\$&")}%`;
+  const conditions = ["(src_key LIKE ? OR dst_key LIKE ?)"];
+  const params = [pattern, pattern];
+  if (options.rel) {
+    conditions.push("rel = ?");
+    params.push(options.rel);
+  }
+  if (options.project) {
+    conditions.push("project = ?");
+    params.push(options.project);
+  }
+  params.push(limit);
+  return d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
+     FROM graph_edges
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY weight DESC, last_seen DESC
+     LIMIT ?`).all(...params);
+}
+function getFileImpact(file, db) {
+  const d = db ?? getDatabase();
+  const pattern = `%${file.replace(/[%_]/g, "\\$&")}%`;
+  const rows = d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
+     FROM graph_edges
+     WHERE src_key LIKE ? OR dst_key LIKE ?
+     ORDER BY weight DESC
+     LIMIT 200`).all(pattern, pattern);
+  const report = {
+    file,
+    co_edited: [],
+    errors: [],
+    decisions: [],
+    sessions: [],
+    imports: [],
+    imported_by: []
+  };
+  const isTarget = (k) => k.includes(file);
+  for (const e of rows) {
+    switch (e.rel) {
+      case "co_edited": {
+        const other = isTarget(e.src_key) ? e.dst_key : e.src_key;
+        if (report.co_edited.length < 10)
+          report.co_edited.push({ file: other, weight: round(e.weight) });
+        break;
+      }
+      case "error_in":
+        if (isTarget(e.dst_key) && report.errors.length < 10) {
+          report.errors.push({ error: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "decided_about":
+        if (isTarget(e.dst_key) && report.decisions.length < 10) {
+          report.decisions.push({ decision: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "session_touched":
+        if (isTarget(e.dst_key) && report.sessions.length < 10) {
+          report.sessions.push({ session_id: e.src_key, weight: round(e.weight) });
+        }
+        break;
+      case "imports":
+        if (isTarget(e.src_key) && report.imports.length < 15)
+          report.imports.push(e.dst_key);
+        else if (isTarget(e.dst_key) && report.imported_by.length < 15)
+          report.imported_by.push(e.src_key);
+        break;
+    }
+  }
+  return report;
+}
+function countEdges(db) {
+  const d = db ?? getDatabase();
+  return d.query("SELECT COUNT(*) c FROM graph_edges").get()?.c ?? 0;
+}
+function round(n) {
+  return Math.round(n * 100) / 100;
+}
+var init_graph_queries = __esm(() => {
+  init_schema();
+});
+
+// src/ui/viewer.ts
+var exports_viewer = {};
+__export(exports_viewer, {
+  startViewer: () => startViewer
+});
+async function handleApi(url) {
+  const db = getDatabase();
+  const path = url.pathname;
+  try {
+    if (path === "/api/health") {
+      return json(runHealthCheck(db));
+    }
+    if (path === "/api/stats") {
+      const sessions = db.prepare("SELECT COUNT(*) as c FROM sessions").get()?.c ?? 0;
+      const entities = db.prepare("SELECT COUNT(*) as c FROM entities").get()?.c ?? 0;
+      const summaries = db.prepare("SELECT COUNT(*) as c FROM long_term_summaries").get()?.c ?? 0;
+      const notes = db.prepare("SELECT COUNT(*) as c FROM session_notes").get()?.c ?? 0;
+      return json({ sessions, entities, summaries, notes });
+    }
+    if (path === "/api/search") {
+      const query = url.searchParams.get("q") || "";
+      const limit = parseInt(url.searchParams.get("limit") || "20");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const project = url.searchParams.get("project");
+      return json(await searchIndex(query, { limit, offset, ...project ? { project } : {} }, db));
+    }
+    if (path === "/api/sessions") {
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const rows = db.prepare("SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+      return json(rows);
+    }
+    if (path === "/api/summaries") {
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      const rows = db.prepare("SELECT * FROM long_term_summaries ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+      return json(rows);
+    }
+    if (path === "/api/entities") {
+      const sessionId = url.searchParams.get("session_id");
+      const limit = parseInt(url.searchParams.get("limit") || "100");
+      const offset = parseInt(url.searchParams.get("offset") || "0");
+      if (sessionId) {
+        const rows2 = db.prepare("SELECT * FROM entities WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?").all(sessionId, limit, offset);
+        return json(rows2);
+      }
+      const rows = db.prepare("SELECT * FROM entities ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+      return json(rows);
+    }
+    if (path === "/api/graph/projects") {
+      const rows = db.prepare("SELECT project, COUNT(*) as edges FROM graph_edges GROUP BY project ORDER BY edges DESC LIMIT 60").all();
+      return json(rows);
+    }
+    if (path === "/api/graph") {
+      return json(buildGraphPayload(url));
+    }
+    if (path === "/api/impact") {
+      const file = url.searchParams.get("file") || "";
+      if (!file)
+        return json({ error: "file param required" }, 400);
+      const { getFileImpact: getFileImpact2 } = await Promise.resolve().then(() => (init_graph_queries(), exports_graph_queries));
+      return json(getFileImpact2(file, db));
+    }
+    return json({ error: "Not found" }, 404);
+  } catch (e) {
+    log7.error("API error", { path, error: String(e) });
+    return json({ error: String(e) }, 500);
+  }
+}
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+  });
+}
+function startViewer() {
+  const server = Bun.serve({
+    port: PORT,
+    fetch(req) {
+      try {
+        const url = new URL(req.url);
+        if (url.pathname.startsWith("/api/"))
+          return handleApi(url);
+        return new Response(VIEWER_HTML, { headers: { "Content-Type": "text/html" } });
+      } catch (e) {
+        log7.error("Server fetch error", { error: String(e) });
+        return new Response(JSON.stringify({ error: String(e) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    },
+    error(err) {
+      log7.error("Server error", { error: String(err) });
+      return new Response(JSON.stringify({ error: String(err) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  });
+  console.log(`claude-memory-hub viewer running at http://localhost:${server.port}`);
+  log7.info("Viewer started", { port: server.port });
+}
+var log7, PORT = 37888;
 var init_viewer = __esm(() => {
   init_schema();
   init_logger();
   init_monitor();
   init_search_workflow();
+  init_graph_api();
   log7 = createLogger("viewer");
 });
 
@@ -3720,96 +4266,6 @@ var init_code_scanner = __esm(() => {
     /^\s*from\s+([A-Za-z0-9_.]+)\s+import/gm
   ];
   RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", "/index.ts", "/index.js", ".dart", ".py"];
-});
-
-// src/graph/graph-queries.ts
-var exports_graph_queries = {};
-__export(exports_graph_queries, {
-  getNeighbors: () => getNeighbors,
-  getFileImpact: () => getFileImpact,
-  countEdges: () => countEdges
-});
-function getNeighbors(node, options = {}) {
-  const d = options.db ?? getDatabase();
-  const limit = Math.min(options.limit ?? 20, 100);
-  const pattern = `%${node.replace(/[%_]/g, "\\$&")}%`;
-  const conditions = ["(src_key LIKE ? OR dst_key LIKE ?)"];
-  const params = [pattern, pattern];
-  if (options.rel) {
-    conditions.push("rel = ?");
-    params.push(options.rel);
-  }
-  if (options.project) {
-    conditions.push("project = ?");
-    params.push(options.project);
-  }
-  params.push(limit);
-  return d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
-     FROM graph_edges
-     WHERE ${conditions.join(" AND ")}
-     ORDER BY weight DESC, last_seen DESC
-     LIMIT ?`).all(...params);
-}
-function getFileImpact(file, db) {
-  const d = db ?? getDatabase();
-  const pattern = `%${file.replace(/[%_]/g, "\\$&")}%`;
-  const rows = d.query(`SELECT project, src_type, src_key, dst_type, dst_key, rel, weight, last_seen
-     FROM graph_edges
-     WHERE src_key LIKE ? OR dst_key LIKE ?
-     ORDER BY weight DESC
-     LIMIT 200`).all(pattern, pattern);
-  const report = {
-    file,
-    co_edited: [],
-    errors: [],
-    decisions: [],
-    sessions: [],
-    imports: [],
-    imported_by: []
-  };
-  const isTarget = (k) => k.includes(file);
-  for (const e of rows) {
-    switch (e.rel) {
-      case "co_edited": {
-        const other = isTarget(e.src_key) ? e.dst_key : e.src_key;
-        if (report.co_edited.length < 10)
-          report.co_edited.push({ file: other, weight: round(e.weight) });
-        break;
-      }
-      case "error_in":
-        if (isTarget(e.dst_key) && report.errors.length < 10) {
-          report.errors.push({ error: e.src_key, weight: round(e.weight) });
-        }
-        break;
-      case "decided_about":
-        if (isTarget(e.dst_key) && report.decisions.length < 10) {
-          report.decisions.push({ decision: e.src_key, weight: round(e.weight) });
-        }
-        break;
-      case "session_touched":
-        if (isTarget(e.dst_key) && report.sessions.length < 10) {
-          report.sessions.push({ session_id: e.src_key, weight: round(e.weight) });
-        }
-        break;
-      case "imports":
-        if (isTarget(e.src_key) && report.imports.length < 15)
-          report.imports.push(e.dst_key);
-        else if (isTarget(e.dst_key) && report.imported_by.length < 15)
-          report.imported_by.push(e.src_key);
-        break;
-    }
-  }
-  return report;
-}
-function countEdges(db) {
-  const d = db ?? getDatabase();
-  return d.query("SELECT COUNT(*) c FROM graph_edges").get()?.c ?? 0;
-}
-function round(n) {
-  return Math.round(n * 100) / 100;
-}
-var init_graph_queries = __esm(() => {
-  init_schema();
 });
 
 // src/cli/stats.ts

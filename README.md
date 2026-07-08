@@ -113,7 +113,7 @@ Layer 3: Path filtering        → .env, *.pem, *.key excluded from tracking
 - **13 MCP tools** — progressive 3-layer search (50→200→500 tokens/result) + graph + resource matching
 - **Proactive retrieval** — detects topic shifts, injects relevant context mid-session
 - **Maintenance daemon** — daily launchd agent: retention, WAL checkpoint, Obsidian sync
-- **Browser dashboard** — `bunx claude-memory-hub viewer` at localhost:37888
+- **Browser dashboard** — `bunx claude-memory-hub viewer` at localhost:37888, with an Obsidian-style force-directed **graph view** of your memory (co-edits, imports, errors, decisions; per-project filter; click a node for its impact panel; deep link `/#graph`)
 - **JSONL export/import** — full backup, incremental, per-table
 - **Multi-agent ready** — subagents share memory via MCP
 - **213 unit tests** — privacy, search, capture, schema, graph, export, health

@@ -1,6 +1,6 @@
 {
   "name": "claude-memory-hub",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + Obsidian export.",
   "type": "module",
   "main": "dist/index.js",

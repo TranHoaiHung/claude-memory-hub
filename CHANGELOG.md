@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.15.2] - 2026-07-08
+
+**Obsidian-style graph view in the browser dashboard.**
+
+The viewer (localhost:37888) gains a **Graph** tab: a zero-dependency force-directed canvas rendered live from `graph_edges`.
+
+- Force simulation hand-rolled (~200 lines ES5, no CDN — consistent with the zero-external-services principle): repulsion + edge springs + gravity, velocity-clamped, auto-fit once the layout settles, double-click to re-fit.
+- Nodes colored by type (file/session/decision/error), radius by degree, labels for hubs and on hover/zoom.
+- Filters: project dropdown, relation chips (co-edited, imports, errors, decisions, sessions), text highlight.
+- Click a file node → impact side panel (co-edit cluster with click-to-navigate, past errors, decisions, imports, sessions) via new `/api/impact`.
+- New endpoints: `/api/graph` (compact index-based payload, top-weight edges, cap 1200), `/api/graph/projects`, `/api/impact`.
+- Deep link `/#graph` opens the tab directly; entities cards now show `touch_count`.
+- `viewer.ts` split into server (`viewer.ts`), page (`viewer-page.ts`), payload builder (`graph-api.ts`).
+
+---
+
 ## [0.15.1] - 2026-07-08
 
 **Error capture actually works now — plus summarizer quality and effectiveness metrics.**
