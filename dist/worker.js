@@ -1091,7 +1091,7 @@ function isIgnoredPath(filePath, config = DEFAULT_PRIVACY_CONFIG) {
   return false;
 }
 function matchGlob(path, pattern) {
-  const pathBasename = path.split("/").pop() || "";
+  const pathBasename = path.split(/[\\/]/).pop() || "";
   if (!pattern.includes("/") && !pattern.includes("**")) {
     return matchSimple(pathBasename, pattern);
   }
@@ -3463,7 +3463,7 @@ function slug(text, maxWords = 7) {
   return safeName(words.join(" ").toLowerCase()).slice(0, 60).trim() || "note";
 }
 function fileNoteName(filePath) {
-  const base = safeName(filePath.split("/").pop() ?? "file");
+  const base = safeName(filePath.split(/[\\/]/).pop() ?? "file");
   return `${base}-${hash8(filePath)}.md`;
 }
 function isoDate(ms) {
@@ -3554,7 +3554,7 @@ function renderFileNote(f, d) {
     `tags: [memory-hub, file]`,
     "---",
     "",
-    `# ${f.entity_value.split("/").pop()}`,
+    `# ${f.entity_value.split(/[\\/]/).pop()}`,
     "",
     `\`${f.entity_value}\``,
     "",
@@ -4202,10 +4202,10 @@ function cleanupProactiveState(sessionId) {
 function detectTopic(recentFiles) {
   if (recentFiles.length < 3)
     return null;
-  const dirs = recentFiles.map((f) => f.split("/").slice(0, -1).join("/")).filter(Boolean);
+  const dirs = recentFiles.map((f) => f.split(/[\\/]/).slice(0, -1).join("/")).filter(Boolean);
   const dirCounts = new Map;
   for (const d of dirs) {
-    const parts = d.split("/").filter(Boolean);
+    const parts = d.split(/[\\/]/).filter(Boolean);
     const leaf = parts[parts.length - 1];
     if (leaf && leaf !== "src" && leaf !== "lib" && leaf !== "utils") {
       dirCounts.set(leaf, (dirCounts.get(leaf) ?? 0) + 1);
@@ -4219,7 +4219,7 @@ function detectTopic(recentFiles) {
       bestCount = count;
     }
   }
-  const fileNames = recentFiles.map((f) => f.split("/").pop() ?? "").filter(Boolean);
+  const fileNames = recentFiles.map((f) => f.split(/[\\/]/).pop() ?? "").filter(Boolean);
   const keywords = ["auth", "payment", "user", "api", "database", "config", "test", "migration", "deploy", "search"];
   for (const kw of keywords) {
     const matches = fileNames.filter((f) => f.toLowerCase().includes(kw));
@@ -4423,7 +4423,8 @@ function isClaudeCliAvailable() {
   if (_cliAvailable !== undefined)
     return _cliAvailable;
   try {
-    const proc = Bun.spawnSync(["which", "claude"]);
+    const finder = process.platform === "win32" ? "where" : "which";
+    const proc = Bun.spawnSync([finder, "claude"]);
     _cliAvailable = proc.exitCode === 0;
   } catch {
     _cliAvailable = false;
@@ -4511,15 +4512,18 @@ async function tryCliSummary(ctx, timeoutMs) {
 }
 async function attemptCliCall(prompt, timeout, attempt) {
   try {
-    const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
+    const argv = process.platform === "win32" ? ["cmd", "/c", "claude", "-p"] : ["claude", "-p"];
+    const proc = Bun.spawn(argv, {
       stdout: "pipe",
       stderr: "pipe",
-      stdin: "ignore",
+      stdin: "pipe",
       env: {
         ...process.env,
         CLAUDE_MEMORY_HUB_SKIP_HOOKS: "1"
       }
     });
+    proc.stdin.write(prompt);
+    await proc.stdin.end();
     const timeoutPromise = new Promise((resolve) => {
       setTimeout(() => {
         try {

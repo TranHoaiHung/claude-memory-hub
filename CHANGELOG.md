@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.1] - 2026-07-08
+
+**Windows parity + a clearer install guide.**
+
+Audited every platform-specific code path so Windows gets the same behavior as macOS; correctness is now enforced by CI running the full test suite on `windows-latest`, `macos-latest`, and `ubuntu-latest` (not by hand-waving).
+
+### Fixed (real Windows bugs)
+
+- **Privacy path filter**: basename extraction split on `/` only — `C:\proj\.env` was NOT filtered on Windows. Now splits on both separators.
+- **Tier-2 CLI summarizer**: availability probe used `which` (absent on Windows) and spawned `claude` directly (a `.cmd` shim there). Now uses `where`/`which` per platform, wraps with `cmd /c`, and passes the prompt via **stdin** — which also removes the ARG_MAX limit for long transcripts on every OS.
+- **Codegraph bridge + `memory_impact`**: absolute-path checks used `startsWith("/")` — always false for `C:\…`, silently disabling the feature. Now `path.isAbsolute()`.
+- **File-note names, graph labels, proactive topic detection**: `split("/")` → split on both separators so Windows paths render/group correctly.
+
+### Added
+
+- `install-daemon` on **Windows**: registers a daily 03:30 Task Scheduler job (same cadence as launchd). On Linux it prints the exact crontab line.
+- CI: test + typecheck matrix on 3 OSes; MCP-server smoke test on Windows (PowerShell).
+
+### Docs
+
+- Quick Start rewritten as 3 explicit steps (install Bun → install hub → verify with `doctor`) with per-OS commands, what-install-actually-does list, optional Obsidian/daemon/viewer setup, and a platform-support table.
+
+---
+
 ## [0.17.0] - 2026-07-08
 
 **Obsidian read-back — the vault now feeds Claude Code, not just the other way around.**

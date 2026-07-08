@@ -1584,7 +1584,7 @@ function buildGraphPayload(url) {
 }
 function nodeLabel(type, key) {
   if (type === "file")
-    return key.split("/").pop() ?? key;
+    return key.split(/[\\/]/).pop() ?? key;
   if (type === "session")
     return key.slice(0, 8);
   return key.length > 42 ? key.slice(0, 39) + "\u2026" : key;
@@ -2240,7 +2240,7 @@ __export(exports_codegraph_bridge, {
   findCodegraphDb: () => findCodegraphDb
 });
 import { existsSync as existsSync5 } from "fs";
-import { dirname, join as join5 } from "path";
+import { dirname, isAbsolute, join as join5 } from "path";
 import { Database as Database3 } from "bun:sqlite";
 function findCodegraphDb(startDir) {
   let dir = startDir;
@@ -2256,7 +2256,7 @@ function findCodegraphDb(startDir) {
   return null;
 }
 function getCodegraphCalls(filePath) {
-  if (!filePath.startsWith("/"))
+  if (!isAbsolute(filePath))
     return null;
   const dbPath = findCodegraphDb(dirname(filePath));
   if (!dbPath)
@@ -2267,7 +2267,7 @@ function getCodegraphCalls(filePath) {
       const schema = resolveSchema(dbPath, db);
       if (!schema)
         return null;
-      const like = `%${filePath.split("/").slice(-3).join("/")}`;
+      const like = `%${filePath.split(/[\\/]/).slice(-3).join("/")}`;
       const kindFilter = schema.edgeKind ? `AND e.${schema.edgeKind} IN ('calls','call','CALLS')` : "";
       const calls = db.prepare(`SELECT DISTINCT d.${schema.symName} as name, d.${schema.symFile} as file
          FROM ${schema.edgeTable} e
@@ -2344,6 +2344,7 @@ __export(exports_graph_queries, {
   getFileImpact: () => getFileImpact,
   countEdges: () => countEdges
 });
+import { isAbsolute as isAbsolute2 } from "path";
 function getNeighbors(node, options = {}) {
   const d = options.db ?? getDatabase();
   const limit = Math.min(options.limit ?? 20, 100);
@@ -2417,7 +2418,7 @@ function getFileImpact(file, db) {
     }
   }
   try {
-    const anchor = file.startsWith("/") ? file : rows.map((e) => [e.src_key, e.dst_key]).flat().find((k) => k.startsWith("/") && k.includes(file));
+    const anchor = isAbsolute2(file) ? file : rows.map((e) => [e.src_key, e.dst_key]).flat().find((k) => isAbsolute2(k) && k.includes(file));
     if (anchor) {
       const { getCodegraphCalls: getCodegraphCalls2 } = (init_codegraph_bridge(), __toCommonJS(exports_codegraph_bridge));
       const cg = getCodegraphCalls2(anchor);
@@ -4307,7 +4308,7 @@ function isIgnoredPath(filePath, config = DEFAULT_PRIVACY_CONFIG) {
   return false;
 }
 function matchGlob(path, pattern) {
-  const pathBasename = path.split("/").pop() || "";
+  const pathBasename = path.split(/[\\/]/).pop() || "";
   if (!pattern.includes("/") && !pattern.includes("**")) {
     return matchSimple(pathBasename, pattern);
   }
@@ -6041,7 +6042,7 @@ function slug(text, maxWords = 7) {
   return safeName(words.join(" ").toLowerCase()).slice(0, 60).trim() || "note";
 }
 function fileNoteName(filePath) {
-  const base = safeName(filePath.split("/").pop() ?? "file");
+  const base = safeName(filePath.split(/[\\/]/).pop() ?? "file");
   return `${base}-${hash8(filePath)}.md`;
 }
 function isoDate(ms) {
@@ -6132,7 +6133,7 @@ function renderFileNote(f, d) {
     `tags: [memory-hub, file]`,
     "---",
     "",
-    `# ${f.entity_value.split("/").pop()}`,
+    `# ${f.entity_value.split(/[\\/]/).pop()}`,
     "",
     `\`${f.entity_value}\``,
     "",
@@ -6802,10 +6803,10 @@ function cleanupProactiveState(sessionId) {
 function detectTopic(recentFiles) {
   if (recentFiles.length < 3)
     return null;
-  const dirs = recentFiles.map((f) => f.split("/").slice(0, -1).join("/")).filter(Boolean);
+  const dirs = recentFiles.map((f) => f.split(/[\\/]/).slice(0, -1).join("/")).filter(Boolean);
   const dirCounts = new Map;
   for (const d of dirs) {
-    const parts = d.split("/").filter(Boolean);
+    const parts = d.split(/[\\/]/).filter(Boolean);
     const leaf = parts[parts.length - 1];
     if (leaf && leaf !== "src" && leaf !== "lib" && leaf !== "utils") {
       dirCounts.set(leaf, (dirCounts.get(leaf) ?? 0) + 1);
@@ -6819,7 +6820,7 @@ function detectTopic(recentFiles) {
       bestCount = count;
     }
   }
-  const fileNames = recentFiles.map((f) => f.split("/").pop() ?? "").filter(Boolean);
+  const fileNames = recentFiles.map((f) => f.split(/[\\/]/).pop() ?? "").filter(Boolean);
   const keywords = ["auth", "payment", "user", "api", "database", "config", "test", "migration", "deploy", "search"];
   for (const kw of keywords) {
     const matches = fileNames.filter((f) => f.toLowerCase().includes(kw));
@@ -7023,7 +7024,8 @@ function isClaudeCliAvailable() {
   if (_cliAvailable !== undefined)
     return _cliAvailable;
   try {
-    const proc = Bun.spawnSync(["which", "claude"]);
+    const finder = process.platform === "win32" ? "where" : "which";
+    const proc = Bun.spawnSync([finder, "claude"]);
     _cliAvailable = proc.exitCode === 0;
   } catch {
     _cliAvailable = false;
@@ -7111,15 +7113,18 @@ async function tryCliSummary(ctx, timeoutMs) {
 }
 async function attemptCliCall(prompt, timeout, attempt) {
   try {
-    const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
+    const argv = process.platform === "win32" ? ["cmd", "/c", "claude", "-p"] : ["claude", "-p"];
+    const proc = Bun.spawn(argv, {
       stdout: "pipe",
       stderr: "pipe",
-      stdin: "ignore",
+      stdin: "pipe",
       env: {
         ...process.env,
         CLAUDE_MEMORY_HUB_SKIP_HOOKS: "1"
       }
     });
+    proc.stdin.write(prompt);
+    await proc.stdin.end();
     const timeoutPromise = new Promise((resolve) => {
       setTimeout(() => {
         try {
@@ -7893,8 +7898,15 @@ function runMaintenance() {
   }
 }
 function installDaemon(bunBin) {
+  if (process.platform === "win32") {
+    installWindowsTask(bunBin);
+    return;
+  }
   if (process.platform !== "darwin") {
-    console.log("install-daemon currently supports macOS (launchd) only.");
+    const cliPath = join21(STABLE_DIR3, "dist", "cli.js");
+    console.log("install-daemon supports macOS (launchd) and Windows (Task Scheduler).");
+    console.log("On Linux, add this line via `crontab -e`:");
+    console.log(`  30 3 * * * ${bunBin} run ${cliPath} maintenance >> ${join21(STABLE_DIR3, "logs", "maintenance.log")} 2>&1`);
     return;
   }
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -7931,6 +7943,19 @@ function installDaemon(bunBin) {
     console.log("Remove with: launchctl unload " + PLIST_PATH);
   } else {
     console.log(`launchctl load failed: ${load.stderr || load.stdout}`);
+  }
+}
+function installWindowsTask(bunBin) {
+  const cliPath = join21(STABLE_DIR3, "dist", "cli.js");
+  const taskRun = `"${bunBin.replace(/"/g, "")}" run "${cliPath}" maintenance`;
+  const r = spawnSync3("schtasks", ["/Create", "/F", "/SC", "DAILY", "/ST", "03:30", "/TN", LABEL, "/TR", taskRun], { encoding: "utf-8" });
+  if (r.status === 0) {
+    console.log(`Scheduled task installed: ${LABEL}`);
+    console.log(`Runs daily at 03:30 \u2014 retention, WAL checkpoint, Obsidian sync (vault: ${getVaultRoot()}).`);
+    console.log(`Remove with: schtasks /Delete /TN ${LABEL} /F`);
+  } else {
+    console.log(`schtasks failed: ${r.stderr || r.stdout}`);
+    console.log(`Create manually: schtasks /Create /SC DAILY /ST 03:30 /TN ${LABEL} /TR '${taskRun}'`);
   }
 }
 var LABEL = "com.kihutech.claude-memory-hub", PLIST_PATH, STABLE_DIR3;

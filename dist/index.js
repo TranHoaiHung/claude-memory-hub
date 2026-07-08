@@ -8826,7 +8826,7 @@ function isIgnoredPath(filePath, config2 = DEFAULT_PRIVACY_CONFIG) {
   return false;
 }
 function matchGlob(path, pattern) {
-  const pathBasename = path.split("/").pop() || "";
+  const pathBasename = path.split(/[\\/]/).pop() || "";
   if (!pattern.includes("/") && !pattern.includes("**")) {
     return matchSimple(pathBasename, pattern);
   }
@@ -9997,7 +9997,7 @@ __export(exports_codegraph_bridge, {
   findCodegraphDb: () => findCodegraphDb
 });
 import { existsSync as existsSync8 } from "fs";
-import { dirname as dirname2, join as join8 } from "path";
+import { dirname as dirname2, isAbsolute, join as join8 } from "path";
 import { Database as Database2 } from "bun:sqlite";
 function findCodegraphDb(startDir) {
   let dir = startDir;
@@ -10013,7 +10013,7 @@ function findCodegraphDb(startDir) {
   return null;
 }
 function getCodegraphCalls(filePath) {
-  if (!filePath.startsWith("/"))
+  if (!isAbsolute(filePath))
     return null;
   const dbPath = findCodegraphDb(dirname2(filePath));
   if (!dbPath)
@@ -10024,7 +10024,7 @@ function getCodegraphCalls(filePath) {
       const schema = resolveSchema(dbPath, db);
       if (!schema)
         return null;
-      const like = `%${filePath.split("/").slice(-3).join("/")}`;
+      const like = `%${filePath.split(/[\\/]/).slice(-3).join("/")}`;
       const kindFilter = schema.edgeKind ? `AND e.${schema.edgeKind} IN ('calls','call','CALLS')` : "";
       const calls = db.prepare(`SELECT DISTINCT d.${schema.symName} as name, d.${schema.symFile} as file
          FROM ${schema.edgeTable} e
@@ -10101,6 +10101,7 @@ __export(exports_graph_queries, {
   getFileImpact: () => getFileImpact,
   countEdges: () => countEdges
 });
+import { isAbsolute as isAbsolute2 } from "path";
 function getNeighbors(node, options = {}) {
   const d = options.db ?? getDatabase();
   const limit = Math.min(options.limit ?? 20, 100);
@@ -10174,7 +10175,7 @@ function getFileImpact(file, db) {
     }
   }
   try {
-    const anchor = file.startsWith("/") ? file : rows.map((e) => [e.src_key, e.dst_key]).flat().find((k) => k.startsWith("/") && k.includes(file));
+    const anchor = isAbsolute2(file) ? file : rows.map((e) => [e.src_key, e.dst_key]).flat().find((k) => isAbsolute2(k) && k.includes(file));
     if (anchor) {
       const { getCodegraphCalls: getCodegraphCalls2 } = (init_codegraph_bridge(), __toCommonJS(exports_codegraph_bridge));
       const cg = getCodegraphCalls2(anchor);

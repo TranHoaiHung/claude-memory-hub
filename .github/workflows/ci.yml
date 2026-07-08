@@ -38,9 +38,12 @@ jobs:
           "
 
   test:
-    name: Tests
-    runs-on: ubuntu-latest
-    # Tests only run if test directory exists (not in public dist-only repo)
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -48,9 +51,17 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        shell: bash
+        run: |
+          if [ -d "tests" ]; then
+            bun install --frozen-lockfile
+          else
+            echo "No source in this repo (dist-only). Skipping."
+          fi
 
+      # Tests only run if test directory exists (not in public dist-only repo)
       - name: Run tests
+        shell: bash
         run: |
           if [ -d "tests" ]; then
             bun test
@@ -58,13 +69,23 @@ jobs:
             echo "No tests directory. Skipping."
           fi
 
+      - name: Typecheck
+        shell: bash
+        run: |
+          if [ -d "src" ]; then
+            bun run typecheck
+          else
+            echo "No src directory. Skipping."
+          fi
+
   install-test:
     name: Install Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: verify
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -78,8 +99,19 @@ jobs:
         run: bun run dist/cli.js status
 
       - name: Test MCP server starts
+        if: runner.os != 'Windows'
         run: |
           timeout 3 bun run dist/index.js &
           sleep 1
           echo "MCP server started successfully"
           kill %1 2>/dev/null || true
+
+      - name: Test MCP server starts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process bun -ArgumentList 'run','dist/index.js' -PassThru
+          Start-Sleep -Seconds 1
+          if ($p.HasExited) { Write-Error "MCP server exited early"; exit 1 }
+          Write-Host "MCP server started successfully"
+          Stop-Process -Id $p.Id -Force

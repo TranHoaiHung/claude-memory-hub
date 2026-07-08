@@ -158,23 +158,67 @@ Layer 3: Path filtering        → .env, *.pem, *.key excluded from tracking
 
 ## Quick Start
 
+### Step 1 — Install Bun (the only requirement)
+
 ```bash
-# Install (registers MCP server + 7 hooks + 3 slash commands)
-bunx claude-memory-hub install
-
-# Verify
-bunx claude-memory-hub status
-
-# That's it. Start a Claude Code session — memory is active.
+# macOS / Linux
+curl -fsSL https://bun.sh/install | bash
 ```
 
-Works on CLI, VS Code, JetBrains. Coming from claude-mem? Data migrates automatically.
+```powershell
+# Windows (PowerShell)
+powershell -c "irm bun.sh/install.ps1 | iex"
+```
 
-### Requirements
+No API key. No Python. No Docker. Claude Code itself is the only other thing you need.
 
-- [Bun](https://bun.sh) runtime
-- Claude Code
-- **No API key needed**
+### Step 2 — Install the hub
+
+Same command on every platform:
+
+```bash
+bunx claude-memory-hub install
+```
+
+What this does (nothing else):
+1. Copies the runtime to `~/.claude-memory-hub/` (`C:\Users\<you>\.claude-memory-hub` on Windows)
+2. Registers the MCP server + 7 lifecycle hooks in `~/.claude/settings.json` (absolute paths, forward slashes — works in cmd, PowerShell, and bash)
+3. Installs 3 slash commands (`/mem-search`, `/mem-status`, `/mem-save`) into `~/.claude/commands/`
+
+### Step 3 — Verify, then restart Claude Code
+
+```bash
+bunx claude-memory-hub doctor   # full health check (hooks, DB, worker, dist files)
+bunx claude-memory-hub status   # quick view
+```
+
+Restart Claude Code (or start a new session) — memory is active. Works on CLI, VS Code, JetBrains. Coming from claude-mem? Data migrates automatically.
+
+### Optional (recommended)
+
+```bash
+# Two-way Obsidian vault — add to the "env" block of ~/.claude/settings.json:
+#   "CLAUDE_MEMORY_HUB_OBSIDIAN": "1"
+#   "CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT": "/path/to/your/vault"   (default: ~/Documents/ObsidianVault)
+bunx claude-memory-hub obsidian sync    # first export + read-back
+
+# Daily 03:30 maintenance (retention + WAL checkpoint + vault sync)
+bunx claude-memory-hub install-daemon   # macOS: launchd · Windows: Task Scheduler · Linux: prints the cron line
+
+# Browser dashboard with the memory graph
+bunx claude-memory-hub viewer           # http://localhost:37888
+```
+
+### Platform support
+
+| | macOS | Windows | Linux |
+|---|---|---|---|
+| Hooks + worker + MCP + search | ✅ | ✅ | ✅ |
+| Obsidian two-way vault | ✅ | ✅ | ✅ |
+| Maintenance daemon | ✅ launchd | ✅ Task Scheduler | manual cron (line printed) |
+| Test suite in CI | ✅ | ✅ | ✅ |
+
+Something off? `bunx claude-memory-hub doctor --fix` repairs the common cases, and the [Troubleshooting](#troubleshooting) section covers the rest.
 
 ---
 
@@ -446,7 +490,7 @@ bunx claude-memory-hub stats       # Memory report (--injections: telemetry + ef
 bunx claude-memory-hub graph       # Knowledge graph: graph build | graph scan [repo]
 bunx claude-memory-hub obsidian sync  # Export memory to Obsidian vault [--project X]
 bunx claude-memory-hub maintenance # Retention + WAL checkpoint + Obsidian sync now
-bunx claude-memory-hub install-daemon # Daily 03:30 launchd maintenance agent (macOS)
+bunx claude-memory-hub install-daemon # Daily 03:30 maintenance (macOS launchd / Windows Task Scheduler / Linux prints cron line)
 bunx claude-memory-hub worker      # Persistent worker: worker start | stop | status
 ```
 
@@ -596,7 +640,7 @@ Honesty over marketing — what this tool does NOT do well (yet):
 - **Summaries are lossy by design** — L3 stores compressed session summaries, not transcripts. Full conversations remain searchable via `memory_conversation`, but they are not re-injected wholesale.
 - **Recall depends on Claude calling the tools** — the awareness hint nudges it, and `memory_tool_used` telemetry measures how often that actually happens, but injection cannot force usage.
 - **First hook after a cold boot pays ~1s** — the worker spawns on demand; every prompt after that is ~50ms. No keep-alive daemon is required (or installed) by default.
-- **Maintenance daemon is macOS-only** (launchd). Hooks, worker, MCP server, and viewer are cross-platform; scheduled retention on Linux/Windows needs a manual cron entry.
+- **Maintenance daemon needs a scheduler per OS** — installed automatically on macOS (launchd) and Windows (Task Scheduler); on Linux `install-daemon` prints the crontab line for you to add manually. Everything else (hooks, worker, MCP, search, vault) is cross-platform and runs in CI on all three OSes.
 - **Single machine, no cloud sync** — by design (privacy-first). Multi-machine workflows use `export`/`import` JSONL manually.
 - **Localhost services are unauthenticated** — viewer (37888) and worker (37889) bind to 127.0.0.1 and assume a single-user machine.
 
