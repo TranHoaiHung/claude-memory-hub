@@ -14,7 +14,7 @@
 </p>
 
 ```bash
-bunx claude-memory-hub install
+bunx claude-memory-hub@latest install
 ```
 
 One command. Zero API key. Zero Python. Zero config. Done.
@@ -177,7 +177,7 @@ No API key. No Python. No Docker. Claude Code itself is the only other thing you
 Same command on every platform:
 
 ```bash
-bunx claude-memory-hub install
+bunx claude-memory-hub@latest install
 ```
 
 What this does (nothing else):
@@ -474,7 +474,7 @@ PostToolUse events batched via write-through queue (~3ms per event).
 ## CLI Reference
 
 ```bash
-bunx claude-memory-hub install     # Register MCP + hooks + slash commands
+bunx claude-memory-hub@latest install   # Register MCP + hooks + slash commands
 bunx claude-memory-hub uninstall   # Clean removal
 bunx claude-memory-hub status      # Check installation
 bunx claude-memory-hub migrate     # Import data from claude-mem
@@ -616,7 +616,7 @@ For ad-hoc lookup from inside a Claude session:
 ## Migrating from claude-mem
 
 ```bash
-bunx claude-memory-hub install   # auto-detects and migrates
+bunx claude-memory-hub@latest install   # auto-detects and migrates
 ```
 
 | claude-mem | → | memory-hub |
@@ -647,6 +647,15 @@ Honesty over marketing — what this tool does NOT do well (yet):
 ---
 
 ## Troubleshooting
+
+### Old version keeps running (`bunx` cache)
+
+`bunx claude-memory-hub …` without a tag can serve a **months-old cached version** — it may
+never re-check the registry. Symptoms: the banner shows an old `(vX.Y.Z)`, `status` reports
+a wrong hook count, or `install` registers fewer than 7 hooks.
+
+**Fix:** always pin the tag — `bunx claude-memory-hub@latest install`. Since v0.17.4 every
+command prints its version and warns when the registry has a newer one.
 
 ### MCP server not connecting (most common issue)
 

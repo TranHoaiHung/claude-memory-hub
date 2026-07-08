@@ -8479,6 +8479,101 @@ function buildSummaryText(s) {
   return sections.join(`
 `) || "Migrated from claude-mem (no summary content)";
 }
+// package.json
+var package_default = {
+  name: "claude-memory-hub",
+  version: "0.17.4",
+  description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
+  type: "module",
+  main: "dist/index.js",
+  bin: {
+    "claude-memory-hub": "dist/cli.js"
+  },
+  files: [
+    "dist/",
+    "commands/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  scripts: {
+    start: "bun run src/index.ts",
+    build: "bun build src/index.ts --outdir dist --target bun --entry-naming [name].js --external @huggingface/transformers",
+    "build:cli": "bun build src/cli/main.ts --outdir dist --target bun --entry-naming cli.js --external @huggingface/transformers",
+    "build:hooks": "bun build src/hooks-entry/post-tool-use.ts src/hooks-entry/session-end.ts src/hooks-entry/session-start.ts src/hooks-entry/stop.ts src/hooks-entry/user-prompt-submit.ts src/hooks-entry/pre-compact.ts src/hooks-entry/post-compact.ts --outdir dist/hooks --target bun --entry-naming [name].js --external @huggingface/transformers",
+    "build:worker": "bun build src/worker/worker-main.ts --outdir dist --target bun --entry-naming worker.js --external @huggingface/transformers",
+    "build:all": "bun run build && bun run build:cli && bun run build:hooks && bun run build:worker",
+    dev: "bun run --watch src/index.ts",
+    prepublishOnly: "test -f dist/index.js || bun run build:all",
+    typecheck: "tsc --noEmit",
+    test: "bun test",
+    "test:coverage": "bun test --coverage"
+  },
+  keywords: [
+    "claude",
+    "claude-code",
+    "memory",
+    "mcp",
+    "context",
+    "persistent-memory",
+    "sqlite",
+    "fts5",
+    "semantic-search",
+    "embeddings"
+  ],
+  author: "TranHoaiHung",
+  license: "MIT",
+  homepage: "https://github.com/TranHoaiHung/claude-memory-hub#readme",
+  bugs: {
+    url: "https://github.com/TranHoaiHung/claude-memory-hub/issues"
+  },
+  repository: {
+    type: "git",
+    url: "git+https://github.com/TranHoaiHung/claude-memory-hub.git"
+  },
+  engines: {
+    bun: ">=1.0.0"
+  },
+  dependencies: {
+    "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  optionalDependencies: {
+    "@huggingface/transformers": "^3.0.0"
+  },
+  devDependencies: {
+    "@types/bun": "latest",
+    typescript: "^5.4.0"
+  }
+};
+
+// src/cli/version-check.ts
+var VERSION = package_default.version;
+async function warnIfOutdated() {
+  try {
+    const res = await fetch("https://registry.npmjs.org/claude-memory-hub/latest", {
+      signal: AbortSignal.timeout(2500)
+    });
+    if (!res.ok)
+      return;
+    const latest = (await res.json()).version;
+    if (latest && semverLess(VERSION, latest)) {
+      console.log(`
+  \u26A0 You are running v${VERSION} but v${latest} is available.`);
+      console.log("    bunx serves cached versions \u2014 upgrade with:");
+      console.log("    bunx claude-memory-hub@latest install");
+    }
+  } catch {}
+}
+function semverLess(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0;i < 3; i++) {
+    const x = pa[i] ?? 0, y = pb[i] ?? 0;
+    if (x !== y)
+      return x < y;
+  }
+  return false;
+}
 
 // src/cli/main.ts
 import { spawnSync as spawnSync4 } from "child_process";
@@ -8641,9 +8736,10 @@ function uninstallCommands() {
     } catch {}
   }
 }
-function install() {
-  console.log(`claude-memory-hub \u2014 install
+async function install() {
+  console.log(`claude-memory-hub \u2014 install (v${VERSION})
 `);
+  await warnIfOutdated();
   console.log("0. Copying dist/ to ~/.claude-memory-hub/dist/...");
   try {
     copyDistToStableDir();
@@ -8756,7 +8852,7 @@ function uninstall() {
   console.log("Data at ~/.claude-memory-hub/ preserved. Delete manually if desired.");
 }
 async function status() {
-  console.log(`claude-memory-hub \u2014 status
+  console.log(`claude-memory-hub \u2014 status (v${VERSION})
 `);
   const settings = loadSettings();
   const expected = HOOK_REGISTRATIONS.length;
@@ -8829,7 +8925,7 @@ function printMigrationStats(stats) {
 var command = process.argv[2];
 switch (command) {
   case "install":
-    install();
+    await install();
     break;
   case "uninstall":
     uninstall();

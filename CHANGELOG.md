@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.4] - 2026-07-08
+
+**The bunx-cache trap, made visible.**
+
+Field report: `bunx claude-memory-hub install` on a machine with an old cache silently ran **v0.14.0** — which overwrote the deployed runtime with old code and rewrote the 7-hook layout back to the broken 5-hook one. The CLI gave no hint which version was executing.
+
+- Every `install`/`status` now prints its version in the banner: `claude-memory-hub — install (v0.17.4)`.
+- `install` does a best-effort registry check (2.5s timeout, silent offline) and warns loudly when a newer version exists, with the exact upgrade command.
+- Docs now use `bunx claude-memory-hub@latest install` everywhere + a Troubleshooting entry for the stale-cache symptom.
+
+If you ever see an old version in the banner: `bunx claude-memory-hub@latest install`.
+
+---
+
 ## [0.17.3] - 2026-07-08
 
 **Critical installer fix: `install` was still writing the pre-v0.15 5-hook layout.**
