@@ -21,6 +21,26 @@ One command. Zero API key. Zero Python. Zero config. Done.
 
 ---
 
+## ✨ Highlights
+
+Every number below is **measured on real usage**, not estimated — the built-in telemetry (`stats --injections`) is part of the product.
+
+| | What | Why it matters |
+|---|---|---|
+| 🛡️ | **Compact Interceptor** | The feature no other memory tool has: PreCompact tells the compactor what to preserve, PostCompact saves the full summary. ~90% context loss → ~90% salvage. |
+| ⚡ | **Token-efficient injection** | Session baseline injected ONCE (SessionStart), later prompts deduplicated — measured **96% reduction** in injection overhead vs per-prompt injection. |
+| 🚀 | **Persistent worker** | Hooks hit a warm local server: **981ms → ~50ms** per prompt. Auto-spawned, self-healing, version-skew guarded, falls back in-process when down — never a single point of failure. |
+| 🕸️ | **Behavioral knowledge graph** | What static analysis can't know: which files are *actually* edited together, where errors *actually* happened, which decisions concern which files. Obsidian-style graph view in the dashboard (`/#graph`). |
+| 📓 | **Obsidian export** | Sessions, decisions, and hot files as markdown notes with `[[wikilinks]]` generated from the graph — your coding memory becomes a personal knowledge vault. |
+| 🎯 | **Resource intelligence** | Matches each prompt to the right skill/agent/CLAUDE.md by meaning (semantic + usage + project context) and audits token overhead of unused resources. |
+| 🔗 | **Codegraph integration** | Repos indexed by [codegraph](https://github.com/colbymchenry/codegraph) get structural calls/called-by joined into `memory_impact` — structure + behavior in one view. |
+| 🔒 | **3-layer privacy** | `<private>` tags + automatic secret redaction (sk-, ghp_, AWS keys…) + path filtering (.env, *.pem). All local: no cloud, no telemetry, no network calls. |
+| 🪶 | **Zero-friction stack** | Bun + SQLite only. No Python, no Chroma, no Docker, no API key. Embeddings are optional and local (~90MB MiniLM). 233 unit tests. |
+
+**Tech**: 7 lifecycle hooks · MCP server (13 tools) · SQLite FTS5 + TF-IDF + local embeddings with RRF fusion · recency-decay ranking · entity dedup with touch counts · injection effectiveness telemetry. Details in [CHANGELOG.md](CHANGELOG.md).
+
+---
+
 ## The Problem
 
 ```
@@ -552,25 +572,19 @@ Idempotent — safe to run multiple times.
 
 ---
 
-## Version History
+## ⚠️ Known Limitations
 
-| Version | Highlight |
-|---------|-----------|
-| **v0.11.4** | Search quality — pruned garbage summaries, guided Claude to use specific keywords instead of generic phrases |
-| **v0.11.3** | MCP registration fix — installer now writes to `~/.claude.json` (correct config), troubleshooting guide |
-| **v0.11.2** | **Critical fix** — context injection null crash, slash commands install fallback, null-safe budget |
-| **v0.11.1** | Quality hardening — clock skew guard, 155 unit tests (+44%) |
-| **v0.11.0** | 3-layer privacy, code-aware search, recency ranking, slash commands |
-| **v0.10.0** | Full conversation capture (user + assistant), `memory_conversation` tool |
-| **v0.9.x** | Smart budget allocation, stable install paths, agent/skill capture |
-| **v0.8.x** | 91 unit tests, L1 cache, batch queue (75ms→3ms), export/import |
-| **v0.7.0** | Semantic search scaling, 14 observation patterns, auto-cleanup |
-| **v0.6.0** | ResourceRegistry, semantic embeddings, CLAUDE.md tracking |
-| **v0.5.0** | Hybrid search, browser UI, health monitoring, claude-mem migration |
-| **v0.2.0** | Compact Interceptor (PreCompact/PostCompact) |
-| **v0.1.0** | Cross-session memory, entity tracking, FTS5 search |
+Honesty over marketing — what this tool does NOT do well (yet):
 
-See [CHANGELOG.md](CHANGELOG.md) for full details.
+- **Semantic search is brute-force** — cosine similarity computed in-process, fine below ~5k embeddings (typical after months of daily use), no ANN index yet. sqlite-vec is planned once real databases approach that scale.
+- **Keyword search is English-biased** — FTS5 porter stemming targets English. Vietnamese/CJK prompts fall back to semantic match + recent-summaries injection; summaries are written in English (with original-language terms preserved verbatim) to stay searchable.
+- **The import graph is regex-based** — relative imports only, no AST, no call graph. That is deliberate: pair it with [codegraph](https://github.com/colbymchenry/codegraph) (tree-sitter, 30+ languages) and `memory_impact` merges both automatically.
+- **Summaries are lossy by design** — L3 stores compressed session summaries, not transcripts. Full conversations remain searchable via `memory_conversation`, but they are not re-injected wholesale.
+- **Recall depends on Claude calling the tools** — the awareness hint nudges it, and `memory_tool_used` telemetry measures how often that actually happens, but injection cannot force usage.
+- **First hook after a cold boot pays ~1s** — the worker spawns on demand; every prompt after that is ~50ms. No keep-alive daemon is required (or installed) by default.
+- **Maintenance daemon is macOS-only** (launchd). Hooks, worker, MCP server, and viewer are cross-platform; scheduled retention on Linux/Windows needs a manual cron entry.
+- **Single machine, no cloud sync** — by design (privacy-first). Multi-machine workflows use `export`/`import` JSONL manually.
+- **Localhost services are unauthenticated** — viewer (37888) and worker (37889) bind to 127.0.0.1 and assume a single-user machine.
 
 ---
 
