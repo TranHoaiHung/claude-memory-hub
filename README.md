@@ -648,14 +648,23 @@ Honesty over marketing — what this tool does NOT do well (yet):
 
 ## Troubleshooting
 
-### Old version keeps running (`bunx` cache)
+### Old version keeps running (stale global install or `bunx` cache)
 
-`bunx claude-memory-hub …` without a tag can serve a **months-old cached version** — it may
-never re-check the registry. Symptoms: the banner shows an old `(vX.Y.Z)`, `status` reports
+Symptoms: the banner shows an old `(vX.Y.Z)` (or none at all, pre-0.17.4), `status` reports
 a wrong hook count, or `install` registers fewer than 7 hooks.
 
-**Fix:** always pin the tag — `bunx claude-memory-hub@latest install`. Since v0.17.4 every
-command prints its version and warns when the registry has a newer one.
+Two causes, in order of likelihood:
+
+1. **A stale global install shadows `bunx`** — if `claude-memory-hub` exists in PATH
+   (old `npm i -g` or `bun add -g`), `bunx` runs it and never asks the registry.
+   ```bash
+   which claude-memory-hub        # anything printed = a global install is shadowing
+   bun remove -g claude-memory-hub
+   npm uninstall -g claude-memory-hub
+   ```
+2. **bunx cache** — fix by pinning the tag: `bunx claude-memory-hub@latest install`.
+
+Since v0.17.4 every command prints its version and warns when the registry has a newer one.
 
 ### MCP server not connecting (most common issue)
 

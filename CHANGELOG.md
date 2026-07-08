@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.5] - 2026-07-08
+
+**Follow-ups from the stale-version incident.**
+
+The full root cause turned out to be **stale global installs shadowing `bunx`** (an old `bun add -g` v0.11.5 and an orphaned `npm i -g` v0.13.1 in nvm) — `bunx` runs whatever is in PATH and never asks the registry. Troubleshooting now covers `which claude-memory-hub` + `bun remove -g` / `npm uninstall -g` as the first check.
+
+- `install` completion summary listed only the 5 old hook names — now rendered from `HOOK_REGISTRATIONS` (single source of truth).
+- claude-mem auto-migration runs **once** (marker `~/.claude-memory-hub/migration-claude-mem.json`) instead of replaying on every install with alarming constraint-error output. `migrate` still forces a manual run.
+
+---
+
 ## [0.17.4] - 2026-07-08
 
 **The bunx-cache trap, made visible.**

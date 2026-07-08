@@ -8482,7 +8482,7 @@ function buildSummaryText(s) {
 // package.json
 var package_default = {
   name: "claude-memory-hub",
-  version: "0.17.4",
+  version: "0.17.5",
   description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
   type: "module",
   main: "dist/index.js",
@@ -8803,15 +8803,16 @@ async function install() {
   console.log("Installation complete!");
   console.log("");
   console.log("  MCP:      claude-memory-hub");
-  console.log("  Hooks:    PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop");
+  console.log(`  Hooks:    ${HOOK_REGISTRATIONS.map(([event]) => event).join(", ")}`);
   console.log("  Commands: /mem-search, /mem-status, /mem-save");
   console.log("  Data:     ~/.claude-memory-hub/memory.db");
   console.log("  Key:      not needed");
   console.log("");
   console.log("  Restart Claude Code to activate.");
   console.log("========================================");
+  const migrationMarker = join23(STABLE_DIR4, "migration-claude-mem.json");
   const cmDbPath = detectClaudeMemDb();
-  if (cmDbPath) {
+  if (cmDbPath && !existsSync23(migrationMarker)) {
     console.log(`
 [Migration] Detected claude-mem database:`);
     console.log(`  ${cmDbPath}`);
@@ -8820,10 +8821,14 @@ async function install() {
     try {
       const stats = migrateFromClaudeMem(cmDbPath);
       printMigrationStats(stats);
+      writeFileSync10(migrationMarker, JSON.stringify({ migrated_at: Date.now(), source: cmDbPath }), "utf-8");
     } catch (e) {
       console.error(`  Migration failed: ${e}`);
-      console.log("  You can retry later with: npx claude-memory-hub migrate");
+      console.log("  You can retry later with: bunx claude-memory-hub@latest migrate");
     }
+  } else if (cmDbPath) {
+    console.log(`
+[Migration] claude-mem data already migrated (rerun manually: migrate).`);
   }
 }
 function uninstall() {
