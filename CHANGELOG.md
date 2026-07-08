@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.3] - 2026-07-08
+
+**Critical installer fix: `install` was still writing the pre-v0.15 5-hook layout.**
+
+Found via a user report of `Hooks: 7/5 registered` in `status`. The display bug led to the real one:
+
+- **`install` now registers all 7 hooks correctly** — it was missing `SessionStart` (no session baseline, no curated-note injection for fresh installs!) and `SessionEnd`, and wired the heavy `session-end.js` pipeline to `Stop`, which fires after EVERY assistant turn. Machines upgraded manually were fine; anyone installing fresh got the old layout. `install` + `status` now share one hook list (`HOOK_REGISTRATIONS`) so they cannot drift again.
+- `status` shows the correct `N/7` count, a `Worker:` line (pid/uptime or "auto-spawns on next hook"), and detects the outdated Stop layout with a prompt to re-run `install`.
+
+Already installed? Run `bunx claude-memory-hub install` once — it replaces old hook entries in place.
+
+---
+
 ## [0.17.2] - 2026-07-08
 
 **Windows CI caught what the audit missed — fixed, matrix green.**
