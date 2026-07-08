@@ -130,7 +130,7 @@ function repairSchema(db) {
   } catch (e) {
     log.error("Integrity check threw", { error: String(e) });
   }
-  const KNOWN_FTS = new Set(["fts_memories", "fts_messages"]);
+  const KNOWN_FTS = new Set(["fts_memories", "fts_messages", "fts_curated"]);
   try {
     const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%'").all();
     for (const t of tables) {
@@ -433,6 +433,73 @@ function applyMigrations(db) {
     } catch {}
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (11, ?)", [Date.now()]);
     log.info("Migration v11 complete");
+  }
+  if (currentVersion < 12) {
+    log.info("Applying migration v12: curated_notes (Obsidian read-back)");
+    db.transaction(() => {
+      db.run(`
+        CREATE TABLE IF NOT EXISTS curated_notes (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          path         TEXT NOT NULL UNIQUE,
+          project      TEXT,
+          title        TEXT NOT NULL,
+          content      TEXT NOT NULL,
+          origin       TEXT NOT NULL CHECK(origin IN ('user','edited')),
+          mtime        INTEGER NOT NULL,
+          content_hash TEXT NOT NULL,
+          indexed_at   INTEGER NOT NULL
+        )
+      `);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_curated_project ON curated_notes(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_curated_mtime   ON curated_notes(mtime DESC)`);
+      db.run(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_curated USING fts5(
+          path UNINDEXED,
+          project UNINDEXED,
+          title,
+          content,
+          tokenize = 'porter unicode61'
+        )
+      `);
+      db.run(`
+        CREATE TRIGGER IF NOT EXISTS fts_curated_insert
+          AFTER INSERT ON curated_notes BEGIN
+            INSERT INTO fts_curated(rowid, path, project, title, content)
+            VALUES (new.id, new.path, new.project, new.title, new.content);
+          END
+      `);
+      db.run(`
+        CREATE TRIGGER IF NOT EXISTS fts_curated_update
+          AFTER UPDATE ON curated_notes BEGIN
+            DELETE FROM fts_curated WHERE rowid = old.id;
+            INSERT INTO fts_curated(rowid, path, project, title, content)
+            VALUES (new.id, new.path, new.project, new.title, new.content);
+          END
+      `);
+      db.run(`
+        CREATE TRIGGER IF NOT EXISTS fts_curated_delete
+          AFTER DELETE ON curated_notes BEGIN
+            DELETE FROM fts_curated WHERE rowid = old.id;
+          END
+      `);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS embeddings_v12 (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note','resource','curated')),
+          doc_id     INTEGER NOT NULL,
+          model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+          vector     BLOB NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+      `);
+      db.run(`INSERT INTO embeddings_v12 SELECT * FROM embeddings`);
+      db.run(`DROP TABLE embeddings`);
+      db.run(`ALTER TABLE embeddings_v12 RENAME TO embeddings`);
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (12, ?)", [Date.now()]);
+    log.info("Migration v12 complete");
   }
 }
 function getDatabase() {

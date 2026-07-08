@@ -31,7 +31,7 @@ Every number below is **measured on real usage**, not estimated — the built-in
 | ⚡ | **Token-efficient injection** | Session baseline injected ONCE (SessionStart), later prompts deduplicated — measured **96% reduction** in injection overhead vs per-prompt injection. |
 | 🚀 | **Persistent worker** | Hooks hit a warm local server: **981ms → ~50ms** per prompt. Auto-spawned, self-healing, version-skew guarded, falls back in-process when down — never a single point of failure. |
 | 🕸️ | **Behavioral knowledge graph** | What static analysis can't know: which files are *actually* edited together, where errors *actually* happened, which decisions concern which files. Obsidian-style graph view in the dashboard (`/#graph`). |
-| 📓 | **Obsidian export** | Sessions, decisions, and hot files as markdown notes with `[[wikilinks]]` generated from the graph — your coding memory becomes a personal knowledge vault. |
+| 📓 | **Obsidian two-way vault** | Memory exported as `[[wikilinked]]` notes — and read back: notes you write or edit in the vault become **curated memory**, injected into future sessions with the highest trust. Your edits are never overwritten. |
 | 🎯 | **Resource intelligence** | Matches each prompt to the right skill/agent/CLAUDE.md by meaning (semantic + usage + project context) and audits token overhead of unused resources. |
 | 🔗 | **Codegraph integration** | Repos indexed by [codegraph](https://github.com/colbymchenry/codegraph) get structural calls/called-by joined into `memory_impact` — structure + behavior in one view. |
 | 🔒 | **3-layer privacy** | `<private>` tags + automatic secret redaction (sk-, ghp_, AWS keys…) + path filtering (.env, *.pem). All local: no cloud, no telemetry, no network calls. |
@@ -100,11 +100,25 @@ happened (`error_in`), what decisions concern which files (`decided_about`), plu
 static import graph (`graph scan`). Ask `memory_impact` before touching a risky file
 to see its blast radius: co-edit cluster, past errors, related decisions, sessions.
 
-### Obsidian Export (v0.15)
+### Obsidian Vault — Two-Way (v0.17)
 
 `bunx claude-memory-hub obsidian sync` exports sessions, decisions, and hot files as
 markdown notes with `[[wikilinks]]` generated from the graph — Obsidian's graph view
-becomes your coding memory graph. Incremental, idempotent, one-way.
+becomes your coding memory graph. Incremental and idempotent.
+
+Since v0.17 the vault is **read back** as curated memory — the loop is closed:
+
+- **`MemoryHub/Notes/`** — every note you write there is indexed as *curated* knowledge.
+  Scope it with `project: "<repo-folder>"` frontmatter, or leave it global.
+- **Edit any exported note** — the hub detects it (content-hash guard), **never
+  overwrites your edit again**, and indexes your version as curated.
+- Curated notes are the **highest-trust source**: injected at session start for the
+  matching project, recalled per-prompt via FTS + semantic match (works for
+  Vietnamese notes), ranked with a 1.3× trust boost in `memory_search`, and
+  fetchable via `memory_fetch` with `type: "curated"`. Per-session dedup keeps
+  repeat prompts at zero token overhead.
+
+Write it once in Obsidian → Claude Code knows it in every future session.
 
 ### Hybrid Search (3 engines)
 

@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.0] - 2026-07-08
+
+**Obsidian read-back — the vault now feeds Claude Code, not just the other way around.**
+
+The export was one-way: nice for humans, invisible to Claude. v0.17.0 closes the loop: **Hub writes → you curate in Obsidian → Hub reads back → Claude recalls it.**
+
+### Curated memory (schema v12: `curated_notes` + `fts_curated`)
+
+- **`MemoryHub/Notes/`** — write any `.md` there and it is indexed as *curated* knowledge (origin `user`). Scope with `project: "<repo-folder>"` frontmatter; no frontmatter = global.
+- **Edit detection** — every exported note now records a content hash in `_meta/sync-state.json`. Edit any exported note and (a) the exporter **never overwrites it again** — your version wins, even for regenerated notes like project MOCs; (b) the read-back indexes your version as curated (origin `edited`).
+- Pre-v0.17 vaults are baselined on first sync (existing notes adopted as hub-written); edits from then on are detected. One-time caveat: edits made *before* upgrading cannot be distinguished.
+
+### Where Claude sees it
+
+- **SessionStart**: newest curated notes for the project (+ globals) join the baseline injection — above auto-generated memory in budget priority.
+- **Every prompt**: FTS match against the prompt (~1ms), per-session dedup → repeat prompts stay at **zero** injection overhead (verified live: first prompt injects the note, repeat returns 0 chars).
+- **`memory_search`**: curated notes rank with a 1.3× trust boost; **`memory_fetch`** accepts `type: "curated"`; semantic embeddings (`doc_type='curated'`) make Vietnamese notes findable.
+- Read-back runs at SessionStart (incremental, ~1000 notes in a few ms), SessionEnd, `obsidian sync`, and daily maintenance.
+
+### Also
+
+- Cleaner decision note filenames: `phase 0 backup db git status (43729).md` instead of `43729 phase 0- backup db, git status,.md`.
+- `Notes/README.md` starter note + updated `Home.md` explain the workflow inside the vault itself.
+- 9 new tests (242 total): read-back scan, edit preservation, dedup, FTS triggers, search integration.
+
+---
+
 ## [0.16.1] - 2026-07-08
 
 **Worker reliability guards — every prompt is now guaranteed fresh code and bounded latency.**

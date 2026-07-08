@@ -6617,7 +6617,7 @@ function repairSchema(db) {
   } catch (e) {
     log.error("Integrity check threw", { error: String(e) });
   }
-  const KNOWN_FTS = new Set(["fts_memories", "fts_messages"]);
+  const KNOWN_FTS = new Set(["fts_memories", "fts_messages", "fts_curated"]);
   try {
     const tables = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fts_%'").all();
     for (const t of tables) {
@@ -6920,6 +6920,73 @@ function applyMigrations(db) {
     } catch {}
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (11, ?)", [Date.now()]);
     log.info("Migration v11 complete");
+  }
+  if (currentVersion < 12) {
+    log.info("Applying migration v12: curated_notes (Obsidian read-back)");
+    db.transaction(() => {
+      db.run(`
+        CREATE TABLE IF NOT EXISTS curated_notes (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          path         TEXT NOT NULL UNIQUE,
+          project      TEXT,
+          title        TEXT NOT NULL,
+          content      TEXT NOT NULL,
+          origin       TEXT NOT NULL CHECK(origin IN ('user','edited')),
+          mtime        INTEGER NOT NULL,
+          content_hash TEXT NOT NULL,
+          indexed_at   INTEGER NOT NULL
+        )
+      `);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_curated_project ON curated_notes(project)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_curated_mtime   ON curated_notes(mtime DESC)`);
+      db.run(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_curated USING fts5(
+          path UNINDEXED,
+          project UNINDEXED,
+          title,
+          content,
+          tokenize = 'porter unicode61'
+        )
+      `);
+      db.run(`
+        CREATE TRIGGER IF NOT EXISTS fts_curated_insert
+          AFTER INSERT ON curated_notes BEGIN
+            INSERT INTO fts_curated(rowid, path, project, title, content)
+            VALUES (new.id, new.path, new.project, new.title, new.content);
+          END
+      `);
+      db.run(`
+        CREATE TRIGGER IF NOT EXISTS fts_curated_update
+          AFTER UPDATE ON curated_notes BEGIN
+            DELETE FROM fts_curated WHERE rowid = old.id;
+            INSERT INTO fts_curated(rowid, path, project, title, content)
+            VALUES (new.id, new.path, new.project, new.title, new.content);
+          END
+      `);
+      db.run(`
+        CREATE TRIGGER IF NOT EXISTS fts_curated_delete
+          AFTER DELETE ON curated_notes BEGIN
+            DELETE FROM fts_curated WHERE rowid = old.id;
+          END
+      `);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS embeddings_v12 (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          doc_type   TEXT NOT NULL CHECK(doc_type IN ('summary','entity','note','resource','curated')),
+          doc_id     INTEGER NOT NULL,
+          model      TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+          vector     BLOB NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+      `);
+      db.run(`INSERT INTO embeddings_v12 SELECT * FROM embeddings`);
+      db.run(`DROP TABLE embeddings`);
+      db.run(`ALTER TABLE embeddings_v12 RENAME TO embeddings`);
+      db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_doc ON embeddings(doc_type, doc_id)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model)`);
+    })();
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (12, ?)", [Date.now()]);
+    log.info("Migration v12 complete");
   }
 }
 function getDatabase() {
@@ -9520,11 +9587,12 @@ function loadInjectionState(sessionId) {
       const parsed = JSON.parse(readFileSync3(path, "utf-8"));
       return {
         baselineInjected: parsed.baselineInjected === true,
-        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : []
+        injectedSummaryIds: Array.isArray(parsed.injectedSummaryIds) ? parsed.injectedSummaryIds : [],
+        injectedCuratedIds: Array.isArray(parsed.injectedCuratedIds) ? parsed.injectedCuratedIds : []
       };
     }
   } catch {}
-  return { baselineInjected: false, injectedSummaryIds: [] };
+  return { baselineInjected: false, injectedSummaryIds: [], injectedCuratedIds: [] };
 }
 function saveInjectionState(sessionId, state) {
   try {
@@ -9537,6 +9605,57 @@ function saveInjectionState(sessionId, state) {
 var STATE_DIR;
 var init_injection_state = __esm(() => {
   STATE_DIR = join7(homedir6(), ".claude-memory-hub", "proactive");
+});
+
+// src/context/curated-injector.ts
+function getCuratedBaseline(project, limit = 3, db) {
+  const d = db ?? getDatabase();
+  try {
+    return d.query(`SELECT id, path, project, title, content, origin, mtime FROM curated_notes
+       WHERE project = ?1 OR project IS NULL
+       ORDER BY (project = ?1) DESC, mtime DESC
+       LIMIT ?2`).all(project, limit);
+  } catch {
+    return [];
+  }
+}
+function searchCuratedNotes(prompt, project, limit = 2, db) {
+  const d = db ?? getDatabase();
+  const query = toFtsQuery(prompt);
+  if (!query)
+    return [];
+  try {
+    return d.query(`SELECT cn.id, cn.path, cn.project, cn.title, cn.content, cn.origin, cn.mtime
+       FROM fts_curated
+       JOIN curated_notes cn ON cn.id = fts_curated.rowid
+       WHERE fts_curated MATCH ?1 AND (cn.project = ?2 OR cn.project IS NULL)
+       ORDER BY rank
+       LIMIT ?3`).all(query, project, limit);
+  } catch {
+    return [];
+  }
+}
+function buildCuratedSection(notes) {
+  if (notes.length === 0)
+    return "";
+  const lines = ["**Curated notes (user-maintained, Obsidian vault \u2014 treat as authoritative):**"];
+  for (const n of notes) {
+    const scope = n.project ? n.project : "global";
+    const body = n.content.replace(/\s+/g, " ").trim().slice(0, NOTE_INJECT_CHARS);
+    lines.push(`- [${scope}] ${n.title}: ${body}`);
+  }
+  return lines.join(`
+`);
+}
+function toFtsQuery(text) {
+  const words = text.trim().split(/\s+/).map((w) => w.replace(/["*^():{}[\]]/g, "").trim()).filter((w) => w.length > 1).slice(0, 12);
+  if (words.length === 0)
+    return "";
+  return words.map((w) => `"${w}"`).join(" OR ");
+}
+var NOTE_INJECT_CHARS = 500;
+var init_curated_injector = __esm(() => {
+  init_schema();
 });
 
 // src/capture/hook-handler.ts
@@ -9692,6 +9811,18 @@ async function handleUserPromptSubmit(hook, project) {
       }
     } catch {}
   }
+  let curatedNotes = [];
+  let curatedSection = "";
+  try {
+    if ((hook.prompt?.length ?? 0) >= 6) {
+      curatedNotes = searchCuratedNotes(hook.prompt ?? "", project, 2).filter((n) => !state.injectedCuratedIds.includes(n.id));
+    }
+    if (!baselineDone) {
+      const baseline = getCuratedBaseline(project, 3).filter((n) => !state.injectedCuratedIds.includes(n.id) && !curatedNotes.some((c) => c.id === n.id));
+      curatedNotes = [...curatedNotes, ...baseline].slice(0, 3);
+    }
+    curatedSection = buildCuratedSection(curatedNotes);
+  } catch {}
   let smartMatchSection = "";
   let smartMatchCount = 0;
   let smartMatchTopScore = 0;
@@ -9710,7 +9841,7 @@ async function handleUserPromptSubmit(hook, project) {
   } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
-  if (!baselineDone || memorySection.length > 0 || recentConvoSection.length > 0) {
+  if (!baselineDone || memorySection.length > 0 || recentConvoSection.length > 0 || curatedSection.length > 0) {
     try {
       awarenessHint = buildAwarenessHint({
         project,
@@ -9720,10 +9851,13 @@ async function handleUserPromptSubmit(hook, project) {
       });
     } catch {}
   }
-  const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning));
+  const safeContext = validator.validate(fitWithinBudget(memorySection, recentConvoSection, awarenessHint, mdSummary, smartMatchSection, advice, overheadWarning, curatedSection));
   state.baselineInjected = true;
   if (results.length > 0) {
     state.injectedSummaryIds = [...new Set([...state.injectedSummaryIds, ...results.map((r) => r.session_id)])];
+  }
+  if (curatedNotes.length > 0) {
+    state.injectedCuratedIds = [...new Set([...state.injectedCuratedIds, ...curatedNotes.map((n) => n.id)])];
   }
   saveInjectionState(hook.session_id, state);
   try {
@@ -9758,11 +9892,12 @@ function formatSmartMatch(matches) {
   return lines.join(`
 `);
 }
-function fitWithinBudget(memoryText, recentConvoText, awarenessHintText, mdText, smartMatchText, adviceText, overheadText) {
+function fitWithinBudget(memoryText, recentConvoText, awarenessHintText, mdText, smartMatchText, adviceText, overheadText, curatedText = "") {
   const MAX_CHARS2 = 8000;
   const sections = [
     { text: recentConvoText || "", priority: 1, minChars: 400 },
     { text: awarenessHintText || "", priority: 1, minChars: 100 },
+    { text: curatedText || "", priority: 2, minChars: 300 },
     { text: memoryText || "", priority: 2, minChars: 500 },
     { text: smartMatchText || "", priority: 3, minChars: 100 },
     { text: mdText || "", priority: 4, minChars: 200 },
@@ -9852,6 +9987,7 @@ var init_hook_handler = __esm(() => {
   init_smart_truncate();
   init_privacy_filter();
   init_injection_state();
+  init_curated_injector();
 });
 
 // src/graph/codegraph-bridge.ts
@@ -17826,6 +17962,27 @@ async function searchIndex(query, opts = {}, db) {
       }
     }
   } catch {}
+  try {
+    const safeQuery = sanitizeFtsQuery2(query);
+    if (safeQuery) {
+      const curatedResults = d.prepare(`SELECT cn.id, cn.project, SUBSTR(cn.title || ' \u2014 ' || cn.content, 1, 80) as title, cn.mtime
+         FROM fts_curated
+         JOIN curated_notes cn ON cn.id = fts_curated.rowid
+         WHERE fts_curated MATCH ?1
+         ORDER BY rank
+         LIMIT ?2`).all(safeQuery, limit);
+      for (const r of curatedResults) {
+        results.push({
+          id: r.id,
+          type: "curated",
+          title: r.title,
+          project: r.project ?? "global",
+          created_at: r.mtime,
+          score: 1
+        });
+      }
+    }
+  } catch {}
   const vectorResults = vectorSearch(query, limit, undefined, d);
   for (const vr of vectorResults) {
     if (vr.doc_type === "summary" && results.some((r) => r.type === "summary" && r.id === vr.doc_id))
@@ -17857,6 +18014,11 @@ async function searchIndex(query, opts = {}, db) {
         const row = d.prepare("SELECT id, project, SUBSTR(entity_value, 1, 80) as entity_value, created_at FROM entities WHERE id = ?").get(sr.doc_id);
         if (row) {
           results.push({ id: row.id, type: "entity", title: row.entity_value, project: row.project, created_at: row.created_at, score: sr.score });
+        }
+      } else if (sr.doc_type === "curated") {
+        const row = d.prepare("SELECT id, project, SUBSTR(title || ' \u2014 ' || content, 1, 80) as title, mtime FROM curated_notes WHERE id = ?").get(sr.doc_id);
+        if (row) {
+          results.push({ id: row.id, type: "curated", title: row.title, project: row.project ?? "global", created_at: row.mtime, score: sr.score });
         }
       }
     }
@@ -17890,6 +18052,8 @@ async function searchIndex(query, opts = {}, db) {
       score *= 1.4;
     else if (r.sourceCount >= 2)
       score *= 1.2;
+    if (r.type === "curated")
+      score *= 1.3;
     return { ...r, score };
   });
   merged.sort((a, b) => b.score - a.score);
@@ -17946,6 +18110,20 @@ ${row.context}` : row.entity_value, files: [], created_at: row.created_at });
       if (row) {
         const session = d.prepare("SELECT project FROM sessions WHERE id = ?").get(row.session_id);
         results.push({ id: row.id, type: "note", session_id: row.session_id, project: session?.project ?? "unknown", content: row.content, files: [], created_at: row.created_at });
+      }
+    } else if (type === "curated") {
+      const row = d.prepare("SELECT id, path, project, title, content, mtime FROM curated_notes WHERE id = ?").get(id);
+      if (row) {
+        results.push({
+          id: row.id,
+          type: "curated",
+          session_id: `obsidian:${row.path}`,
+          project: row.project ?? "global",
+          content: `# ${row.title}
+${row.content}`,
+          files: [],
+          created_at: row.mtime
+        });
       }
     }
   }
@@ -18386,7 +18564,7 @@ var TOOL_DEFINITIONS = [
             type: "object",
             properties: {
               id: { type: "number" },
-              type: { type: "string", enum: ["summary", "entity", "note"] }
+              type: { type: "string", enum: ["summary", "entity", "note", "curated"] }
             },
             required: ["id", "type"]
           },
