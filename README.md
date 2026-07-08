@@ -109,6 +109,8 @@ Layer 3: Path filtering        → .env, *.pem, *.key excluded from tracking
 
 ### Everything Else
 
+- **Persistent worker** — hooks hit a warm local server (~50ms vs ~1s cold start); auto-spawned, auto-healing, falls back to in-process when down
+- **Codegraph integration** — repos indexed by [codegraph](https://github.com/colbymchenry/codegraph) get calls/called-by joined into `memory_impact` (structure + behavior in one view)
 - **Slash commands** — `/mem-search`, `/mem-status`, `/mem-save`
 - **13 MCP tools** — progressive 3-layer search (50→200→500 tokens/result) + graph + resource matching
 - **Proactive retrieval** — detects topic shifts, injects relevant context mid-session
@@ -411,6 +413,7 @@ bunx claude-memory-hub graph       # Knowledge graph: graph build | graph scan [
 bunx claude-memory-hub obsidian sync  # Export memory to Obsidian vault [--project X]
 bunx claude-memory-hub maintenance # Retention + WAL checkpoint + Obsidian sync now
 bunx claude-memory-hub install-daemon # Daily 03:30 launchd maintenance agent (macOS)
+bunx claude-memory-hub worker      # Persistent worker: worker start | stop | status
 ```
 
 ---

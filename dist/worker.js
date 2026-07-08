@@ -3318,111 +3318,6 @@ var init_hook_handler = __esm(() => {
   init_injection_state();
 });
 
-// src/capture/session-start-handler.ts
-async function handleSessionStart(hook, project) {
-  if (hook.source === "compact")
-    return { additionalContext: "" };
-  const store = new SessionStore;
-  const ltStore = new LongTermStore;
-  store.upsertSession({
-    id: hook.session_id,
-    project,
-    started_at: Date.now(),
-    status: "active"
-  });
-  let recent = ltStore.getRecentSummaries(project, 3);
-  if (recent.length === 0)
-    recent = ltStore.getRecentSummariesAll(3);
-  let memoryHint = "";
-  const total = ltStore.countSummaries();
-  if (recent.length > 0 && total > recent.length) {
-    memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
-  }
-  const memorySection = buildMemorySection(recent, memoryHint);
-  const registry = getResourceRegistry();
-  const validator = new InjectionValidator(registry);
-  let advice = "";
-  let mdSummary = "";
-  let overheadWarning = "";
-  try {
-    registry.scan(hook.cwd);
-    const loader = new SmartResourceLoader(registry);
-    const plan = loader.buildContextPlan(project, "", 30000, hook.cwd);
-    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
-    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
-    advice = loader.formatContextAdvice(plan);
-  } catch {}
-  if (hook.cwd) {
-    try {
-      const mdTracker = new ClaudeMdTracker;
-      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
-      const tracker = new ResourceTracker;
-      for (const entry of mdEntries) {
-        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
-      }
-      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
-      mdSummary = mdTracker.formatForInjection(injectableEntries);
-    } catch {}
-  }
-  try {
-    const overhead = await registry.getOverheadReport(project);
-    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
-    if (unusedTokens > 1e4) {
-      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
-      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
-    }
-  } catch {}
-  let awarenessHint = "";
-  try {
-    awarenessHint = buildAwarenessHint({
-      project,
-      isCommandInvocation: false,
-      hasMemoryInjected: memorySection.length > 0,
-      hasRecentConvoInjected: false
-    });
-  } catch {}
-  const safeContext = validator.validate(fitWithinBudget(memorySection, "", awarenessHint, mdSummary, "", advice, overheadWarning));
-  const state = loadInjectionState(hook.session_id);
-  state.baselineInjected = true;
-  state.injectedSummaryIds = [
-    ...new Set([...state.injectedSummaryIds, ...recent.map((r) => r.session_id)])
-  ];
-  saveInjectionState(hook.session_id, state);
-  try {
-    logInjection({
-      session_id: hook.session_id,
-      project,
-      intent: "session_start",
-      language: null,
-      prompt_length: 0,
-      smart_match_count: 0,
-      smart_match_top_score: 0,
-      memory_section_chars: memorySection.length,
-      claude_md_chars: mdSummary.length,
-      recent_convo_chars: 0,
-      awareness_hint_chars: awarenessHint.length,
-      total_injection_chars: safeContext.length,
-      history_intent_matched: false,
-      injected_at: "session_start",
-      dedup_skipped: 0
-    });
-  } catch {}
-  return { additionalContext: safeContext };
-}
-var init_session_start_handler = __esm(() => {
-  init_session_store();
-  init_long_term_store();
-  init_resource_registry();
-  init_injection_validator();
-  init_smart_resource_loader();
-  init_claude_md_tracker();
-  init_resource_tracker();
-  init_awareness_hint();
-  init_injection_state();
-  init_injection_telemetry();
-  init_hook_handler();
-});
-
 // src/capture/batch-queue.ts
 import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync as unlinkSync2, statSync as statSync3 } from "fs";
 import { join as join7 } from "path";
@@ -4629,11 +4524,122 @@ var init_compact_interceptor = __esm(() => {
   init_session_summarizer();
 });
 
+// src/worker/worker-server.ts
+init_logger();
+import { existsSync as existsSync12, mkdirSync as mkdirSync7, unlinkSync as unlinkSync3, writeFileSync as writeFileSync6 } from "fs";
+import { join as join11 } from "path";
+import { homedir as homedir10 } from "os";
+
 // src/worker/hook-dispatch.ts
-var exports_hook_dispatch = {};
-__export(exports_hook_dispatch, {
-  dispatchHookEvent: () => dispatchHookEvent
-});
+init_hook_handler();
+
+// src/capture/session-start-handler.ts
+init_session_store();
+init_long_term_store();
+init_resource_registry();
+init_injection_validator();
+init_smart_resource_loader();
+init_claude_md_tracker();
+init_resource_tracker();
+init_awareness_hint();
+init_injection_state();
+init_injection_telemetry();
+init_hook_handler();
+async function handleSessionStart(hook, project) {
+  if (hook.source === "compact")
+    return { additionalContext: "" };
+  const store = new SessionStore;
+  const ltStore = new LongTermStore;
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    status: "active"
+  });
+  let recent = ltStore.getRecentSummaries(project, 3);
+  if (recent.length === 0)
+    recent = ltStore.getRecentSummariesAll(3);
+  let memoryHint = "";
+  const total = ltStore.countSummaries();
+  if (recent.length > 0 && total > recent.length) {
+    memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+  }
+  const memorySection = buildMemorySection(recent, memoryHint);
+  const registry = getResourceRegistry();
+  const validator = new InjectionValidator(registry);
+  let advice = "";
+  let mdSummary = "";
+  let overheadWarning = "";
+  try {
+    registry.scan(hook.cwd);
+    const loader = new SmartResourceLoader(registry);
+    const plan = loader.buildContextPlan(project, "", 30000, hook.cwd);
+    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+    advice = loader.formatContextAdvice(plan);
+  } catch {}
+  if (hook.cwd) {
+    try {
+      const mdTracker = new ClaudeMdTracker;
+      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+      const tracker = new ResourceTracker;
+      for (const entry of mdEntries) {
+        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      }
+      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+      mdSummary = mdTracker.formatForInjection(injectableEntries);
+    } catch {}
+  }
+  try {
+    const overhead = await registry.getOverheadReport(project);
+    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+    if (unusedTokens > 1e4) {
+      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
+    }
+  } catch {}
+  let awarenessHint = "";
+  try {
+    awarenessHint = buildAwarenessHint({
+      project,
+      isCommandInvocation: false,
+      hasMemoryInjected: memorySection.length > 0,
+      hasRecentConvoInjected: false
+    });
+  } catch {}
+  const safeContext = validator.validate(fitWithinBudget(memorySection, "", awarenessHint, mdSummary, "", advice, overheadWarning));
+  const state = loadInjectionState(hook.session_id);
+  state.baselineInjected = true;
+  state.injectedSummaryIds = [
+    ...new Set([...state.injectedSummaryIds, ...recent.map((r) => r.session_id)])
+  ];
+  saveInjectionState(hook.session_id, state);
+  try {
+    logInjection({
+      session_id: hook.session_id,
+      project,
+      intent: "session_start",
+      language: null,
+      prompt_length: 0,
+      smart_match_count: 0,
+      smart_match_top_score: 0,
+      memory_section_chars: memorySection.length,
+      claude_md_chars: mdSummary.length,
+      recent_convo_chars: 0,
+      awareness_hint_chars: awarenessHint.length,
+      total_injection_chars: safeContext.length,
+      history_intent_matched: false,
+      injected_at: "session_start",
+      dedup_skipped: 0
+    });
+  } catch {}
+  return { additionalContext: safeContext };
+}
+
+// src/worker/hook-dispatch.ts
+init_entity_extractor();
+init_batch_queue();
+init_proactive_retrieval();
 async function dispatchHookEvent(event, raw, cwd, options = {}) {
   let hook;
   try {
@@ -4727,24 +4733,8 @@ async function runPostToolUse(hook, cwd, inWorker) {
   } catch {}
   return "";
 }
-var init_hook_dispatch = __esm(() => {
-  init_hook_handler();
-  init_session_start_handler();
-  init_entity_extractor();
-  init_batch_queue();
-  init_proactive_retrieval();
-});
-
-// src/worker/worker-client.ts
-import { existsSync as existsSync12, readFileSync as readFileSync8, writeFileSync as writeFileSync6 } from "fs";
-import { join as join12 } from "path";
-import { homedir as homedir11 } from "os";
 
 // src/worker/worker-server.ts
-init_logger();
-init_hook_dispatch();
-import { join as join11 } from "path";
-import { homedir as homedir10 } from "os";
 var log18 = createLogger("worker");
 var DEFAULT_WORKER_PORT = 37889;
 var IDLE_EXIT_MS = 6 * 60 * 60 * 1000;
@@ -4760,73 +4750,73 @@ var VALID_EVENTS = new Set([
 function getWorkerPort() {
   return Number(process.env["CLAUDE_MEMORY_HUB_WORKER_PORT"]) || DEFAULT_WORKER_PORT;
 }
-
-// src/worker/worker-client.ts
-var HOOK_TIMEOUT_MS = 4000;
-var SPAWN_THROTTLE_MS = 30000;
-var STABLE_DIR = join12(homedir11(), ".claude-memory-hub");
-var SPAWN_MARKER = join12(STABLE_DIR, "worker-spawn.json");
-async function callWorkerHook(event, raw, cwd) {
-  if (process.env["CLAUDE_MEMORY_HUB_WORKER"] === "disabled")
-    return;
+function startWorker() {
+  const port = getWorkerPort();
+  const startedAt = Date.now();
+  let lastRequestAt = Date.now();
+  let server;
   try {
-    const res = await fetch(`http://127.0.0.1:${getWorkerPort()}/hook/${event}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ raw, cwd }),
-      signal: AbortSignal.timeout(HOOK_TIMEOUT_MS)
-    });
-    if (!res.ok)
-      return;
-    const data = await res.json();
-    return typeof data.out === "string" ? data.out : "";
-  } catch {
-    ensureWorkerSpawned();
-    return;
-  }
-}
-function ensureWorkerSpawned() {
-  try {
-    if (process.env["CLAUDE_MEMORY_HUB_WORKER"] === "disabled")
-      return;
-    try {
-      if (existsSync12(SPAWN_MARKER)) {
-        const parsed = JSON.parse(readFileSync8(SPAWN_MARKER, "utf-8"));
-        if (typeof parsed.at === "number" && Date.now() - parsed.at < SPAWN_THROTTLE_MS)
-          return;
+    server = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        lastRequestAt = Date.now();
+        const url = new URL(req.url);
+        if (url.pathname === "/health") {
+          return json({
+            ok: true,
+            pid: process.pid,
+            uptime_s: Math.round((Date.now() - startedAt) / 1000)
+          });
+        }
+        if (req.method === "POST" && url.pathname.startsWith("/hook/")) {
+          const event = url.pathname.slice("/hook/".length);
+          if (!VALID_EVENTS.has(event))
+            return json({ error: "unknown event" }, 404);
+          try {
+            const body = await req.json();
+            const out = await dispatchHookEvent(event, body.raw ?? "", body.cwd ?? process.cwd(), { inWorker: true });
+            return json({ out });
+          } catch (err) {
+            log18.error("worker dispatch failed", { event, error: String(err) });
+            return json({ error: String(err) }, 500);
+          }
+        }
+        return json({ error: "not found" }, 404);
       }
-    } catch {}
-    writeFileSync6(SPAWN_MARKER, JSON.stringify({ at: Date.now() }), "utf-8");
-    const entry = join12(STABLE_DIR, "dist", "worker.js");
-    if (!existsSync12(entry))
-      return;
-    const proc = Bun.spawn([process.execPath, "run", entry], {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      env: { ...process.env, CLAUDE_MEMORY_HUB_SKIP_HOOKS: "" }
     });
-    proc.unref();
+  } catch (err) {
+    log18.info("worker not started (port in use)", { port, error: String(err) });
+    return null;
+  }
+  try {
+    const dir = join11(homedir10(), ".claude-memory-hub");
+    if (!existsSync12(dir))
+      mkdirSync7(dir, { recursive: true, mode: 448 });
+    writeFileSync6(PID_PATH, String(process.pid), "utf-8");
   } catch {}
+  const idleTimer = setInterval(() => {
+    if (Date.now() - lastRequestAt > IDLE_EXIT_MS) {
+      log18.info("worker idle timeout, exiting");
+      try {
+        unlinkSync3(PID_PATH);
+      } catch {}
+      server.stop();
+      process.exit(0);
+    }
+  }, 10 * 60 * 1000);
+  if (typeof idleTimer.unref === "function")
+    idleTimer.unref();
+  log18.info("worker started", { port, pid: process.pid });
+  console.log(`claude-memory-hub worker on http://127.0.0.1:${port} (pid ${process.pid})`);
+  return server;
+}
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
 }
 
-// src/hooks-entry/user-prompt-submit.ts
-async function main() {
-  if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
-    return;
-  const raw = await Bun.stdin.text();
-  if (!raw.trim())
-    return;
-  const cwd = process.env["CLAUDE_CWD"] ?? process.cwd();
-  const viaWorker = await callWorkerHook("user-prompt-submit", raw, cwd);
-  if (viaWorker !== undefined) {
-    if (viaWorker)
-      process.stdout.write(viaWorker);
-    return;
-  }
-  const { dispatchHookEvent: dispatchHookEvent2 } = await Promise.resolve().then(() => (init_hook_dispatch(), exports_hook_dispatch));
-  const out = await dispatchHookEvent2("user-prompt-submit", raw, cwd);
-  if (out)
-    process.stdout.write(out);
-}
-main().catch(() => {}).finally(() => process.exit(0));
+// src/worker/worker-main.ts
+startWorker();

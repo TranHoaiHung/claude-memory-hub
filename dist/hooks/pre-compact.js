@@ -288,8 +288,7 @@ function applyMigrations(db) {
     db.run(`
       CREATE TRIGGER IF NOT EXISTS fts_messages_delete
         AFTER DELETE ON messages BEGIN
-          INSERT INTO fts_messages(fts_messages, rowid, session_id, role, content)
-          VALUES ('delete', old.id, old.session_id, old.role, old.content);
+          DELETE FROM fts_messages WHERE rowid = old.id;
         END
     `);
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
@@ -419,6 +418,21 @@ function applyMigrations(db) {
     } catch {}
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
     log.info("Migration v10 complete");
+  }
+  if (currentVersion < 11) {
+    log.info("Applying migration v11: fix fts_messages delete trigger");
+    db.run("DROP TRIGGER IF EXISTS fts_messages_delete");
+    db.run(`
+      CREATE TRIGGER fts_messages_delete
+        AFTER DELETE ON messages BEGIN
+          DELETE FROM fts_messages WHERE rowid = old.id;
+        END
+    `);
+    try {
+      db.run("INSERT INTO fts_messages(fts_messages) VALUES('rebuild')");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (11, ?)", [Date.now()]);
+    log.info("Migration v11 complete");
   }
 }
 function getDatabase() {
@@ -564,8 +578,6 @@ var init_schema = __esm(() => {
 });
 
 // src/db/session-store.ts
-init_schema();
-
 class SessionStore {
   db;
   constructor(db) {
@@ -708,10 +720,11 @@ class SessionStore {
     }
   }
 }
+var init_session_store = __esm(() => {
+  init_schema();
+});
 
 // src/db/long-term-store.ts
-init_schema();
-
 class LongTermStore {
   db;
   constructor(db) {
@@ -806,367 +819,11 @@ function sanitizeFtsQuery(query) {
   const last = words[words.length - 1];
   return [...head, `"${last}"*`].join(" ");
 }
-
-// src/summarizer/summarizer-prompts.ts
-function stripNoiseTags(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").trim();
-}
-function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
-  const parts = [];
-  if (session.user_prompt) {
-    const cleanPrompt = stripNoiseTags(session.user_prompt);
-    if (cleanPrompt) {
-      parts.push(`Task: ${cleanPrompt.slice(0, 500)}.`);
-    }
-  }
-  if (files.length > 0) {
-    const listed = files.slice(0, 15).join(", ");
-    parts.push(`Files (${files.length}): ${listed}${files.length > 15 ? ` (+${files.length - 15} more)` : ""}.`);
-  }
-  if (decisions.length > 0) {
-    const listed = decisions.slice(0, 5).map((d) => {
-      const base = d.entity_value.slice(0, 150);
-      const ctx = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
-      return base + ctx;
-    }).join("; ");
-    parts.push(`Decisions: ${listed}.`);
-  }
-  if (errors.length > 0) {
-    const errorLines = errors.slice(0, 5).map((e) => {
-      const ctx = e.context ? ` (${e.context.slice(0, 100)})` : "";
-      return `${e.entity_value.slice(0, 150)}${ctx}`;
-    });
-    parts.push(`Errors (${errors.length}): ${errorLines.join("; ")}.`);
-  }
-  if (notes.length > 0) {
-    parts.push(`Notes: ${notes.slice(-5).join("; ").slice(0, 500)}.`);
-  }
-  return parts.join(" ") || `Session in project ${session.project}.`;
-}
-
-// src/summarizer/cli-summarizer.ts
-init_logger();
-var log2 = createLogger("cli-summarizer");
-var MAX_PROMPT_CHARS = 6000;
-var MAX_OUTPUT_CHARS = 2000;
-var DEFAULT_TIMEOUT_MS = 30000;
-var _cliAvailable;
-var _cliCheckedAt = 0;
-var CLI_CHECK_TTL_MS = 5 * 60 * 1000;
-function isClaudeCliAvailable() {
-  if (_cliAvailable === false && Date.now() - _cliCheckedAt > CLI_CHECK_TTL_MS) {
-    _cliAvailable = undefined;
-  }
-  if (_cliAvailable !== undefined)
-    return _cliAvailable;
-  try {
-    const proc = Bun.spawnSync(["which", "claude"]);
-    _cliAvailable = proc.exitCode === 0;
-  } catch {
-    _cliAvailable = false;
-  }
-  _cliCheckedAt = Date.now();
-  return _cliAvailable;
-}
-function stripNoise(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").trim();
-}
-function buildCliPrompt(ctx) {
-  const sections = [
-    "Summarize this coding session in 4-6 plain sentences. No markdown, no headers, no code blocks.",
-    "Cover: (1) what was accomplished and why, (2) key decisions with their reasons, (3) errors hit and how they were resolved, (4) anything left unfinished or planned next.",
-    "Write in English, but preserve Vietnamese feature names, domain terms, and user requirements VERBATIM in quotes.",
-    "Include exact file names, function names, and error identifiers so keyword search can find this session later.",
-    "",
-    `Project: ${ctx.project}`
-  ];
-  if (ctx.files.length > 0) {
-    sections.push(`Files modified: ${ctx.files.slice(0, 15).join(", ")}`);
-  }
-  if (ctx.errors.length > 0) {
-    sections.push(`Errors resolved: ${ctx.errors.slice(0, 5).map(stripNoise).join("; ")}`);
-  }
-  if (ctx.decisions.length > 0) {
-    sections.push(`Decisions: ${ctx.decisions.slice(0, 8).map(stripNoise).join("; ")}`);
-  }
-  if (ctx.notes.length > 0) {
-    sections.push(`Notes: ${ctx.notes.slice(0, 5).map(stripNoise).join("; ")}`);
-  }
-  if (ctx.observations.length > 0) {
-    sections.push(`Key observations: ${ctx.observations.slice(0, 5).map(stripNoise).join("; ")}`);
-  }
-  let prompt = sections.join(`
-`);
-  if (prompt.length > MAX_PROMPT_CHARS) {
-    prompt = prompt.slice(0, MAX_PROMPT_CHARS - 3) + "...";
-  }
-  return prompt;
-}
-var MAX_RETRIES = 2;
-var DEFAULT_DAILY_MAX = 20;
-function consumeDailyBudget() {
-  const max = Number(process.env["CLAUDE_MEMORY_HUB_LLM_DAILY_MAX"]) || DEFAULT_DAILY_MAX;
-  const { existsSync: existsSync3, readFileSync, writeFileSync } = __require("fs");
-  const { join: join3 } = __require("path");
-  const { homedir: homedir3 } = __require("os");
-  const path = join3(homedir3(), ".claude-memory-hub", "cli-summary-budget.json");
-  const today = new Date().toISOString().slice(0, 10);
-  let count = 0;
-  try {
-    if (existsSync3(path)) {
-      const parsed = JSON.parse(readFileSync(path, "utf-8"));
-      if (parsed.date === today && typeof parsed.count === "number")
-        count = parsed.count;
-    }
-  } catch {}
-  if (count >= max)
-    return false;
-  try {
-    writeFileSync(path, JSON.stringify({ date: today, count: count + 1 }), "utf-8");
-  } catch {}
-  return true;
-}
-async function tryCliSummary(ctx, timeoutMs) {
-  const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
-  const timeout = timeoutMs ?? envTimeout;
-  if (!isClaudeCliAvailable()) {
-    log2.info("claude CLI not found, skipping Tier 2");
-    return;
-  }
-  if (!consumeDailyBudget()) {
-    log2.warn("Tier 2 daily budget exhausted, falling back to rule-based");
-    return;
-  }
-  const prompt = buildCliPrompt(ctx);
-  for (let attempt = 1;attempt <= MAX_RETRIES; attempt++) {
-    const result = await attemptCliCall(prompt, timeout, attempt);
-    if (result)
-      return result;
-    if (attempt < MAX_RETRIES)
-      await new Promise((r) => setTimeout(r, 1000));
-  }
-  log2.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
-  return;
-}
-async function attemptCliCall(prompt, timeout, attempt) {
-  try {
-    const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      env: {
-        ...process.env,
-        CLAUDE_MEMORY_HUB_SKIP_HOOKS: "1"
-      }
-    });
-    const timeoutPromise = new Promise((resolve) => {
-      setTimeout(() => {
-        try {
-          proc.kill();
-        } catch {}
-        resolve(undefined);
-      }, timeout);
-    });
-    const outputPromise = (async () => {
-      const output = await new Response(proc.stdout).text();
-      const exitCode = await proc.exited;
-      if (exitCode !== 0) {
-        log2.warn("claude CLI exited with non-zero", { exitCode, attempt });
-        return;
-      }
-      const text = output.trim();
-      if (!text || text.length < 10) {
-        log2.warn("claude CLI returned empty or too short output", { attempt });
-        return;
-      }
-      const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
-      return cleaned.slice(0, MAX_OUTPUT_CHARS);
-    })();
-    const result = await Promise.race([outputPromise, timeoutPromise]);
-    if (result) {
-      log2.info("Tier 2 CLI summary generated", { length: result.length, attempt });
-    } else {
-      log2.warn("Tier 2 CLI attempt failed or timed out", { attempt });
-    }
-    return result;
-  } catch (err) {
-    log2.error("Tier 2 CLI attempt error", { error: String(err), attempt });
-    return;
-  }
-}
-
-// src/summarizer/session-summarizer.ts
-init_logger();
-var log3 = createLogger("session-summarizer");
-
-class SessionSummarizer {
-  sessionStore;
-  ltStore;
-  constructor() {
-    this.sessionStore = new SessionStore;
-    this.ltStore = new LongTermStore;
-  }
-  async summarize(session_id, project) {
-    const session = this.sessionStore.getSession(session_id);
-    if (!session)
-      return;
-    if (this.ltStore.getSummary(session_id))
-      return;
-    const files = this.sessionStore.getSessionFiles(session_id);
-    const errors = this.sessionStore.getSessionErrors(session_id);
-    const decisions = this.sessionStore.getSessionDecisions(session_id);
-    const observations = this.sessionStore.getSessionObservations(session_id);
-    const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
-    const messages = this.sessionStore.getSessionMessages(session_id);
-    if (files.length === 0 && errors.length === 0 && notes.length === 0 && messages.length === 0)
-      return;
-    const hasModified = this.sessionStore.hasModifiedFiles(session_id);
-    if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && messages.length === 0)
-      return;
-    const userPrompts = messages.filter((m) => m.role === "user").slice(0, 10).map((m, i) => `[${i + 1}] ${m.content.slice(0, 150)}`);
-    const conversationDigest = userPrompts.length > 0 ? `User requests (${userPrompts.length}): ${userPrompts.join("; ")}` : "";
-    const obsValues = observations.slice(0, 8).map((o) => o.entity_value);
-    let summaryText;
-    let tier = "rule-based";
-    const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
-    if (llmMode !== "rule-based") {
-      const decisionDetails = decisions.slice(0, 8).map((d) => {
-        const ctx2 = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
-        return d.entity_value.slice(0, 150) + ctx2;
-      });
-      const allNotes = [...notes.slice(0, 5)];
-      if (conversationDigest)
-        allNotes.push(conversationDigest);
-      const ctx = {
-        sessionId: session_id,
-        project,
-        files,
-        errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 150)),
-        decisions: decisionDetails,
-        notes: allNotes,
-        observations: obsValues.slice(0, 5)
-      };
-      summaryText = await tryCliSummary(ctx);
-      if (summaryText)
-        tier = "cli";
-    }
-    if (!summaryText) {
-      const allNotes = [...notes, ...obsValues];
-      if (conversationDigest)
-        allNotes.push(conversationDigest);
-      summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
-    }
-    log3.info("Summary generated", { session_id, tier, length: summaryText.length });
-    const ltSummary = {
-      session_id,
-      project,
-      summary: summaryText,
-      files_touched: JSON.stringify(files.slice(0, 50)),
-      decisions: JSON.stringify(decisions.slice(0, 20).map((d) => d.entity_value)),
-      errors_fixed: JSON.stringify(errors.slice(0, 10).map((e) => e.entity_value.slice(0, 100))),
-      token_savings: estimateTokenSavings(files.length, errors.length, notes.length),
-      created_at: Date.now()
-    };
-    this.ltStore.upsertSummary(ltSummary);
-  }
-}
-function estimateTokenSavings(fileCount, errorCount, noteCount) {
-  return fileCount * 500 + errorCount * 100 + noteCount * 50;
-}
-
-// src/compact/compact-interceptor.ts
-async function handlePreCompact(hook, project) {
-  const store = new SessionStore;
-  const session = store.getSession(hook.session_id);
-  if (!session)
-    return "";
-  const entities = store.getSessionEntities(hook.session_id);
-  if (entities.length === 0)
-    return "";
-  const now = Date.now();
-  const scored = entities.map((e) => ({
-    ...e,
-    score: e.importance * recencyWeight(e.created_at, now)
-  })).sort((a, b) => b.score - a.score);
-  const lines = [
-    "## Memory Hub Priority Items",
-    "",
-    "The following items are CRITICAL \u2014 ensure they appear in the summary:",
-    ""
-  ];
-  const modifiedFiles = scored.filter((e) => e.entity_type === "file_modified" || e.entity_type === "file_created").slice(0, 15);
-  if (modifiedFiles.length > 0) {
-    lines.push("### Files Modified (MUST include)");
-    for (const f of modifiedFiles) {
-      lines.push(`- ${f.entity_value}`);
-    }
-    lines.push("");
-  }
-  const decisions = scored.filter((e) => e.entity_type === "decision").slice(0, 5);
-  if (decisions.length > 0) {
-    lines.push("### Decisions Made (MUST include)");
-    for (const d of decisions) {
-      lines.push(`- ${d.entity_value}`);
-    }
-    lines.push("");
-  }
-  const errors = scored.filter((e) => e.entity_type === "error").slice(0, 5);
-  if (errors.length > 0) {
-    lines.push("### Errors Encountered (include if space allows)");
-    for (const e of errors) {
-      lines.push(`- ${e.entity_value.slice(0, 150)}`);
-      if (e.context)
-        lines.push(`  Context: ${e.context.slice(0, 100)}`);
-    }
-    lines.push("");
-  }
-  const notes = store.getSessionNotes(hook.session_id);
-  if (notes.length > 0) {
-    lines.push("### Session Notes (MUST include)");
-    for (const n of notes.slice(-3)) {
-      lines.push(`- ${n.content.slice(0, 200)}`);
-    }
-    lines.push("");
-  }
-  return lines.join(`
-`);
-}
-async function handlePostCompact(hook, project) {
-  const store = new SessionStore;
-  const ltStore = new LongTermStore;
-  const files = store.getSessionFiles(hook.session_id);
-  const decisions = store.getSessionDecisions(hook.session_id);
-  const errors = store.getSessionErrors(hook.session_id);
-  const MAX_COMPACT_SUMMARY = 5000;
-  const summary = hook.compact_summary.length > MAX_COMPACT_SUMMARY ? hook.compact_summary.slice(0, MAX_COMPACT_SUMMARY - 20) + `
-
-[truncated]` : hook.compact_summary;
-  ltStore.upsertSummary({
-    session_id: hook.session_id,
-    project,
-    summary,
-    files_touched: JSON.stringify(files.slice(0, 50)),
-    decisions: JSON.stringify(decisions.slice(0, 20).map((d) => d.entity_value)),
-    errors_fixed: JSON.stringify(errors.slice(0, 10).map((e) => e.entity_value.slice(0, 100))),
-    token_savings: estimateTokenSavings2(hook.compact_summary.length, files.length),
-    created_at: Date.now()
-  });
-  const summarizer = new SessionSummarizer;
-  await summarizer.summarize(hook.session_id, project).catch(() => {});
-}
-function recencyWeight(createdAt, now) {
-  const hoursAgo = (now - createdAt) / (1000 * 60 * 60);
-  return Math.max(0.1, 1 / (1 + hoursAgo));
-}
-function estimateTokenSavings2(summaryLength, fileCount) {
-  return fileCount * 500 + summaryLength / 4;
-}
-
-// src/capture/hook-handler.ts
-init_schema();
+var init_long_term_store = __esm(() => {
+  init_schema();
+});
 
 // src/capture/context-enricher.ts
-var CONTEXT_MAX_LENGTH = 500;
 function enrichEntityContext(entity, hook) {
   const response = hook.tool_response;
   if (!response)
@@ -1263,18 +920,9 @@ function extractCodePatterns(content) {
   }
   return [...new Set(patterns)];
 }
+var CONTEXT_MAX_LENGTH = 500;
 
 // src/capture/error-detector.ts
-var BASH_ERROR_PATTERNS = [
-  { re: /exited with code \d+/, label: "exit", importance: 4 },
-  { re: /Traceback \(most recent call last\)/, label: "python", importance: 4 },
-  { re: /npm ERR!/, label: "npm", importance: 4 },
-  { re: /(?:^|\n)fatal: /, label: "git", importance: 4 },
-  { re: /command not found/, label: "not-found", importance: 3 },
-  { re: /error TS\d+/, label: "tsc", importance: 3 },
-  { re: /(?:^|\n)\s*(?:error|ERROR)[: ]/, label: "error", importance: 3 },
-  { re: /Build failed|Compilation failed|FAILED \(|Tests? failed/i, label: "build", importance: 3 }
-];
 function detectToolError(toolName, toolInput, toolResponse) {
   if (typeof toolResponse === "string") {
     const text = toolResponse.trim();
@@ -1334,41 +982,24 @@ function excerptAround(text, index) {
   return lines.join(`
 `).slice(0, 400);
 }
+var BASH_ERROR_PATTERNS;
+var init_error_detector = __esm(() => {
+  BASH_ERROR_PATTERNS = [
+    { re: /exited with code \d+/, label: "exit", importance: 4 },
+    { re: /Traceback \(most recent call last\)/, label: "python", importance: 4 },
+    { re: /npm ERR!/, label: "npm", importance: 4 },
+    { re: /(?:^|\n)fatal: /, label: "git", importance: 4 },
+    { re: /command not found/, label: "not-found", importance: 3 },
+    { re: /error TS\d+/, label: "tsc", importance: 3 },
+    { re: /(?:^|\n)\s*(?:error|ERROR)[: ]/, label: "error", importance: 3 },
+    { re: /Build failed|Compilation failed|FAILED \(|Tests? failed/i, label: "build", importance: 3 }
+  ];
+});
 
 // src/capture/privacy-filter.ts
-init_logger();
-var log4 = createLogger("privacy-filter");
-var DEFAULT_PRIVACY_CONFIG = {
-  tag_stripping: true,
-  auto_detect_secrets: true,
-  ignored_paths: [
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "*.credentials",
-    "credentials.*",
-    "**/secrets/**",
-    "**/.secrets/**",
-    "**/private/**"
-  ],
-  custom_patterns: []
-};
-var PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
 function stripPrivateTags(text) {
   return text.replace(PRIVATE_TAG_RE, "[REDACTED]");
 }
-var SECRET_PATTERNS = [
-  /(?:api[_-]?key|api[_-]?secret|access[_-]?key)\s*[:=]\s*['"]?[\w\-./+]{8,}['"]?/gi,
-  /(?:sk-|pk_|pk-|ghp_|gho_|ghr_|ghs_|ghv_|xox[bsrap]-|hf_|glpat-)[\w\-]{20,}/g,
-  /Bearer\s+[\w\-./+=]{20,}/g,
-  /(?:password|passwd|secret|token|credential)\s*[:=]\s*['"]?[^\s'"]{8,}['"]?/gi,
-  /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
-  /(?:AKIA|ASIA)[A-Z0-9]{16}/g,
-  /(?:secret|token|key|password|auth)\s*[:=]\s*['"]?[a-f0-9]{32,}['"]?/gi
-];
 function redactSecrets(text) {
   let result = text;
   for (const pattern of SECRET_PATTERNS) {
@@ -1386,7 +1017,7 @@ function isIgnoredPath(filePath, config = DEFAULT_PRIVACY_CONFIG) {
   const normalized = filePath.replace(/\\/g, "/");
   for (const pattern of config.ignored_paths) {
     if (matchGlob(normalized, pattern)) {
-      log4.debug("Path ignored by privacy filter", { path: filePath, pattern });
+      log2.debug("Path ignored by privacy filter", { path: filePath, pattern });
       return true;
     }
   }
@@ -1419,7 +1050,6 @@ function globToRegex(pattern) {
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "___DOUBLESTAR___").replace(/\*/g, "[^/]*").replace(/___DOUBLESTAR___/g, ".*");
   return new RegExp(`(?:^|/)${escaped}(?:$|/)`, "i");
 }
-var compiledCustomCache = new Map;
 function getCustomPatterns(config) {
   const results = [];
   for (const p of config.custom_patterns) {
@@ -1429,7 +1059,7 @@ function getCustomPatterns(config) {
         compiled = new RegExp(p, "gi");
         compiledCustomCache.set(p, compiled);
       } catch {
-        log4.warn("Invalid custom privacy pattern", { pattern: p });
+        log2.warn("Invalid custom privacy pattern", { pattern: p });
         continue;
       }
     }
@@ -1473,34 +1103,42 @@ function loadPrivacyConfig() {
     return DEFAULT_PRIVACY_CONFIG;
   }
 }
+var log2, DEFAULT_PRIVACY_CONFIG, PRIVATE_TAG_RE, SECRET_PATTERNS, compiledCustomCache;
+var init_privacy_filter = __esm(() => {
+  init_logger();
+  log2 = createLogger("privacy-filter");
+  DEFAULT_PRIVACY_CONFIG = {
+    tag_stripping: true,
+    auto_detect_secrets: true,
+    ignored_paths: [
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "*.p12",
+      "*.pfx",
+      "*.credentials",
+      "credentials.*",
+      "**/secrets/**",
+      "**/.secrets/**",
+      "**/private/**"
+    ],
+    custom_patterns: []
+  };
+  PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
+  SECRET_PATTERNS = [
+    /(?:api[_-]?key|api[_-]?secret|access[_-]?key)\s*[:=]\s*['"]?[\w\-./+]{8,}['"]?/gi,
+    /(?:sk-|pk_|pk-|ghp_|gho_|ghr_|ghs_|ghv_|xox[bsrap]-|hf_|glpat-)[\w\-]{20,}/g,
+    /Bearer\s+[\w\-./+=]{20,}/g,
+    /(?:password|passwd|secret|token|credential)\s*[:=]\s*['"]?[^\s'"]{8,}['"]?/gi,
+    /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
+    /(?:AKIA|ASIA)[A-Z0-9]{16}/g,
+    /(?:secret|token|key|password|auth)\s*[:=]\s*['"]?[a-f0-9]{32,}['"]?/gi
+  ];
+  compiledCustomCache = new Map;
+});
 
 // src/capture/observation-extractor.ts
-var TOOL_OUTPUT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
-  { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
-  { pattern: /\b(migration failed|data loss|corrupt)/i, importance: 4, label: "data-risk" },
-  { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
-  { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
-  { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
-  { pattern: /\b(refactored?|migrated?|upgraded?|replaced)\b/i, importance: 3, label: "refactor" },
-  { pattern: /\b(installed|added dependency|npm install|bun add)\b/i, importance: 2, label: "dependency" },
-  { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
-  { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
-  { pattern: /\b(created|scaffolded|initialized|bootstrapped)\b/i, importance: 2, label: "creation" },
-  { pattern: /\b(tests? (?:pass|fail)|coverage|assertion)/i, importance: 2, label: "test-result" },
-  { pattern: /\b(deployed|published|released|pushed to)\b/i, importance: 2, label: "deployment" },
-  { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
-];
-var PROMPT_HEURISTICS = [
-  { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
-  { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
-  { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
-  { pattern: /\b(fix|debug|investigate|analyze|resolve)\b/i, importance: 2, label: "user-task" },
-  { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" },
-  { pattern: /\b(implement|build|create|add feature|integrate)\b/i, importance: 2, label: "user-feature" }
-];
-var MAX_VALUE_LENGTH = 500;
-var MIN_INPUT_LENGTH = 20;
 function extractObservationFromOutput(output, sessionId, project, toolName, promptNumber) {
   if (!output || output.length < MIN_INPUT_LENGTH)
     return;
@@ -1549,6 +1187,34 @@ function extractSurroundingText(text, matchIndex, matchLength) {
   }
   return snippet;
 }
+var TOOL_OUTPUT_HEURISTICS, PROMPT_HEURISTICS, MAX_VALUE_LENGTH = 500, MIN_INPUT_LENGTH = 20;
+var init_observation_extractor = __esm(() => {
+  init_privacy_filter();
+  TOOL_OUTPUT_HEURISTICS = [
+    { pattern: /\b(IMPORTANT|CRITICAL|WARNING|BREAKING)\b/i, importance: 4, label: "important" },
+    { pattern: /\b(DEPRECATED|SECURITY|VULNERABILITY)\b/i, importance: 4, label: "security" },
+    { pattern: /\b(migration failed|data loss|corrupt)/i, importance: 4, label: "data-risk" },
+    { pattern: /\b(decision:|decided to|NOTE:|conclusion:)/i, importance: 3, label: "decision-note" },
+    { pattern: /\b(discovered|found that|learned|realized|root cause)\b/i, importance: 3, label: "discovery" },
+    { pattern: /\b(workaround:|alternative:|instead of|switched to)/i, importance: 3, label: "approach-change" },
+    { pattern: /\b(refactored?|migrated?|upgraded?|replaced)\b/i, importance: 3, label: "refactor" },
+    { pattern: /\b(installed|added dependency|npm install|bun add)\b/i, importance: 2, label: "dependency" },
+    { pattern: /\b(TODO:|FIXME:|HACK:|WORKAROUND:)/i, importance: 2, label: "todo-note" },
+    { pattern: /\b(performance:|bottleneck|slow|timeout|OOM)/i, importance: 2, label: "performance" },
+    { pattern: /\b(created|scaffolded|initialized|bootstrapped)\b/i, importance: 2, label: "creation" },
+    { pattern: /\b(tests? (?:pass|fail)|coverage|assertion)/i, importance: 2, label: "test-result" },
+    { pattern: /\b(deployed|published|released|pushed to)\b/i, importance: 2, label: "deployment" },
+    { pattern: /^>\s+.{10,}/m, importance: 2, label: "quoted" }
+  ];
+  PROMPT_HEURISTICS = [
+    { pattern: /\b(IMPORTANT|CRITICAL|MUST)\b/i, importance: 4, label: "user-important" },
+    { pattern: /\b(remember that|note that|I decided|we should|keep in mind)\b/i, importance: 3, label: "user-note" },
+    { pattern: /\b(don't|do not|never|avoid|stop)\b/i, importance: 3, label: "user-constraint" },
+    { pattern: /\b(fix|debug|investigate|analyze|resolve)\b/i, importance: 2, label: "user-task" },
+    { pattern: /\b(prefer|always use|convention is|pattern is)\b/i, importance: 2, label: "user-preference" },
+    { pattern: /\b(implement|build|create|add feature|integrate)\b/i, importance: 2, label: "user-feature" }
+  ];
+});
 
 // src/capture/entity-extractor.ts
 function extractEntities(hook, promptNumber = 0) {
@@ -1673,28 +1339,13 @@ function extractFileFromBashCmd(cmd) {
   }
   return;
 }
+var init_entity_extractor = __esm(() => {
+  init_error_detector();
+  init_observation_extractor();
+  init_privacy_filter();
+});
 
 // src/context/resource-tracker.ts
-init_schema();
-var SCHEMA_ADDITIONS = `
-CREATE TABLE IF NOT EXISTS resource_usage (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL,
-  project     TEXT NOT NULL,
-  resource_type TEXT NOT NULL
-    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
-  resource_name TEXT NOT NULL,
-  use_count   INTEGER NOT NULL DEFAULT 1,
-  token_cost  INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
-CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
-CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
-CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
-`;
-
 class ResourceTracker {
   db;
   initialized = false;
@@ -1759,18 +1410,32 @@ class ResourceTracker {
     return { total_token_cost: total, resource_count: count, by_type };
   }
 }
+var SCHEMA_ADDITIONS = `
+CREATE TABLE IF NOT EXISTS resource_usage (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  resource_type TEXT NOT NULL
+    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
+  resource_name TEXT NOT NULL,
+  use_count   INTEGER NOT NULL DEFAULT 1,
+  token_cost  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
+CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
+CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
+`;
+var init_resource_tracker = __esm(() => {
+  init_schema();
+});
 
 // src/context/resource-registry.ts
-init_logger();
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
-var log5 = createLogger("resource-registry");
-var CHARS_PER_TOKEN = 3.75;
-var SCAN_TTL_MS = 5 * 60 * 1000;
-var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
-var SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
-var MAX_DIR_WALK_DEPTH = 5;
 
 class ResourceRegistry {
   resources = new Map;
@@ -1792,7 +1457,7 @@ class ResourceRegistry {
       this.scanClaudeMd(cwd);
       this.lastScanAt = Date.now();
     } catch (err) {
-      log5.error("scan failed", { error: String(err) });
+      log3.error("scan failed", { error: String(err) });
     }
   }
   resolve(kind, name) {
@@ -1894,7 +1559,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log5.error(`scanSkillDir ${dir}`, { error: String(err) });
+      log3.error(`scanSkillDir ${dir}`, { error: String(err) });
     }
   }
   scanFlatAgents(dir) {
@@ -1926,7 +1591,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log5.error(`scanFlatAgents ${dir}`, { error: String(err) });
+      log3.error(`scanFlatAgents ${dir}`, { error: String(err) });
     }
   }
   scanAgentPackages(claudeDir) {
@@ -1940,7 +1605,7 @@ class ResourceRegistry {
         this.scanAgentPackageDir(packageDir);
       }
     } catch (err) {
-      log5.error("scanAgentPackages", { error: String(err) });
+      log3.error("scanAgentPackages", { error: String(err) });
     }
   }
   scanAgentPackageDir(packageDir) {
@@ -1994,7 +1659,7 @@ class ResourceRegistry {
         }
       }
     } catch (err) {
-      log5.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
+      log3.error(`scanAgentPackageDir ${packageDir}`, { error: String(err) });
     }
   }
   scanCommands(globalDir, cwd) {
@@ -2032,7 +1697,7 @@ class ResourceRegistry {
         }
       }
     } catch (err) {
-      log5.error(`scanCommandDir ${dir}`, { error: String(err) });
+      log3.error(`scanCommandDir ${dir}`, { error: String(err) });
     }
   }
   scanWorkflows(dir) {
@@ -2060,7 +1725,7 @@ class ResourceRegistry {
         });
       }
     } catch (err) {
-      log5.error(`scanWorkflows ${dir}`, { error: String(err) });
+      log3.error(`scanWorkflows ${dir}`, { error: String(err) });
     }
   }
   scanClaudeMd(cwd) {
@@ -2217,16 +1882,22 @@ class ResourceRegistry {
     return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
   }
 }
-var _instance;
 function getResourceRegistry() {
   if (!_instance)
     _instance = new ResourceRegistry;
   return _instance;
 }
+var log3, CHARS_PER_TOKEN = 3.75, SCAN_TTL_MS, SAFE_NAME_RE, SAFE_COMMAND_NAME_RE, MAX_DIR_WALK_DEPTH = 5, _instance;
+var init_resource_registry = __esm(() => {
+  init_logger();
+  init_resource_tracker();
+  log3 = createLogger("resource-registry");
+  SCAN_TTL_MS = 5 * 60 * 1000;
+  SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
+  SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
+});
 
 // src/context/smart-resource-loader.ts
-var DEFAULT_TOKEN_BUDGET = 30000;
-
 class SmartResourceLoader {
   tracker;
   ltStore;
@@ -2334,12 +2005,14 @@ function safeJson(text, fallback) {
     return fallback;
   }
 }
+var DEFAULT_TOKEN_BUDGET = 30000;
+var init_smart_resource_loader = __esm(() => {
+  init_resource_tracker();
+  init_long_term_store();
+  init_resource_registry();
+});
 
 // src/context/injection-validator.ts
-init_logger();
-var log6 = createLogger("injection-validator");
-var MAX_CHARS = 8000;
-
 class InjectionValidator {
   registry;
   constructor(registry) {
@@ -2360,7 +2033,7 @@ class InjectionValidator {
       }
       return text;
     } catch (err) {
-      log6.error("validation failed, returning empty", { error: String(err) });
+      log4.error("validation failed, returning empty", { error: String(err) });
       return "";
     }
   }
@@ -2371,7 +2044,7 @@ class InjectionValidator {
         return true;
       const alive = this.registry.exists(kind, r.resource_name);
       if (!alive) {
-        log6.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
+        log4.warn(`filtered dead resource: ${r.resource_type}:${r.resource_name}`);
       }
       return alive;
     });
@@ -2390,17 +2063,16 @@ function mapResourceTypeToKind(type) {
   };
   return mapping[type];
 }
+var log4, MAX_CHARS = 8000;
+var init_injection_validator = __esm(() => {
+  init_logger();
+  log4 = createLogger("injection-validator");
+});
 
 // src/context/claude-md-tracker.ts
-init_schema();
-init_logger();
 import { existsSync as existsSync4, readFileSync as readFileSync2 } from "fs";
 import { homedir as homedir4 } from "os";
 import { join as join4, dirname, basename as basename2 } from "path";
-var log7 = createLogger("claude-md-tracker");
-var MAX_WALK_DEPTH = 20;
-var CHARS_PER_TOKEN2 = 3.75;
-var STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
 
 class ClaudeMdTracker {
   db;
@@ -2439,7 +2111,7 @@ class ClaudeMdTracker {
           entries.push({ path: filePath, project, contentHash: hash, sections, tokenCost });
         }
       } catch (err) {
-        log7.error(`Failed to process ${filePath}`, { error: String(err) });
+        log5.error(`Failed to process ${filePath}`, { error: String(err) });
       }
     }
     return entries;
@@ -2560,54 +2232,17 @@ function safeJson2(text, fallback) {
     return fallback;
   }
 }
+var log5, MAX_WALK_DEPTH = 20, CHARS_PER_TOKEN2 = 3.75, STALE_THRESHOLD_MS;
+var init_claude_md_tracker = __esm(() => {
+  init_schema();
+  init_logger();
+  log5 = createLogger("claude-md-tracker");
+  STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+});
 
 // src/context/prompt-analyzer.ts
 import { existsSync as existsSync5, readdirSync as readdirSync2, statSync as statSync2 } from "fs";
 import { join as join5 } from "path";
-var INTENT_PATTERNS = [
-  { intent: "debug", re: /\b(bug|error|crash|fail|broken|not work|fix|debug|exception|stack ?trace|loi|s\u1EEDa|sua|hong|loi)\b/i },
-  { intent: "design", re: /\b(design|ui|ux|layout|figma|component|wireframe|mockup|style|color|theme|thiet ke|thi\u1EBFt k\u1EBF)\b/i },
-  { intent: "refactor", re: /\b(refactor|clean ?up|simplify|reorganize|rename|extract|inline|optimize|tach|toi uu|t\u1ED1i \u01B0u)\b/i },
-  { intent: "implement", re: /\b(add|create|build|implement|write|tao|t\u1EA1o|viet|vi\u1EBFt|code|l\u00E0m|lam|trien khai|tri\u1EC3n khai)\b/i },
-  { intent: "question", re: /\b(how|what|why|when|where|which|l\u00E0m sao|t\u1EA1i sao|l\u00E0 g\u00EC|la gi|lam sao|tai sao)\b|\?/i }
-];
-var VIETNAMESE_RE = /[\u0103\u00E2\u0111\u00EA\u00F4\u01A1\u01B0]|[\u00E1\u00E0\u1EA3\u00E3\u1EA1]|[\u00E9\u00E8\u1EBB\u1EBD\u1EB9]|[\u00ED\u00EC\u1EC9\u0129\u1ECB]|[\u00F3\u00F2\u1ECF\u00F5\u1ECD]|[\u00FA\u00F9\u1EE7\u0169\u1EE5]|[\u00FD\u1EF3\u1EF7\u1EF9\u1EF5]|[\u00C0-\u1EF9]/i;
-var STOP_WORDS = new Set([
-  "the",
-  "is",
-  "at",
-  "of",
-  "in",
-  "on",
-  "and",
-  "or",
-  "but",
-  "for",
-  "with",
-  "to",
-  "a",
-  "an",
-  "t\xF4i",
-  "toi",
-  "b\u1EA1n",
-  "ban",
-  "c\xF3",
-  "co",
-  "kh\xF4ng",
-  "khong",
-  "l\xE0",
-  "la",
-  "n\xE0y",
-  "nay",
-  "the",
-  "this",
-  "that",
-  "what",
-  "when",
-  "where",
-  "how",
-  "why"
-]);
 function analyzePrompt(prompt, cwd) {
   const text = prompt.trim();
   const lower = text.toLowerCase();
@@ -2641,8 +2276,6 @@ function extractKeywords(text) {
   const tokens = text.toLowerCase().replace(/[^\w\u00C0-\u1EF9\-_./]+/g, " ").split(/\s+/).filter((t) => t.length >= 3 && !STOP_WORDS.has(t));
   return [...new Set(tokens)].slice(0, 20);
 }
-var CWD_CACHE = new Map;
-var CWD_TTL_MS = 60000;
 function scanCwdSignals(cwd) {
   const cached = CWD_CACHE.get(cwd);
   if (cached && Date.now() - cached.ts < CWD_TTL_MS)
@@ -2773,15 +2406,56 @@ function pickPrimary(s) {
     return "csharp";
   return null;
 }
-
-// src/context/resource-embedding-search.ts
-init_schema();
+var INTENT_PATTERNS, VIETNAMESE_RE, STOP_WORDS, CWD_CACHE, CWD_TTL_MS = 60000;
+var init_prompt_analyzer = __esm(() => {
+  INTENT_PATTERNS = [
+    { intent: "debug", re: /\b(bug|error|crash|fail|broken|not work|fix|debug|exception|stack ?trace|loi|s\u1EEDa|sua|hong|loi)\b/i },
+    { intent: "design", re: /\b(design|ui|ux|layout|figma|component|wireframe|mockup|style|color|theme|thiet ke|thi\u1EBFt k\u1EBF)\b/i },
+    { intent: "refactor", re: /\b(refactor|clean ?up|simplify|reorganize|rename|extract|inline|optimize|tach|toi uu|t\u1ED1i \u01B0u)\b/i },
+    { intent: "implement", re: /\b(add|create|build|implement|write|tao|t\u1EA1o|viet|vi\u1EBFt|code|l\u00E0m|lam|trien khai|tri\u1EC3n khai)\b/i },
+    { intent: "question", re: /\b(how|what|why|when|where|which|l\u00E0m sao|t\u1EA1i sao|l\u00E0 g\u00EC|la gi|lam sao|tai sao)\b|\?/i }
+  ];
+  VIETNAMESE_RE = /[\u0103\u00E2\u0111\u00EA\u00F4\u01A1\u01B0]|[\u00E1\u00E0\u1EA3\u00E3\u1EA1]|[\u00E9\u00E8\u1EBB\u1EBD\u1EB9]|[\u00ED\u00EC\u1EC9\u0129\u1ECB]|[\u00F3\u00F2\u1ECF\u00F5\u1ECD]|[\u00FA\u00F9\u1EE7\u0169\u1EE5]|[\u00FD\u1EF3\u1EF7\u1EF9\u1EF5]|[\u00C0-\u1EF9]/i;
+  STOP_WORDS = new Set([
+    "the",
+    "is",
+    "at",
+    "of",
+    "in",
+    "on",
+    "and",
+    "or",
+    "but",
+    "for",
+    "with",
+    "to",
+    "a",
+    "an",
+    "t\xF4i",
+    "toi",
+    "b\u1EA1n",
+    "ban",
+    "c\xF3",
+    "co",
+    "kh\xF4ng",
+    "khong",
+    "l\xE0",
+    "la",
+    "n\xE0y",
+    "nay",
+    "the",
+    "this",
+    "that",
+    "what",
+    "when",
+    "where",
+    "how",
+    "why"
+  ]);
+  CWD_CACHE = new Map;
+});
 
 // src/search/embedding-model.ts
-init_logger();
-var log8 = createLogger("embedding-model");
-var MODEL_NAME = "Xenova/all-MiniLM-L6-v2";
-var EMBEDDING_DIM = 384;
 class EmbeddingModel {
   pipeline = null;
   loading = null;
@@ -2796,7 +2470,7 @@ class EmbeddingModel {
       const result = await this.pipeline(text, { pooling: "mean", normalize: true });
       return new Float32Array(result.data);
     } catch (err) {
-      log8.error("embed failed", { error: String(err) });
+      log6.error("embed failed", { error: String(err) });
       return null;
     }
   }
@@ -2852,14 +2526,19 @@ class EmbeddingModel {
       env.allowRemoteModels = true;
       const t0 = Date.now();
       this.pipeline = await pipeline("feature-extraction", MODEL_NAME, { dtype: "fp32" });
-      log8.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
+      log6.info("Embedding model loaded", { model: MODEL_NAME, ms: Date.now() - t0 });
     } catch (err) {
-      log8.warn("Embedding model unavailable", { error: String(err) });
+      log6.warn("Embedding model unavailable", { error: String(err) });
       this.available = false;
     }
   }
 }
-var embeddingModel = new EmbeddingModel;
+var log6, MODEL_NAME = "Xenova/all-MiniLM-L6-v2", EMBEDDING_DIM = 384, embeddingModel;
+var init_embedding_model = __esm(() => {
+  init_logger();
+  log6 = createLogger("embedding-model");
+  embeddingModel = new EmbeddingModel;
+});
 
 // src/context/resource-embedding-search.ts
 async function searchResourcesByPrompt(prompt, options = {}) {
@@ -2901,27 +2580,12 @@ function cosineSimilarity(a, b) {
     dot += a[i] * b[i];
   return dot;
 }
+var init_resource_embedding_search = __esm(() => {
+  init_schema();
+  init_embedding_model();
+});
 
 // src/context/resource-matcher.ts
-init_logger();
-var log9 = createLogger("resource-matcher");
-var CONTEXT_BOOSTS = [
-  { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
-  { when: (s) => s.has_kotlin, names: ["android-developer", "kotlin", "compose"] },
-  { when: (s) => s.has_react_native, names: ["react-native-developer", "expo"] },
-  { when: (s) => s.has_flutter, names: ["flutter-developer", "dart", "riverpod"] },
-  { when: (s) => s.has_typescript, names: ["web-developer", "react", "nextjs", "frontend"] },
-  { when: (s) => s.has_python, names: ["python", "fastapi", "django"] },
-  { when: (s) => s.has_figma, names: ["figma-ui-mcp", "ui-ux-pro-max", "ui-ux-designer"] },
-  { when: (s) => s.is_mobile, names: ["mobile-development", "mobile-development-skill"] }
-];
-var KIND_ORDER = {
-  skill: 0,
-  agent: 1,
-  command: 2,
-  workflow: 3,
-  claude_md: 4
-};
 async function matchResourcesForPrompt(prompt, analysis, opts) {
   const t0 = Date.now();
   const { project, threshold = 0.3, limit = 5, semantic_threshold = 0.15 } = opts;
@@ -2973,7 +2637,7 @@ async function matchResourcesForPrompt(prompt, analysis, opts) {
       return b.score - a.score;
     return (KIND_ORDER[a.kind] ?? 99) - (KIND_ORDER[b.kind] ?? 99);
   });
-  log9.info("matched resources", {
+  log7.info("matched resources", {
     candidates: all.length,
     above_threshold: filtered.length,
     ms: Date.now() - t0
@@ -3039,23 +2703,33 @@ function computeRecencyScore(daysAgo) {
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
 }
+var log7, CONTEXT_BOOSTS, KIND_ORDER;
+var init_resource_matcher = __esm(() => {
+  init_resource_embedding_search();
+  init_resource_tracker();
+  init_resource_registry();
+  init_logger();
+  log7 = createLogger("resource-matcher");
+  CONTEXT_BOOSTS = [
+    { when: (s) => s.has_swift, names: ["ios-developer", "swift", "swiftui"] },
+    { when: (s) => s.has_kotlin, names: ["android-developer", "kotlin", "compose"] },
+    { when: (s) => s.has_react_native, names: ["react-native-developer", "expo"] },
+    { when: (s) => s.has_flutter, names: ["flutter-developer", "dart", "riverpod"] },
+    { when: (s) => s.has_typescript, names: ["web-developer", "react", "nextjs", "frontend"] },
+    { when: (s) => s.has_python, names: ["python", "fastapi", "django"] },
+    { when: (s) => s.has_figma, names: ["figma-ui-mcp", "ui-ux-pro-max", "ui-ux-designer"] },
+    { when: (s) => s.is_mobile, names: ["mobile-development", "mobile-development-skill"] }
+  ];
+  KIND_ORDER = {
+    skill: 0,
+    agent: 1,
+    command: 2,
+    workflow: 3,
+    claude_md: 4
+  };
+});
 
 // src/context/history-intent.ts
-var HISTORY_EXEMPLARS = [
-  "what was the last message we exchanged",
-  "what did we work on previously",
-  "show me our previous conversation",
-  "what were we discussing before",
-  "tin nh\u1EAFn g\u1EA7n nh\u1EA5t l\xE0 g\xEC",
-  "l\u1EA7n tr\u01B0\u1EDBc ch\xFAng ta \u0111\xE3 l\xE0m g\xEC",
-  "c\xF4ng vi\u1EC7c tr\u01B0\u1EDBc \u0111\xF3 c\u1EE7a b\u1EA1n l\xE0 g\xEC",
-  "cu\u1ED9c tr\xF2 chuy\u1EC7n tr\u01B0\u1EDBc \u0111\xE2y",
-  "l\u1ECBch s\u1EED chat c\u1EE7a t\xF4i",
-  "what was I working on"
-];
-var SIMILARITY_THRESHOLD = 0.55;
-var cachedExemplarVectors = null;
-var cachedExemplarsLoading = null;
 async function ensureExemplarsLoaded() {
   if (cachedExemplarVectors)
     return;
@@ -3095,11 +2769,24 @@ function cosine(a, b) {
     dot += a[i] * b[i];
   return dot;
 }
+var HISTORY_EXEMPLARS, SIMILARITY_THRESHOLD = 0.55, cachedExemplarVectors = null, cachedExemplarsLoading = null;
+var init_history_intent = __esm(() => {
+  init_embedding_model();
+  HISTORY_EXEMPLARS = [
+    "what was the last message we exchanged",
+    "what did we work on previously",
+    "show me our previous conversation",
+    "what were we discussing before",
+    "tin nh\u1EAFn g\u1EA7n nh\u1EA5t l\xE0 g\xEC",
+    "l\u1EA7n tr\u01B0\u1EDBc ch\xFAng ta \u0111\xE3 l\xE0m g\xEC",
+    "c\xF4ng vi\u1EC7c tr\u01B0\u1EDBc \u0111\xF3 c\u1EE7a b\u1EA1n l\xE0 g\xEC",
+    "cu\u1ED9c tr\xF2 chuy\u1EC7n tr\u01B0\u1EDBc \u0111\xE2y",
+    "l\u1ECBch s\u1EED chat c\u1EE7a t\xF4i",
+    "what was I working on"
+  ];
+});
 
 // src/context/conversation-injector.ts
-init_schema();
-var MAX_MESSAGES_PER_SECTION = 6;
-var PER_MESSAGE_PREVIEW_CHARS = 240;
 function buildRecentConversationSection(currentSessionId, project, injectedDb) {
   const db = injectedDb ?? getDatabase();
   const store = new SessionStore(db);
@@ -3142,9 +2829,13 @@ function formatSection(heading, messages) {
 function compactWhitespace(s) {
   return s.replace(/\s+/g, " ").trim();
 }
+var MAX_MESSAGES_PER_SECTION = 6, PER_MESSAGE_PREVIEW_CHARS = 240;
+var init_conversation_injector = __esm(() => {
+  init_session_store();
+  init_schema();
+});
 
 // src/context/awareness-hint.ts
-init_schema();
 function buildAwarenessHint(options) {
   if (options.isCommandInvocation)
     return "";
@@ -3189,11 +2880,11 @@ function collectStats(db, project) {
     project_summaries: projectSummaries
   };
 }
+var init_awareness_hint = __esm(() => {
+  init_schema();
+});
 
 // src/db/injection-telemetry.ts
-init_schema();
-init_logger();
-var log10 = createLogger("injection-telemetry");
 function logInjection(entry, db) {
   if (process.env["CLAUDE_MEMORY_HUB_TELEMETRY"] === "disabled")
     return;
@@ -3226,7 +2917,7 @@ function logInjection(entry, db) {
       Date.now()
     ]);
   } catch (err) {
-    log10.warn("logInjection failed", { error: String(err) });
+    log8.warn("logInjection failed", { error: String(err) });
   }
 }
 function pruneInjectionLog(olderThanDays = 90, db) {
@@ -3235,11 +2926,14 @@ function pruneInjectionLog(olderThanDays = 90, db) {
   const result = d.run(`DELETE FROM injection_log WHERE timestamp < ?`, [cutoff]);
   return result.changes;
 }
+var log8;
+var init_injection_telemetry = __esm(() => {
+  init_schema();
+  init_logger();
+  log8 = createLogger("injection-telemetry");
+});
 
 // src/capture/smart-truncate.ts
-var MIN_USEFUL_RATIO = 0.8;
-var MARKER = `
-[truncated]`;
 function smartTruncate(text, maxChars) {
   if (text.length <= maxChars)
     return text;
@@ -3267,19 +2961,22 @@ function smartTruncate(text, maxChars) {
   }
   return slice + MARKER;
 }
-var ROLE_CAPS = {
-  user: 2000,
-  assistant: 4000
-};
 function capForRole(role) {
   return ROLE_CAPS[role];
 }
+var MIN_USEFUL_RATIO = 0.8, MARKER = `
+[truncated]`, ROLE_CAPS;
+var init_smart_truncate = __esm(() => {
+  ROLE_CAPS = {
+    user: 2000,
+    assistant: 4000
+  };
+});
 
 // src/context/injection-state.ts
 import { existsSync as existsSync6, readFileSync as readFileSync3, writeFileSync, mkdirSync as mkdirSync3, unlinkSync } from "fs";
 import { join as join6 } from "path";
 import { homedir as homedir5 } from "os";
-var STATE_DIR = join6(homedir5(), ".claude-memory-hub", "proactive");
 function statePath(sessionId) {
   return join6(STATE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}-inject.json`);
 }
@@ -3311,6 +3008,10 @@ function cleanupInjectionState(sessionId) {
       unlinkSync(path);
   } catch {}
 }
+var STATE_DIR;
+var init_injection_state = __esm(() => {
+  STATE_DIR = join6(homedir5(), ".claude-memory-hub", "proactive");
+});
 
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
@@ -3595,6 +3296,1519 @@ function projectFromCwd(cwd) {
     return "unknown";
   return basename3(cwd);
 }
+var init_hook_handler = __esm(() => {
+  init_session_store();
+  init_long_term_store();
+  init_schema();
+  init_entity_extractor();
+  init_resource_tracker();
+  init_smart_resource_loader();
+  init_resource_registry();
+  init_injection_validator();
+  init_observation_extractor();
+  init_claude_md_tracker();
+  init_prompt_analyzer();
+  init_resource_matcher();
+  init_history_intent();
+  init_conversation_injector();
+  init_awareness_hint();
+  init_injection_telemetry();
+  init_smart_truncate();
+  init_privacy_filter();
+  init_injection_state();
+});
+
+// src/capture/session-start-handler.ts
+async function handleSessionStart(hook, project) {
+  if (hook.source === "compact")
+    return { additionalContext: "" };
+  const store = new SessionStore;
+  const ltStore = new LongTermStore;
+  store.upsertSession({
+    id: hook.session_id,
+    project,
+    started_at: Date.now(),
+    status: "active"
+  });
+  let recent = ltStore.getRecentSummaries(project, 3);
+  if (recent.length === 0)
+    recent = ltStore.getRecentSummariesAll(3);
+  let memoryHint = "";
+  const total = ltStore.countSummaries();
+  if (recent.length > 0 && total > recent.length) {
+    memoryHint = `(showing ${recent.length} most recent of ${total} stored sessions \u2014 use \`memory_search\` with technical keywords for targeted retrieval)`;
+  }
+  const memorySection = buildMemorySection(recent, memoryHint);
+  const registry = getResourceRegistry();
+  const validator = new InjectionValidator(registry);
+  let advice = "";
+  let mdSummary = "";
+  let overheadWarning = "";
+  try {
+    registry.scan(hook.cwd);
+    const loader = new SmartResourceLoader(registry);
+    const plan = loader.buildContextPlan(project, "", 30000, hook.cwd);
+    plan.recommendations = validator.filterAliveRecommendations(plan.recommendations);
+    plan.skipped = validator.filterAliveRecommendations(plan.skipped);
+    advice = loader.formatContextAdvice(plan);
+  } catch {}
+  if (hook.cwd) {
+    try {
+      const mdTracker = new ClaudeMdTracker;
+      const mdEntries = mdTracker.scanAndUpdate(hook.cwd, project);
+      const tracker = new ResourceTracker;
+      for (const entry of mdEntries) {
+        tracker.trackUsage(hook.session_id, project, "claude_md", entry.path, entry.tokenCost);
+      }
+      const injectableEntries = mdTracker.filterNonRedundant(mdEntries, hook.cwd);
+      mdSummary = mdTracker.formatForInjection(injectableEntries);
+    } catch {}
+  }
+  try {
+    const overhead = await registry.getOverheadReport(project);
+    const unusedTokens = overhead.potential_savings.if_remove_unused_skills + overhead.potential_savings.if_remove_unused_agents;
+    if (unusedTokens > 1e4) {
+      const unusedCount = overhead.usage_analysis.skills_never_used.length + overhead.usage_analysis.agents_never_used.length;
+      overheadWarning = `Note: ${unusedCount} unused resources (~${unusedTokens} listing tok overhead). Run \`memory_context_budget\` for details.`;
+    }
+  } catch {}
+  let awarenessHint = "";
+  try {
+    awarenessHint = buildAwarenessHint({
+      project,
+      isCommandInvocation: false,
+      hasMemoryInjected: memorySection.length > 0,
+      hasRecentConvoInjected: false
+    });
+  } catch {}
+  const safeContext = validator.validate(fitWithinBudget(memorySection, "", awarenessHint, mdSummary, "", advice, overheadWarning));
+  const state = loadInjectionState(hook.session_id);
+  state.baselineInjected = true;
+  state.injectedSummaryIds = [
+    ...new Set([...state.injectedSummaryIds, ...recent.map((r) => r.session_id)])
+  ];
+  saveInjectionState(hook.session_id, state);
+  try {
+    logInjection({
+      session_id: hook.session_id,
+      project,
+      intent: "session_start",
+      language: null,
+      prompt_length: 0,
+      smart_match_count: 0,
+      smart_match_top_score: 0,
+      memory_section_chars: memorySection.length,
+      claude_md_chars: mdSummary.length,
+      recent_convo_chars: 0,
+      awareness_hint_chars: awarenessHint.length,
+      total_injection_chars: safeContext.length,
+      history_intent_matched: false,
+      injected_at: "session_start",
+      dedup_skipped: 0
+    });
+  } catch {}
+  return { additionalContext: safeContext };
+}
+var init_session_start_handler = __esm(() => {
+  init_session_store();
+  init_long_term_store();
+  init_resource_registry();
+  init_injection_validator();
+  init_smart_resource_loader();
+  init_claude_md_tracker();
+  init_resource_tracker();
+  init_awareness_hint();
+  init_injection_state();
+  init_injection_telemetry();
+  init_hook_handler();
+});
+
+// src/capture/batch-queue.ts
+import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync2, appendFileSync as appendFileSync2, unlinkSync as unlinkSync2, statSync as statSync3 } from "fs";
+import { join as join7 } from "path";
+import { homedir as homedir6 } from "os";
+function enqueueEvent(event) {
+  try {
+    ensureBatchDir();
+    const line = JSON.stringify(event) + `
+`;
+    appendFileSync2(QUEUE_PATH, line, "utf-8");
+  } catch (err) {
+    log9.error("enqueue failed", { error: String(err) });
+    throw err;
+  }
+}
+function tryFlush() {
+  try {
+    if (!existsSync7(QUEUE_PATH))
+      return false;
+    const stat = statSync3(QUEUE_PATH);
+    if (stat.size === 0)
+      return false;
+    if (!tryAcquireLock())
+      return false;
+    try {
+      flushQueue();
+      return true;
+    } finally {
+      releaseLock();
+    }
+  } catch (err) {
+    log9.error("flush failed", { error: String(err) });
+    return false;
+  }
+}
+function flushQueue() {
+  const content = readFileSync4(QUEUE_PATH, "utf-8").trim();
+  if (!content)
+    return;
+  const events = [];
+  for (const line of content.split(`
+`)) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      log9.warn("skipping malformed queue line");
+    }
+  }
+  if (events.length === 0)
+    return;
+  const store = new SessionStore;
+  const tracker = new ResourceTracker;
+  const registry = getResourceRegistry();
+  const db = store["db"];
+  db.transaction(() => {
+    for (const event of events) {
+      store.upsertSession({
+        id: event.session.id,
+        project: event.session.project,
+        started_at: event.session.started_at,
+        status: "active"
+      });
+      for (const entity of event.entities) {
+        store.insertEntity({ ...entity, project: event.session.project });
+      }
+      if (event.resources) {
+        for (const r of event.resources) {
+          const resource = registry.resolve(r.type, r.name);
+          tracker.trackUsage(event.session.id, event.session.project, r.type, r.name, r.tokenCost ?? resource?.full_tokens ?? 0);
+        }
+      }
+    }
+  })();
+  writeFileSync2(QUEUE_PATH, "", "utf-8");
+  log9.info("batch flushed", { events: events.length });
+}
+function tryAcquireLock() {
+  try {
+    if (existsSync7(LOCK_PATH)) {
+      const lockContent = readFileSync4(LOCK_PATH, "utf-8").trim();
+      const [pidStr, timestampStr] = lockContent.split(":");
+      const lockTime = Number(timestampStr);
+      if (Date.now() - lockTime < LOCK_STALE_MS) {
+        const pid = Number(pidStr);
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch {}
+      }
+    }
+    writeFileSync2(LOCK_PATH, `${process.pid}:${Date.now()}`, "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+function releaseLock() {
+  try {
+    unlinkSync2(LOCK_PATH);
+  } catch {}
+}
+function ensureBatchDir() {
+  if (!existsSync7(BATCH_DIR)) {
+    mkdirSync4(BATCH_DIR, { recursive: true, mode: 448 });
+  }
+}
+function isBatchEnabled() {
+  const mode = process.env["CLAUDE_MEMORY_HUB_BATCH"] ?? "auto";
+  return mode !== "disabled";
+}
+var log9, DATA_DIR, BATCH_DIR, QUEUE_PATH, LOCK_PATH, MAX_QUEUE_SIZE, LOCK_STALE_MS = 30000;
+var init_batch_queue = __esm(() => {
+  init_session_store();
+  init_resource_tracker();
+  init_resource_registry();
+  init_logger();
+  log9 = createLogger("batch-queue");
+  DATA_DIR = join7(homedir6(), ".claude-memory-hub");
+  BATCH_DIR = join7(DATA_DIR, "batch");
+  QUEUE_PATH = join7(BATCH_DIR, "queue.jsonl");
+  LOCK_PATH = join7(BATCH_DIR, "queue.lock");
+  MAX_QUEUE_SIZE = 100 * 1024;
+});
+
+// src/retrieval/proactive-retrieval.ts
+import { existsSync as existsSync8, readFileSync as readFileSync5, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5 } from "fs";
+import { join as join8 } from "path";
+import { homedir as homedir7 } from "os";
+function evaluateProactiveInjection(sessionId, toolName, toolInput, toolResponse) {
+  const state = loadState(sessionId);
+  state.toolCallCount++;
+  const filePath = extractFilePath(toolName, toolInput);
+  if (filePath) {
+    state.recentFiles = [...new Set([filePath, ...state.recentFiles])].slice(0, 20);
+  }
+  const shouldTrigger = state.toolCallCount % TOOL_CALL_INTERVAL === 0 || detectToolError(toolName, toolInput, toolResponse) !== null && state.toolCallCount > 5;
+  if (!shouldTrigger) {
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const currentTopic = detectTopic(state.recentFiles);
+  if (!currentTopic || state.injectedTopics.includes(currentTopic)) {
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const ltStore = new LongTermStore;
+  const results = ltStore.search(currentTopic, 2);
+  if (results.length === 0) {
+    state.injectedTopics.push(currentTopic);
+    saveState(sessionId, state);
+    return { shouldInject: false };
+  }
+  const lines = [`**Relevant past context** (topic: ${currentTopic}):`];
+  for (const r of results) {
+    const date = new Date(r.created_at).toLocaleDateString();
+    lines.push(`- [${date}] ${r.summary.slice(0, 400)}`);
+    const files = safeJson4(r.files_touched, []);
+    if (files.length > 0)
+      lines.push(`  Files: ${files.slice(0, 3).join(", ")}`);
+  }
+  let context = lines.join(`
+`);
+  if (context.length > MAX_INJECTION_CHARS) {
+    context = context.slice(0, MAX_INJECTION_CHARS) + `
+[...truncated]`;
+  }
+  state.injectedTopics.push(currentTopic);
+  state.lastInjectionAt = Date.now();
+  saveState(sessionId, state);
+  log10.info("proactive injection triggered", { sessionId, topic: currentTopic, results: results.length });
+  return { shouldInject: true, additionalContext: context };
+}
+function cleanupProactiveState(sessionId) {
+  const path = statePath2(sessionId);
+  try {
+    if (existsSync8(path)) {
+      const { unlinkSync: unlinkSync3 } = __require("fs");
+      unlinkSync3(path);
+    }
+  } catch {}
+}
+function detectTopic(recentFiles) {
+  if (recentFiles.length < 3)
+    return null;
+  const dirs = recentFiles.map((f) => f.split("/").slice(0, -1).join("/")).filter(Boolean);
+  const dirCounts = new Map;
+  for (const d of dirs) {
+    const parts = d.split("/").filter(Boolean);
+    const leaf = parts[parts.length - 1];
+    if (leaf && leaf !== "src" && leaf !== "lib" && leaf !== "utils") {
+      dirCounts.set(leaf, (dirCounts.get(leaf) ?? 0) + 1);
+    }
+  }
+  let bestTopic = null;
+  let bestCount = 0;
+  for (const [topic, count] of dirCounts) {
+    if (count > bestCount) {
+      bestTopic = topic;
+      bestCount = count;
+    }
+  }
+  const fileNames = recentFiles.map((f) => f.split("/").pop() ?? "").filter(Boolean);
+  const keywords = ["auth", "payment", "user", "api", "database", "config", "test", "migration", "deploy", "search"];
+  for (const kw of keywords) {
+    const matches = fileNames.filter((f) => f.toLowerCase().includes(kw));
+    if (matches.length >= 2)
+      return kw;
+  }
+  return bestTopic;
+}
+function statePath2(sessionId) {
+  return join8(PROACTIVE_DIR, `${sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+}
+function loadState(sessionId) {
+  const path = statePath2(sessionId);
+  try {
+    if (existsSync8(path)) {
+      return JSON.parse(readFileSync5(path, "utf-8"));
+    }
+  } catch {}
+  return { toolCallCount: 0, lastInjectionAt: 0, injectedTopics: [], recentFiles: [] };
+}
+function saveState(sessionId, state) {
+  try {
+    if (!existsSync8(PROACTIVE_DIR)) {
+      mkdirSync5(PROACTIVE_DIR, { recursive: true, mode: 448 });
+    }
+    writeFileSync3(statePath2(sessionId), JSON.stringify(state), "utf-8");
+  } catch {}
+}
+function extractFilePath(toolName, toolInput) {
+  if (toolName === "Read" || toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit") {
+    const fp = toolInput.file_path;
+    return typeof fp === "string" ? fp : undefined;
+  }
+  return;
+}
+function safeJson4(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+var log10, DATA_DIR2, PROACTIVE_DIR, TOOL_CALL_INTERVAL = 15, MAX_INJECTION_CHARS = 3000;
+var init_proactive_retrieval = __esm(() => {
+  init_long_term_store();
+  init_error_detector();
+  init_logger();
+  log10 = createLogger("proactive-retrieval");
+  DATA_DIR2 = join8(homedir7(), ".claude-memory-hub");
+  PROACTIVE_DIR = join8(DATA_DIR2, "proactive");
+});
+
+// src/capture/transcript-parser.ts
+import { createReadStream, existsSync as existsSync9, statSync as statSync4 } from "fs";
+import { createInterface } from "readline";
+async function parseTranscript(transcriptPath, sessionId, project) {
+  if (!transcriptPath || !existsSync9(transcriptPath)) {
+    log11.info("Transcript not found, skipping", { path: transcriptPath });
+    return [];
+  }
+  try {
+    const stat = statSync4(transcriptPath);
+    if (stat.size > MAX_FILE_SIZE) {
+      log11.warn("Transcript too large, skipping", { size: stat.size, max: MAX_FILE_SIZE });
+      return [];
+    }
+  } catch {
+    return [];
+  }
+  const messages = [];
+  let promptNumber = 0;
+  try {
+    const rl = createInterface({
+      input: createReadStream(transcriptPath, { encoding: "utf-8" }),
+      crlfDelay: Infinity
+    });
+    for await (const line of rl) {
+      if (messages.length >= MAX_MESSAGES)
+        break;
+      if (!line.trim())
+        continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry.type !== "user" && entry.type !== "assistant")
+        continue;
+      if (!entry.message)
+        continue;
+      const role = entry.type;
+      const content = extractTextContent(entry.message.content);
+      if (!content || content.length < 3)
+        continue;
+      if (role === "user" && messages.length > 0)
+        promptNumber++;
+      const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+      const msg = {
+        session_id: sessionId,
+        project,
+        role,
+        content: smartTruncate(content, capForRole(role)),
+        prompt_number: promptNumber,
+        timestamp
+      };
+      if (entry.uuid)
+        msg.uuid = entry.uuid;
+      if (entry.parentUuid)
+        msg.parent_uuid = entry.parentUuid;
+      messages.push(msg);
+    }
+  } catch (err) {
+    log11.error("Transcript parse failed", { error: String(err) });
+    return [];
+  }
+  const privacyConfig = loadPrivacyConfig();
+  for (const msg of messages) {
+    msg.content = sanitize(msg.content, privacyConfig);
+  }
+  log11.info("Transcript parsed", {
+    path: transcriptPath,
+    total: messages.length,
+    user: messages.filter((m) => m.role === "user").length,
+    assistant: messages.filter((m) => m.role === "assistant").length
+  });
+  return messages;
+}
+function extractTextContent(content) {
+  if (!content)
+    return;
+  if (typeof content === "string") {
+    return stripNoiseTags(content);
+  }
+  if (!Array.isArray(content))
+    return;
+  const textParts = [];
+  for (const block of content) {
+    if (block.type === "text" && block.text) {
+      textParts.push(block.text);
+    }
+  }
+  const joined = textParts.join(`
+`).trim();
+  return joined ? stripNoiseTags(joined) : undefined;
+}
+function stripNoiseTags(text) {
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]*>[\s\S]*?<\/local-command-[\w-]*>\s*/g, "").replace(/<command-[\w-]*>[\s\S]*?<\/command-[\w-]*>\s*/g, "").trim();
+}
+var log11, MAX_FILE_SIZE, MAX_MESSAGES = 200;
+var init_transcript_parser = __esm(() => {
+  init_logger();
+  init_privacy_filter();
+  init_smart_truncate();
+  log11 = createLogger("transcript-parser");
+  MAX_FILE_SIZE = 50 * 1024 * 1024;
+});
+
+// src/summarizer/summarizer-prompts.ts
+function stripNoiseTags2(text) {
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").trim();
+}
+function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
+  const parts = [];
+  if (session.user_prompt) {
+    const cleanPrompt = stripNoiseTags2(session.user_prompt);
+    if (cleanPrompt) {
+      parts.push(`Task: ${cleanPrompt.slice(0, 500)}.`);
+    }
+  }
+  if (files.length > 0) {
+    const listed = files.slice(0, 15).join(", ");
+    parts.push(`Files (${files.length}): ${listed}${files.length > 15 ? ` (+${files.length - 15} more)` : ""}.`);
+  }
+  if (decisions.length > 0) {
+    const listed = decisions.slice(0, 5).map((d) => {
+      const base = d.entity_value.slice(0, 150);
+      const ctx = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
+      return base + ctx;
+    }).join("; ");
+    parts.push(`Decisions: ${listed}.`);
+  }
+  if (errors.length > 0) {
+    const errorLines = errors.slice(0, 5).map((e) => {
+      const ctx = e.context ? ` (${e.context.slice(0, 100)})` : "";
+      return `${e.entity_value.slice(0, 150)}${ctx}`;
+    });
+    parts.push(`Errors (${errors.length}): ${errorLines.join("; ")}.`);
+  }
+  if (notes.length > 0) {
+    parts.push(`Notes: ${notes.slice(-5).join("; ").slice(0, 500)}.`);
+  }
+  return parts.join(" ") || `Session in project ${session.project}.`;
+}
+
+// src/summarizer/cli-summarizer.ts
+function isClaudeCliAvailable() {
+  if (_cliAvailable === false && Date.now() - _cliCheckedAt > CLI_CHECK_TTL_MS) {
+    _cliAvailable = undefined;
+  }
+  if (_cliAvailable !== undefined)
+    return _cliAvailable;
+  try {
+    const proc = Bun.spawnSync(["which", "claude"]);
+    _cliAvailable = proc.exitCode === 0;
+  } catch {
+    _cliAvailable = false;
+  }
+  _cliCheckedAt = Date.now();
+  return _cliAvailable;
+}
+function stripNoise(text) {
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").trim();
+}
+function buildCliPrompt(ctx) {
+  const sections = [
+    "Summarize this coding session in 4-6 plain sentences. No markdown, no headers, no code blocks.",
+    "Cover: (1) what was accomplished and why, (2) key decisions with their reasons, (3) errors hit and how they were resolved, (4) anything left unfinished or planned next.",
+    "Write in English, but preserve Vietnamese feature names, domain terms, and user requirements VERBATIM in quotes.",
+    "Include exact file names, function names, and error identifiers so keyword search can find this session later.",
+    "",
+    `Project: ${ctx.project}`
+  ];
+  if (ctx.files.length > 0) {
+    sections.push(`Files modified: ${ctx.files.slice(0, 15).join(", ")}`);
+  }
+  if (ctx.errors.length > 0) {
+    sections.push(`Errors resolved: ${ctx.errors.slice(0, 5).map(stripNoise).join("; ")}`);
+  }
+  if (ctx.decisions.length > 0) {
+    sections.push(`Decisions: ${ctx.decisions.slice(0, 8).map(stripNoise).join("; ")}`);
+  }
+  if (ctx.notes.length > 0) {
+    sections.push(`Notes: ${ctx.notes.slice(0, 5).map(stripNoise).join("; ")}`);
+  }
+  if (ctx.observations.length > 0) {
+    sections.push(`Key observations: ${ctx.observations.slice(0, 5).map(stripNoise).join("; ")}`);
+  }
+  let prompt = sections.join(`
+`);
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    prompt = prompt.slice(0, MAX_PROMPT_CHARS - 3) + "...";
+  }
+  return prompt;
+}
+function consumeDailyBudget() {
+  const max = Number(process.env["CLAUDE_MEMORY_HUB_LLM_DAILY_MAX"]) || DEFAULT_DAILY_MAX;
+  const { existsSync: existsSync10, readFileSync: readFileSync6, writeFileSync: writeFileSync4 } = __require("fs");
+  const { join: join9 } = __require("path");
+  const { homedir: homedir8 } = __require("os");
+  const path = join9(homedir8(), ".claude-memory-hub", "cli-summary-budget.json");
+  const today = new Date().toISOString().slice(0, 10);
+  let count = 0;
+  try {
+    if (existsSync10(path)) {
+      const parsed = JSON.parse(readFileSync6(path, "utf-8"));
+      if (parsed.date === today && typeof parsed.count === "number")
+        count = parsed.count;
+    }
+  } catch {}
+  if (count >= max)
+    return false;
+  try {
+    writeFileSync4(path, JSON.stringify({ date: today, count: count + 1 }), "utf-8");
+  } catch {}
+  return true;
+}
+async function tryCliSummary(ctx, timeoutMs) {
+  const envTimeout = Number(process.env["CLAUDE_MEMORY_HUB_LLM_TIMEOUT_MS"]) || DEFAULT_TIMEOUT_MS;
+  const timeout = timeoutMs ?? envTimeout;
+  if (!isClaudeCliAvailable()) {
+    log12.info("claude CLI not found, skipping Tier 2");
+    return;
+  }
+  if (!consumeDailyBudget()) {
+    log12.warn("Tier 2 daily budget exhausted, falling back to rule-based");
+    return;
+  }
+  const prompt = buildCliPrompt(ctx);
+  for (let attempt = 1;attempt <= MAX_RETRIES; attempt++) {
+    const result = await attemptCliCall(prompt, timeout, attempt);
+    if (result)
+      return result;
+    if (attempt < MAX_RETRIES)
+      await new Promise((r) => setTimeout(r, 1000));
+  }
+  log12.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
+  return;
+}
+async function attemptCliCall(prompt, timeout, attempt) {
+  try {
+    const proc = Bun.spawn(["claude", "-p", prompt, "--print"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      env: {
+        ...process.env,
+        CLAUDE_MEMORY_HUB_SKIP_HOOKS: "1"
+      }
+    });
+    const timeoutPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+        resolve(undefined);
+      }, timeout);
+    });
+    const outputPromise = (async () => {
+      const output = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        log12.warn("claude CLI exited with non-zero", { exitCode, attempt });
+        return;
+      }
+      const text = output.trim();
+      if (!text || text.length < 10) {
+        log12.warn("claude CLI returned empty or too short output", { attempt });
+        return;
+      }
+      const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
+      return cleaned.slice(0, MAX_OUTPUT_CHARS);
+    })();
+    const result = await Promise.race([outputPromise, timeoutPromise]);
+    if (result) {
+      log12.info("Tier 2 CLI summary generated", { length: result.length, attempt });
+    } else {
+      log12.warn("Tier 2 CLI attempt failed or timed out", { attempt });
+    }
+    return result;
+  } catch (err) {
+    log12.error("Tier 2 CLI attempt error", { error: String(err), attempt });
+    return;
+  }
+}
+var log12, MAX_PROMPT_CHARS = 6000, MAX_OUTPUT_CHARS = 2000, DEFAULT_TIMEOUT_MS = 30000, _cliAvailable, _cliCheckedAt = 0, CLI_CHECK_TTL_MS, MAX_RETRIES = 2, DEFAULT_DAILY_MAX = 20;
+var init_cli_summarizer = __esm(() => {
+  init_logger();
+  log12 = createLogger("cli-summarizer");
+  CLI_CHECK_TTL_MS = 5 * 60 * 1000;
+});
+
+// src/summarizer/session-summarizer.ts
+class SessionSummarizer {
+  sessionStore;
+  ltStore;
+  constructor() {
+    this.sessionStore = new SessionStore;
+    this.ltStore = new LongTermStore;
+  }
+  async summarize(session_id, project) {
+    const session = this.sessionStore.getSession(session_id);
+    if (!session)
+      return;
+    if (this.ltStore.getSummary(session_id))
+      return;
+    const files = this.sessionStore.getSessionFiles(session_id);
+    const errors = this.sessionStore.getSessionErrors(session_id);
+    const decisions = this.sessionStore.getSessionDecisions(session_id);
+    const observations = this.sessionStore.getSessionObservations(session_id);
+    const notes = this.sessionStore.getSessionNotes(session_id).map((n) => n.content);
+    const messages = this.sessionStore.getSessionMessages(session_id);
+    if (files.length === 0 && errors.length === 0 && notes.length === 0 && messages.length === 0)
+      return;
+    const hasModified = this.sessionStore.hasModifiedFiles(session_id);
+    if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && messages.length === 0)
+      return;
+    const userPrompts = messages.filter((m) => m.role === "user").slice(0, 10).map((m, i) => `[${i + 1}] ${m.content.slice(0, 150)}`);
+    const conversationDigest = userPrompts.length > 0 ? `User requests (${userPrompts.length}): ${userPrompts.join("; ")}` : "";
+    const obsValues = observations.slice(0, 8).map((o) => o.entity_value);
+    let summaryText;
+    let tier = "rule-based";
+    const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
+    if (llmMode !== "rule-based") {
+      const decisionDetails = decisions.slice(0, 8).map((d) => {
+        const ctx2 = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
+        return d.entity_value.slice(0, 150) + ctx2;
+      });
+      const allNotes = [...notes.slice(0, 5)];
+      if (conversationDigest)
+        allNotes.push(conversationDigest);
+      const ctx = {
+        sessionId: session_id,
+        project,
+        files,
+        errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 150)),
+        decisions: decisionDetails,
+        notes: allNotes,
+        observations: obsValues.slice(0, 5)
+      };
+      summaryText = await tryCliSummary(ctx);
+      if (summaryText)
+        tier = "cli";
+    }
+    if (!summaryText) {
+      const allNotes = [...notes, ...obsValues];
+      if (conversationDigest)
+        allNotes.push(conversationDigest);
+      summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
+    }
+    log13.info("Summary generated", { session_id, tier, length: summaryText.length });
+    const ltSummary = {
+      session_id,
+      project,
+      summary: summaryText,
+      files_touched: JSON.stringify(files.slice(0, 50)),
+      decisions: JSON.stringify(decisions.slice(0, 20).map((d) => d.entity_value)),
+      errors_fixed: JSON.stringify(errors.slice(0, 10).map((e) => e.entity_value.slice(0, 100))),
+      token_savings: estimateTokenSavings(files.length, errors.length, notes.length),
+      created_at: Date.now()
+    };
+    this.ltStore.upsertSummary(ltSummary);
+  }
+}
+function estimateTokenSavings(fileCount, errorCount, noteCount) {
+  return fileCount * 500 + errorCount * 100 + noteCount * 50;
+}
+var log13;
+var init_session_summarizer = __esm(() => {
+  init_session_store();
+  init_long_term_store();
+  init_cli_summarizer();
+  init_logger();
+  log13 = createLogger("session-summarizer");
+});
+
+// src/search/semantic-search.ts
+async function indexEmbedding(docType, docId, text, db) {
+  const vector = await embeddingModel.embed(text);
+  if (!vector)
+    return;
+  const d = db ?? getDatabase();
+  const blob = Buffer.from(vector.buffer);
+  d.run(`INSERT INTO embeddings(doc_type, doc_id, model, vector, created_at)
+     VALUES (?, ?, 'all-MiniLM-L6-v2', ?, ?)
+     ON CONFLICT(doc_type, doc_id) DO UPDATE SET
+       vector = excluded.vector,
+       created_at = excluded.created_at`, [docType, docId, blob, Date.now()]);
+}
+var log14;
+var init_semantic_search = __esm(() => {
+  init_schema();
+  init_embedding_model();
+  init_logger();
+  log14 = createLogger("semantic-search");
+});
+
+// src/health/auto-cleanup.ts
+import { existsSync as existsSync10, readFileSync as readFileSync6, writeFileSync as writeFileSync4 } from "fs";
+import { join as join9 } from "path";
+import { homedir as homedir8 } from "os";
+function maybeRunAutoCleanup() {
+  try {
+    if (!isDue())
+      return;
+    const db = getDatabase();
+    const cutoff = Date.now() - RETENTION_DAYS * 86400000;
+    const entities = db.run(`DELETE FROM entities
+       WHERE created_at < ? AND importance <= 1 AND entity_type = 'file_read'`, [cutoff]).changes;
+    const injections = pruneInjectionLog(RETENTION_DAYS, db);
+    const healthChecks = db.run(`DELETE FROM health_checks WHERE checked_at < ?`, [cutoff]).changes;
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    writeFileSync4(MARKER_PATH, JSON.stringify({ last_run: Date.now() }), "utf-8");
+    log15.info("auto-cleanup complete", { entities, injections, healthChecks });
+  } catch (err) {
+    log15.warn("auto-cleanup failed", { error: String(err) });
+  }
+}
+function isDue() {
+  try {
+    if (!existsSync10(MARKER_PATH))
+      return true;
+    const parsed = JSON.parse(readFileSync6(MARKER_PATH, "utf-8"));
+    const last = typeof parsed.last_run === "number" ? parsed.last_run : 0;
+    return Date.now() - last > CADENCE_DAYS * 86400000;
+  } catch {
+    return true;
+  }
+}
+var log15, CADENCE_DAYS = 7, RETENTION_DAYS = 90, MARKER_PATH;
+var init_auto_cleanup = __esm(() => {
+  init_schema();
+  init_injection_telemetry();
+  init_logger();
+  log15 = createLogger("auto-cleanup");
+  MARKER_PATH = join9(homedir8(), ".claude-memory-hub", "last-cleanup.json");
+});
+
+// src/graph/edge-builder.ts
+var exports_edge_builder = {};
+__export(exports_edge_builder, {
+  buildSessionEdges: () => buildSessionEdges,
+  backfillAllSessions: () => backfillAllSessions
+});
+function buildSessionEdges(sessionId, project, db) {
+  const d = db ?? getDatabase();
+  let edges = 0;
+  const entities = d.query("SELECT * FROM entities WHERE session_id = ? ORDER BY prompt_number ASC, created_at ASC").all(sessionId);
+  if (entities.length === 0)
+    return { edges: 0 };
+  const upsert = d.prepare(`INSERT INTO graph_edges(project, src_type, src_key, dst_type, dst_key, rel, weight, first_seen, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project, src_type, src_key, dst_type, dst_key, rel) DO UPDATE SET
+       weight    = weight + excluded.weight,
+       last_seen = excluded.last_seen`);
+  const now = Date.now();
+  const modified = entities.filter((e) => e.entity_type === "file_modified" || e.entity_type === "file_created").sort((a, b) => (b.touch_count ?? 1) - (a.touch_count ?? 1)).slice(0, MAX_FILES_PER_SESSION);
+  d.transaction(() => {
+    for (let i = 0;i < modified.length; i++) {
+      for (let j = i + 1;j < modified.length; j++) {
+        const a = modified[i];
+        const b = modified[j];
+        if (a.entity_value === b.entity_value)
+          continue;
+        const dist = Math.abs(a.prompt_number - b.prompt_number);
+        if (dist > PROMPT_WINDOW)
+          continue;
+        const [src, dst] = a.entity_value < b.entity_value ? [a.entity_value, b.entity_value] : [b.entity_value, a.entity_value];
+        upsert.run(project, "file", key(src), "file", key(dst), "co_edited", 1 / (1 + dist), now, now);
+        edges++;
+      }
+    }
+    const errors = entities.filter((e) => e.entity_type === "error");
+    for (const err of errors) {
+      const target = [...modified].filter((f) => f.prompt_number <= err.prompt_number).sort((x, y) => y.prompt_number - x.prompt_number)[0];
+      if (!target)
+        continue;
+      upsert.run(project, "error", key(err.entity_value), "file", key(target.entity_value), "error_in", 1, now, now);
+      edges++;
+    }
+    const decisions = entities.filter((e) => (e.entity_type === "decision" || e.entity_type === "observation") && e.importance >= 3).slice(0, 10);
+    for (const dec of decisions) {
+      let linked = 0;
+      for (const f of modified) {
+        if (Math.abs(f.prompt_number - dec.prompt_number) > 1)
+          continue;
+        if (++linked > 5)
+          break;
+        upsert.run(project, "decision", key(dec.entity_value), "file", key(f.entity_value), "decided_about", 1, now, now);
+        edges++;
+      }
+    }
+    const touched = entities.filter((e) => e.entity_type.startsWith("file_"));
+    for (const f of touched) {
+      upsert.run(project, "session", sessionId, "file", key(f.entity_value), "session_touched", f.touch_count ?? 1, now, now);
+      edges++;
+    }
+  })();
+  return { edges };
+}
+function backfillAllSessions(db) {
+  const d = db ?? getDatabase();
+  const sessions = d.query("SELECT id, project FROM sessions").all();
+  let total = 0;
+  for (const s of sessions) {
+    try {
+      total += buildSessionEdges(s.id, s.project, d).edges;
+    } catch (err) {
+      log16.warn("edge build failed for session", { session: s.id, error: String(err) });
+    }
+  }
+  log16.info("graph backfill complete", { sessions: sessions.length, edges: total });
+  return { sessions: sessions.length, edges: total };
+}
+function key(value) {
+  return value.length <= KEY_MAX_CHARS ? value : value.slice(0, KEY_MAX_CHARS);
+}
+var log16, PROMPT_WINDOW = 3, MAX_FILES_PER_SESSION = 40, KEY_MAX_CHARS = 160;
+var init_edge_builder = __esm(() => {
+  init_schema();
+  init_logger();
+  log16 = createLogger("edge-builder");
+});
+
+// src/export/obsidian-notes.ts
+function safeName(name) {
+  return name.replace(/[\\/:*?"<>|#^[\]]/g, "-").trim() || "unknown";
+}
+function slug(text, maxWords = 6) {
+  return safeName(text.split(/\s+/).slice(0, maxWords).join(" ").toLowerCase()).slice(0, 60);
+}
+function fileNoteName(filePath) {
+  const base = safeName(filePath.split("/").pop() ?? "file");
+  return `${base}-${hash8(filePath)}.md`;
+}
+function isoDate(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+function hash8(text) {
+  let h = 5381;
+  for (let i = 0;i < text.length; i++) {
+    h = (h << 5) + h + text.charCodeAt(i) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+function parseJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+function renderSessionNote(row, d) {
+  const files = parseJson(row.files_touched, []);
+  const decisions = parseJson(row.decisions, []);
+  const errors = parseJson(row.errors_fixed, []);
+  const lines = [
+    "---",
+    `type: session`,
+    `project: "${row.project}"`,
+    `session_id: ${row.session_id}`,
+    `date: ${isoDate(row.created_at)}`,
+    `tags: [memory-hub, session]`,
+    "---",
+    "",
+    `# Session ${isoDate(row.created_at)} \u2014 [[${safeName(row.project)}]]`,
+    "",
+    row.summary,
+    ""
+  ];
+  if (files.length > 0) {
+    lines.push("## Files touched");
+    for (const f of files.slice(0, 15))
+      lines.push(`- ${fileLink(f, d)}`);
+    lines.push("");
+  }
+  if (decisions.length > 0) {
+    lines.push("## Decisions");
+    for (const dec of decisions.slice(0, 10))
+      lines.push(`- ${dec}`);
+    lines.push("");
+  }
+  if (errors.length > 0) {
+    lines.push("## Errors fixed");
+    for (const e of errors.slice(0, 10))
+      lines.push(`- ${e}`);
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+function renderDecisionNote(row) {
+  return [
+    "---",
+    `type: decision`,
+    `project: "${row.project}"`,
+    `importance: ${row.importance}`,
+    `date: ${isoDate(row.created_at)}`,
+    `session_id: ${row.session_id}`,
+    `tags: [memory-hub, decision]`,
+    "---",
+    "",
+    `# ${row.entity_value.slice(0, 120)}`,
+    "",
+    `Project: [[${safeName(row.project)}]]`,
+    "",
+    row.entity_value,
+    row.context ? `
+> ${row.context}` : "",
+    ""
+  ].join(`
+`);
+}
+function renderFileNote(f, d) {
+  const lines = [
+    "---",
+    `type: file`,
+    `project: "${f.project}"`,
+    `path: "${f.entity_value}"`,
+    `touches: ${f.touches}`,
+    `tags: [memory-hub, file]`,
+    "---",
+    "",
+    `# ${f.entity_value.split("/").pop()}`,
+    "",
+    `\`${f.entity_value}\``,
+    "",
+    `Project: [[${safeName(f.project)}]] \xB7 edited ${f.touches}\xD7 \xB7 last ${isoDate(f.last_seen)}`,
+    ""
+  ];
+  const edges = d.query(`SELECT src_key, dst_key, weight FROM graph_edges
+     WHERE rel = 'co_edited' AND (src_key = ? OR dst_key = ?)
+     ORDER BY weight DESC LIMIT 8`).all(f.entity_value, f.entity_value);
+  if (edges.length > 0) {
+    lines.push("## Usually edited together with");
+    for (const e of edges) {
+      const other = e.src_key === f.entity_value ? e.dst_key : e.src_key;
+      lines.push(`- [[${fileNoteName(other).replace(/\.md$/, "")}]] (${e.weight.toFixed(1)})`);
+    }
+    lines.push("");
+  }
+  const errors = d.query(`SELECT src_key FROM graph_edges WHERE rel = 'error_in' AND dst_key = ? ORDER BY weight DESC LIMIT 5`).all(f.entity_value);
+  if (errors.length > 0) {
+    lines.push("## Past errors here");
+    for (const e of errors)
+      lines.push(`- ${e.src_key}`);
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+function renderProjectMoc(project, d) {
+  const recent = d.query(`SELECT session_id, summary, created_at FROM long_term_summaries
+     WHERE project = ? ORDER BY created_at DESC LIMIT 20`).all(project);
+  const lines = [
+    "---",
+    `type: project`,
+    `tags: [memory-hub, project]`,
+    "---",
+    "",
+    `# ${project}`,
+    "",
+    "## Recent sessions"
+  ];
+  for (const s of recent) {
+    lines.push(`- [[${isoDate(s.created_at)} ${s.session_id.slice(0, 8)}]] \u2014 ${s.summary.slice(0, 100).replace(/\n/g, " ")}`);
+  }
+  lines.push("", `[[Home]]`);
+  return lines.join(`
+`);
+}
+function renderHome(projects) {
+  const lines = [
+    "---",
+    `tags: [memory-hub, moc]`,
+    "---",
+    "",
+    "# \uD83E\uDDE0 Memory Hub",
+    "",
+    "Knowledge exported from Claude Code sessions. One-way sync \u2014 edits here are not written back (yet).",
+    "",
+    "## Projects"
+  ];
+  for (const p of projects) {
+    lines.push(`- [[${safeName(p.project)}]] (${p.sessions} sessions)`);
+  }
+  return lines.join(`
+`);
+}
+function fileLink(filePath, d) {
+  try {
+    const hot = d.query(`SELECT COUNT(*) c FROM graph_edges WHERE rel = 'co_edited' AND (src_key = ? OR dst_key = ?)`).get(filePath, filePath);
+    if ((hot?.c ?? 0) > 0)
+      return `[[${fileNoteName(filePath).replace(/\.md$/, "")}]]`;
+  } catch {}
+  return `\`${filePath}\``;
+}
+
+// src/export/obsidian-exporter.ts
+var exports_obsidian_exporter = {};
+__export(exports_obsidian_exporter, {
+  syncObsidianVault: () => syncObsidianVault,
+  getVaultRoot: () => getVaultRoot
+});
+import { existsSync as existsSync11, mkdirSync as mkdirSync6, readFileSync as readFileSync7, writeFileSync as writeFileSync5 } from "fs";
+import { join as join10 } from "path";
+import { homedir as homedir9 } from "os";
+function getVaultRoot() {
+  return process.env["CLAUDE_MEMORY_HUB_OBSIDIAN_VAULT"] ?? DEFAULT_VAULT;
+}
+function syncObsidianVault(options = {}) {
+  const d = options.db ?? getDatabase();
+  const root = join10(getVaultRoot(), SUBFOLDER);
+  ensureDir(root);
+  ensureDir(join10(root, "_meta"));
+  const state = loadSyncState(root);
+  const result = {
+    vault: root,
+    sessions_exported: 0,
+    decisions_exported: 0,
+    file_notes_exported: 0,
+    projects: 0
+  };
+  const summaryRows = d.query(`SELECT session_id, project, summary, files_touched, decisions, errors_fixed, created_at
+     FROM long_term_summaries
+     WHERE created_at > ?${options.project ? " AND project = ?" : ""}
+     ORDER BY created_at ASC`).all(...options.project ? [state.last_summary_at, options.project] : [state.last_summary_at]);
+  for (const row of summaryRows) {
+    const dir = join10(root, "Projects", safeName(row.project), "Sessions");
+    ensureDir(dir);
+    writeFileSync5(join10(dir, `${isoDate(row.created_at)} ${row.session_id.slice(0, 8)}.md`), renderSessionNote(row, d), "utf-8");
+    result.sessions_exported++;
+    state.last_summary_at = Math.max(state.last_summary_at, row.created_at);
+  }
+  const decisionRows = d.query(`SELECT id, project, entity_value, context, importance, created_at, session_id
+     FROM entities
+     WHERE entity_type IN ('decision','observation') AND importance >= 3 AND created_at > ?
+       ${options.project ? "AND project = ?" : ""}
+     ORDER BY created_at ASC LIMIT 500`).all(...options.project ? [state.last_decision_at, options.project] : [state.last_decision_at]);
+  for (const row of decisionRows) {
+    const dir = join10(root, "Projects", safeName(row.project), "Decisions");
+    ensureDir(dir);
+    writeFileSync5(join10(dir, `${row.id} ${slug(row.entity_value)}.md`), renderDecisionNote(row), "utf-8");
+    result.decisions_exported++;
+    state.last_decision_at = Math.max(state.last_decision_at, row.created_at);
+  }
+  const hotFiles = d.query(`SELECT project, entity_value, SUM(touch_count) touches, MAX(created_at) last_seen
+     FROM entities
+     WHERE entity_type IN ('file_modified','file_created')
+       ${options.project ? "AND project = ?" : ""}
+     GROUP BY project, entity_value
+     HAVING touches >= ?
+     ORDER BY touches DESC LIMIT 300`).all(...options.project ? [options.project, FILE_NOTE_MIN_TOUCHES] : [FILE_NOTE_MIN_TOUCHES]);
+  for (const f of hotFiles) {
+    const dir = join10(root, "Files", safeName(f.project));
+    ensureDir(dir);
+    writeFileSync5(join10(dir, fileNoteName(f.entity_value)), renderFileNote(f, d), "utf-8");
+    result.file_notes_exported++;
+  }
+  const projects = d.query(`SELECT project, COUNT(*) sessions FROM long_term_summaries GROUP BY project ORDER BY MAX(created_at) DESC`).all();
+  result.projects = projects.length;
+  for (const p of projects) {
+    if (options.project && p.project !== options.project)
+      continue;
+    const dir = join10(root, "Projects", safeName(p.project));
+    if (!existsSync11(dir))
+      continue;
+    writeFileSync5(join10(dir, `${safeName(p.project)}.md`), renderProjectMoc(p.project, d), "utf-8");
+  }
+  writeFileSync5(join10(root, "Home.md"), renderHome(projects), "utf-8");
+  saveSyncState(root, state);
+  log17.info("obsidian sync complete", { ...result });
+  return result;
+}
+function loadSyncState(root) {
+  try {
+    const parsed = JSON.parse(readFileSync7(join10(root, "_meta", "sync-state.json"), "utf-8"));
+    return {
+      last_summary_at: parsed.last_summary_at ?? 0,
+      last_decision_at: parsed.last_decision_at ?? 0
+    };
+  } catch {
+    return { last_summary_at: 0, last_decision_at: 0 };
+  }
+}
+function saveSyncState(root, state) {
+  writeFileSync5(join10(root, "_meta", "sync-state.json"), JSON.stringify(state, null, 2), "utf-8");
+}
+function ensureDir(dir) {
+  if (!existsSync11(dir))
+    mkdirSync6(dir, { recursive: true });
+}
+var log17, DEFAULT_VAULT, SUBFOLDER = "MemoryHub", FILE_NOTE_MIN_TOUCHES = 3;
+var init_obsidian_exporter = __esm(() => {
+  init_schema();
+  init_logger();
+  log17 = createLogger("obsidian-exporter");
+  DEFAULT_VAULT = join10(homedir9(), "Documents", "ObsidianVault");
+});
+
+// src/worker/session-end-pipeline.ts
+var exports_session_end_pipeline = {};
+__export(exports_session_end_pipeline, {
+  runSessionEnd: () => runSessionEnd
+});
+async function runSessionEnd(hook, project) {
+  await handleSessionEnd(hook, project);
+  try {
+    tryFlush();
+  } catch {}
+  cleanupProactiveState(hook.session_id);
+  cleanupInjectionState(hook.session_id);
+  if (hook.transcript_path) {
+    try {
+      const store2 = new SessionStore;
+      const messages = await parseTranscript(hook.transcript_path, hook.session_id, project);
+      if (messages.length > 0) {
+        store2.insertMessages(messages);
+      }
+    } catch {}
+  }
+  const store = new SessionStore;
+  if (store.getSession(hook.session_id)) {
+    await new SessionSummarizer().summarize(hook.session_id, project).catch(() => {});
+    const ltStore = new LongTermStore;
+    const summary = ltStore.getSummary(hook.session_id);
+    if (summary?.id) {
+      const text = [summary.summary, summary.files_touched, summary.decisions].join(" ");
+      indexEmbedding("summary", summary.id, text).catch(() => {});
+    }
+    try {
+      const { buildSessionEdges: buildSessionEdges2 } = await Promise.resolve().then(() => (init_edge_builder(), exports_edge_builder));
+      buildSessionEdges2(hook.session_id, project);
+    } catch {}
+    if (process.env["CLAUDE_MEMORY_HUB_OBSIDIAN"] === "1") {
+      try {
+        const { syncObsidianVault: syncObsidianVault2 } = await Promise.resolve().then(() => (init_obsidian_exporter(), exports_obsidian_exporter));
+        syncObsidianVault2({ project });
+      } catch {}
+    }
+  }
+  maybeRunAutoCleanup();
+}
+var init_session_end_pipeline = __esm(() => {
+  init_hook_handler();
+  init_transcript_parser();
+  init_session_summarizer();
+  init_session_store();
+  init_long_term_store();
+  init_semantic_search();
+  init_proactive_retrieval();
+  init_injection_state();
+  init_auto_cleanup();
+  init_batch_queue();
+});
+
+// src/compact/compact-interceptor.ts
+var exports_compact_interceptor = {};
+__export(exports_compact_interceptor, {
+  handlePreCompact: () => handlePreCompact,
+  handlePostCompact: () => handlePostCompact
+});
+async function handlePreCompact(hook, project) {
+  const store = new SessionStore;
+  const session = store.getSession(hook.session_id);
+  if (!session)
+    return "";
+  const entities = store.getSessionEntities(hook.session_id);
+  if (entities.length === 0)
+    return "";
+  const now = Date.now();
+  const scored = entities.map((e) => ({
+    ...e,
+    score: e.importance * recencyWeight(e.created_at, now)
+  })).sort((a, b) => b.score - a.score);
+  const lines = [
+    "## Memory Hub Priority Items",
+    "",
+    "The following items are CRITICAL \u2014 ensure they appear in the summary:",
+    ""
+  ];
+  const modifiedFiles = scored.filter((e) => e.entity_type === "file_modified" || e.entity_type === "file_created").slice(0, 15);
+  if (modifiedFiles.length > 0) {
+    lines.push("### Files Modified (MUST include)");
+    for (const f of modifiedFiles) {
+      lines.push(`- ${f.entity_value}`);
+    }
+    lines.push("");
+  }
+  const decisions = scored.filter((e) => e.entity_type === "decision").slice(0, 5);
+  if (decisions.length > 0) {
+    lines.push("### Decisions Made (MUST include)");
+    for (const d of decisions) {
+      lines.push(`- ${d.entity_value}`);
+    }
+    lines.push("");
+  }
+  const errors = scored.filter((e) => e.entity_type === "error").slice(0, 5);
+  if (errors.length > 0) {
+    lines.push("### Errors Encountered (include if space allows)");
+    for (const e of errors) {
+      lines.push(`- ${e.entity_value.slice(0, 150)}`);
+      if (e.context)
+        lines.push(`  Context: ${e.context.slice(0, 100)}`);
+    }
+    lines.push("");
+  }
+  const notes = store.getSessionNotes(hook.session_id);
+  if (notes.length > 0) {
+    lines.push("### Session Notes (MUST include)");
+    for (const n of notes.slice(-3)) {
+      lines.push(`- ${n.content.slice(0, 200)}`);
+    }
+    lines.push("");
+  }
+  return lines.join(`
+`);
+}
+async function handlePostCompact(hook, project) {
+  const store = new SessionStore;
+  const ltStore = new LongTermStore;
+  const files = store.getSessionFiles(hook.session_id);
+  const decisions = store.getSessionDecisions(hook.session_id);
+  const errors = store.getSessionErrors(hook.session_id);
+  const MAX_COMPACT_SUMMARY = 5000;
+  const summary = hook.compact_summary.length > MAX_COMPACT_SUMMARY ? hook.compact_summary.slice(0, MAX_COMPACT_SUMMARY - 20) + `
+
+[truncated]` : hook.compact_summary;
+  ltStore.upsertSummary({
+    session_id: hook.session_id,
+    project,
+    summary,
+    files_touched: JSON.stringify(files.slice(0, 50)),
+    decisions: JSON.stringify(decisions.slice(0, 20).map((d) => d.entity_value)),
+    errors_fixed: JSON.stringify(errors.slice(0, 10).map((e) => e.entity_value.slice(0, 100))),
+    token_savings: estimateTokenSavings2(hook.compact_summary.length, files.length),
+    created_at: Date.now()
+  });
+  const summarizer = new SessionSummarizer;
+  await summarizer.summarize(hook.session_id, project).catch(() => {});
+}
+function recencyWeight(createdAt, now) {
+  const hoursAgo = (now - createdAt) / (1000 * 60 * 60);
+  return Math.max(0.1, 1 / (1 + hoursAgo));
+}
+function estimateTokenSavings2(summaryLength, fileCount) {
+  return fileCount * 500 + summaryLength / 4;
+}
+var init_compact_interceptor = __esm(() => {
+  init_session_store();
+  init_long_term_store();
+  init_session_summarizer();
+});
+
+// src/worker/hook-dispatch.ts
+var exports_hook_dispatch = {};
+__export(exports_hook_dispatch, {
+  dispatchHookEvent: () => dispatchHookEvent
+});
+async function dispatchHookEvent(event, raw, cwd, options = {}) {
+  let hook;
+  try {
+    hook = JSON.parse(raw);
+  } catch {
+    return "";
+  }
+  if (!hook || typeof hook !== "object")
+    return "";
+  switch (event) {
+    case "session-start": {
+      const h = hook;
+      const project = projectFromCwd(h.cwd ?? cwd);
+      const { additionalContext } = await handleSessionStart(h, project);
+      if (!additionalContext)
+        return "";
+      return JSON.stringify({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext }
+      }) + `
+`;
+    }
+    case "user-prompt-submit": {
+      const h = hook;
+      const project = projectFromCwd(h.cwd ?? cwd);
+      const { additionalContext } = await handleUserPromptSubmit(h, project);
+      return additionalContext ? JSON.stringify({ additionalContext }) + `
+` : "";
+    }
+    case "post-tool-use":
+      return runPostToolUse(hook, cwd, options.inWorker === true);
+    case "session-end": {
+      const h = hook;
+      const { runSessionEnd: runSessionEnd2 } = await Promise.resolve().then(() => (init_session_end_pipeline(), exports_session_end_pipeline));
+      await runSessionEnd2(h, projectFromCwd(h.cwd ?? cwd));
+      return "";
+    }
+    case "pre-compact": {
+      const { handlePreCompact: handlePreCompact2 } = await Promise.resolve().then(() => (init_compact_interceptor(), exports_compact_interceptor));
+      const instructions = await handlePreCompact2(hook, projectFromCwd(cwd));
+      return instructions.trim() ? instructions : "";
+    }
+    case "post-compact": {
+      const { handlePostCompact: handlePostCompact2 } = await Promise.resolve().then(() => (init_compact_interceptor(), exports_compact_interceptor));
+      await handlePostCompact2(hook, projectFromCwd(cwd));
+      return `Memory Hub: context preserved.
+`;
+    }
+  }
+}
+async function runPostToolUse(hook, cwd, inWorker) {
+  const project = projectFromCwd(cwd);
+  if (!inWorker && isBatchEnabled()) {
+    try {
+      const entities = extractEntities(hook);
+      const resources = [];
+      if (hook.tool_name === "Skill") {
+        const skill = typeof hook.tool_input?.skill === "string" ? hook.tool_input.skill : undefined;
+        if (skill)
+          resources.push({ type: "skill", name: skill });
+      }
+      if (hook.tool_name === "Agent") {
+        const agent = typeof hook.tool_input?.subagent_type === "string" ? hook.tool_input.subagent_type : undefined;
+        if (agent)
+          resources.push({ type: "agent", name: agent });
+      }
+      if (hook.tool_name.startsWith("mcp__")) {
+        resources.push({ type: "mcp_tool", name: hook.tool_name });
+      }
+      enqueueEvent({
+        session: { id: hook.session_id, project, started_at: Date.now() },
+        entities,
+        resources: resources.length > 0 ? resources : undefined,
+        timestamp: Date.now()
+      });
+      tryFlush();
+    } catch {
+      await handlePostToolUse(hook, project);
+    }
+  } else {
+    await handlePostToolUse(hook, project);
+  }
+  if (hook.tool_name.startsWith("mcp__claude-memory-hub__")) {
+    markMemoryToolUsed(hook.session_id);
+  }
+  try {
+    const result = evaluateProactiveInjection(hook.session_id, hook.tool_name, hook.tool_input ?? {}, hook.tool_response ?? {});
+    if (result.shouldInject && result.additionalContext) {
+      return JSON.stringify({ additionalContext: result.additionalContext }) + `
+`;
+    }
+  } catch {}
+  return "";
+}
+var init_hook_dispatch = __esm(() => {
+  init_hook_handler();
+  init_session_start_handler();
+  init_entity_extractor();
+  init_batch_queue();
+  init_proactive_retrieval();
+});
+
+// src/worker/worker-client.ts
+import { existsSync as existsSync12, readFileSync as readFileSync8, writeFileSync as writeFileSync6 } from "fs";
+import { join as join12 } from "path";
+import { homedir as homedir11 } from "os";
+
+// src/worker/worker-server.ts
+init_logger();
+init_hook_dispatch();
+import { join as join11 } from "path";
+import { homedir as homedir10 } from "os";
+var log18 = createLogger("worker");
+var DEFAULT_WORKER_PORT = 37889;
+var IDLE_EXIT_MS = 6 * 60 * 60 * 1000;
+var PID_PATH = join11(homedir10(), ".claude-memory-hub", "worker.pid");
+var VALID_EVENTS = new Set([
+  "session-start",
+  "user-prompt-submit",
+  "post-tool-use",
+  "session-end",
+  "pre-compact",
+  "post-compact"
+]);
+function getWorkerPort() {
+  return Number(process.env["CLAUDE_MEMORY_HUB_WORKER_PORT"]) || DEFAULT_WORKER_PORT;
+}
+
+// src/worker/worker-client.ts
+var HOOK_TIMEOUT_MS = 4000;
+var SPAWN_THROTTLE_MS = 30000;
+var STABLE_DIR = join12(homedir11(), ".claude-memory-hub");
+var SPAWN_MARKER = join12(STABLE_DIR, "worker-spawn.json");
+async function callWorkerHook(event, raw, cwd) {
+  if (process.env["CLAUDE_MEMORY_HUB_WORKER"] === "disabled")
+    return;
+  try {
+    const res = await fetch(`http://127.0.0.1:${getWorkerPort()}/hook/${event}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ raw, cwd }),
+      signal: AbortSignal.timeout(HOOK_TIMEOUT_MS)
+    });
+    if (!res.ok)
+      return;
+    const data = await res.json();
+    return typeof data.out === "string" ? data.out : "";
+  } catch {
+    ensureWorkerSpawned();
+    return;
+  }
+}
+function ensureWorkerSpawned() {
+  try {
+    if (process.env["CLAUDE_MEMORY_HUB_WORKER"] === "disabled")
+      return;
+    try {
+      if (existsSync12(SPAWN_MARKER)) {
+        const parsed = JSON.parse(readFileSync8(SPAWN_MARKER, "utf-8"));
+        if (typeof parsed.at === "number" && Date.now() - parsed.at < SPAWN_THROTTLE_MS)
+          return;
+      }
+    } catch {}
+    writeFileSync6(SPAWN_MARKER, JSON.stringify({ at: Date.now() }), "utf-8");
+    const entry = join12(STABLE_DIR, "dist", "worker.js");
+    if (!existsSync12(entry))
+      return;
+    const proc = Bun.spawn([process.execPath, "run", entry], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      env: { ...process.env, CLAUDE_MEMORY_HUB_SKIP_HOOKS: "" }
+    });
+    proc.unref();
+  } catch {}
+}
 
 // src/hooks-entry/pre-compact.ts
 async function main() {
@@ -3603,14 +4817,16 @@ async function main() {
   const raw = await Bun.stdin.text();
   if (!raw.trim())
     return;
-  let hook;
-  try {
-    hook = JSON.parse(raw);
-  } catch {
+  const cwd = process.env["CLAUDE_CWD"] ?? process.cwd();
+  const viaWorker = await callWorkerHook("pre-compact", raw, cwd);
+  if (viaWorker !== undefined) {
+    if (viaWorker)
+      process.stdout.write(viaWorker);
     return;
   }
-  const instructions = await handlePreCompact(hook, projectFromCwd(process.env["CLAUDE_CWD"] ?? process.cwd()));
-  if (instructions.trim())
-    process.stdout.write(instructions);
+  const { dispatchHookEvent: dispatchHookEvent2 } = await Promise.resolve().then(() => (init_hook_dispatch(), exports_hook_dispatch));
+  const out = await dispatchHookEvent2("pre-compact", raw, cwd);
+  if (out)
+    process.stdout.write(out);
 }
 main().catch(() => {}).finally(() => process.exit(0));

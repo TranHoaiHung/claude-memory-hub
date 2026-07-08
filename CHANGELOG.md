@@ -5,6 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.16.0] - 2026-07-08
+
+**Persistent worker (~20× faster hooks), codegraph integration, and a critical FTS trigger fix.**
+
+### Worker service (architecture cue from claude-mem)
+
+Hooks were short-lived bun processes paying a cold start (embedding model, registry scan, SQLite open) on every lifecycle event — measured 981ms for UserPromptSubmit. v0.16.0 adds a persistent worker holding everything warm:
+
+- `dist/worker.js` — localhost HTTP server (port 37889, `CLAUDE_MEMORY_HUB_WORKER_PORT`) exposing `/hook/<event>` + `/health`. Idle self-shutdown after 6h.
+- Hooks become thin transports: try the worker (~5ms POST), **fall back to identical in-process dispatch when unreachable** — the worker accelerates, it can never break memory capture. Measured: **981ms → 45-54ms** per prompt hook.
+- **Auto-spawn**: the first hook that misses the worker spawns it detached (throttled to one attempt/30s across concurrent hooks); the next event hits it warm. Zero configuration.
+- All lifecycle logic now lives in one dispatcher (`worker/hook-dispatch.ts` + `worker/session-end-pipeline.ts`) shared by both transports — hooks-entry files are 23 lines each.
+- CLI: `worker start | stop | status`.
+- Env: `CLAUDE_MEMORY_HUB_WORKER=disabled` forces the local path.
+
+### Codegraph integration (structure + behavior in one view)
+
+If a repo has a [codegraph](https://github.com/colbymchenry/codegraph) index (`.codegraph/codegraph.db`), `memory_impact` (MCP + viewer panel) now joins their **structural call graph** with our **behavioral graph**: calls / called-by alongside co-edited, past errors, and decisions. Read-only, schema resolved by introspection, silently absent when codegraph is not installed.
+
+### Fixed: broken fts_messages delete trigger (migration v11)
+
+`fts_messages` is a standalone FTS5 table, but its delete trigger used the external-content `'delete'`-command syntax — **every `DELETE FROM messages` has thrown "SQL logic error" since v5**. It went unnoticed because nothing deleted messages until now. v11 recreates the trigger with a plain `DELETE` and rebuilds the index. Regression test included.
+
+### Test infrastructure
+
+- `CLAUDE_MEMORY_HUB_EMBEDDINGS=disabled` + `CLAUDE_MEMORY_HUB_WORKER=disabled` in test preload — the native onnx runtime crashed bun:test intermittently; production paths unaffected.
+- 233 tests (worker HTTP end-to-end, dispatcher, codegraph fixture, FTS trigger regression).
+
+---
+
 ## [0.15.2] - 2026-07-08
 
 **Obsidian-style graph view in the browser dashboard.**

@@ -288,8 +288,7 @@ function applyMigrations(db) {
     db.run(`
       CREATE TRIGGER IF NOT EXISTS fts_messages_delete
         AFTER DELETE ON messages BEGIN
-          INSERT INTO fts_messages(fts_messages, rowid, session_id, role, content)
-          VALUES ('delete', old.id, old.session_id, old.role, old.content);
+          DELETE FROM fts_messages WHERE rowid = old.id;
         END
     `);
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
@@ -419,6 +418,21 @@ function applyMigrations(db) {
     } catch {}
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
     log.info("Migration v10 complete");
+  }
+  if (currentVersion < 11) {
+    log.info("Applying migration v11: fix fts_messages delete trigger");
+    db.run("DROP TRIGGER IF EXISTS fts_messages_delete");
+    db.run(`
+      CREATE TRIGGER fts_messages_delete
+        AFTER DELETE ON messages BEGIN
+          DELETE FROM fts_messages WHERE rowid = old.id;
+        END
+    `);
+    try {
+      db.run("INSERT INTO fts_messages(fts_messages) VALUES('rebuild')");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (11, ?)", [Date.now()]);
+    log.info("Migration v11 complete");
   }
 }
 function getDatabase() {
@@ -563,14 +577,7 @@ var init_schema = __esm(() => {
   log = createLogger("schema");
 });
 
-// src/capture/batch-queue.ts
-import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync2 } from "fs";
-import { join as join4 } from "path";
-import { homedir as homedir4 } from "os";
-
 // src/db/session-store.ts
-init_schema();
-
 class SessionStore {
   db;
   constructor(db) {
@@ -713,28 +720,11 @@ class SessionStore {
     }
   }
 }
+var init_session_store = __esm(() => {
+  init_schema();
+});
 
 // src/context/resource-tracker.ts
-init_schema();
-var SCHEMA_ADDITIONS = `
-CREATE TABLE IF NOT EXISTS resource_usage (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id  TEXT NOT NULL,
-  project     TEXT NOT NULL,
-  resource_type TEXT NOT NULL
-    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
-  resource_name TEXT NOT NULL,
-  use_count   INTEGER NOT NULL DEFAULT 1,
-  token_cost  INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
-CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
-CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
-CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
-`;
-
 class ResourceTracker {
   db;
   initialized = false;
@@ -799,18 +789,32 @@ class ResourceTracker {
     return { total_token_cost: total, resource_count: count, by_type };
   }
 }
+var SCHEMA_ADDITIONS = `
+CREATE TABLE IF NOT EXISTS resource_usage (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id  TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  resource_type TEXT NOT NULL
+    CHECK(resource_type IN ('skill','agent','command','workflow','claude_md','memory','mcp_tool','hook')),
+  resource_name TEXT NOT NULL,
+  use_count   INTEGER NOT NULL DEFAULT 1,
+  token_cost  INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_session  ON resource_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_project  ON resource_usage(project);
+CREATE INDEX IF NOT EXISTS idx_resource_name     ON resource_usage(resource_name);
+CREATE INDEX IF NOT EXISTS idx_resource_type     ON resource_usage(resource_type);
+`;
+var init_resource_tracker = __esm(() => {
+  init_schema();
+});
 
 // src/context/resource-registry.ts
-init_logger();
 import { existsSync as existsSync3, readdirSync, statSync, readFileSync } from "fs";
 import { join as join3, basename, relative } from "path";
 import { homedir as homedir3 } from "os";
-var log2 = createLogger("resource-registry");
-var CHARS_PER_TOKEN = 3.75;
-var SCAN_TTL_MS = 5 * 60 * 1000;
-var SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
-var SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
-var MAX_DIR_WALK_DEPTH = 5;
 
 class ResourceRegistry {
   resources = new Map;
@@ -1257,22 +1261,25 @@ class ResourceRegistry {
     return this.listMdFiles(dir).reduce((sum, f) => sum + this.charsToTokens(this.readFileSize(f)), 0);
   }
 }
-var _instance;
 function getResourceRegistry() {
   if (!_instance)
     _instance = new ResourceRegistry;
   return _instance;
 }
+var log2, CHARS_PER_TOKEN = 3.75, SCAN_TTL_MS, SAFE_NAME_RE, SAFE_COMMAND_NAME_RE, MAX_DIR_WALK_DEPTH = 5, _instance;
+var init_resource_registry = __esm(() => {
+  init_logger();
+  init_resource_tracker();
+  log2 = createLogger("resource-registry");
+  SCAN_TTL_MS = 5 * 60 * 1000;
+  SAFE_NAME_RE = /^[a-zA-Z0-9_\-:.]+$/;
+  SAFE_COMMAND_NAME_RE = /^[a-zA-Z0-9_\-:.\/]+$/;
+});
 
 // src/capture/batch-queue.ts
-init_logger();
-var log3 = createLogger("batch-queue");
-var DATA_DIR = join4(homedir4(), ".claude-memory-hub");
-var BATCH_DIR = join4(DATA_DIR, "batch");
-var QUEUE_PATH = join4(BATCH_DIR, "queue.jsonl");
-var LOCK_PATH = join4(BATCH_DIR, "queue.lock");
-var MAX_QUEUE_SIZE = 100 * 1024;
-var LOCK_STALE_MS = 30000;
+import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync, appendFileSync as appendFileSync2, unlinkSync, statSync as statSync2 } from "fs";
+import { join as join4 } from "path";
+import { homedir as homedir4 } from "os";
 function enqueueEvent(event) {
   try {
     ensureBatchDir();
@@ -1379,8 +1386,22 @@ function isBatchEnabled() {
   const mode = process.env["CLAUDE_MEMORY_HUB_BATCH"] ?? "auto";
   return mode !== "disabled";
 }
+var log3, DATA_DIR, BATCH_DIR, QUEUE_PATH, LOCK_PATH, MAX_QUEUE_SIZE, LOCK_STALE_MS = 30000;
+var init_batch_queue = __esm(() => {
+  init_session_store();
+  init_resource_tracker();
+  init_resource_registry();
+  init_logger();
+  log3 = createLogger("batch-queue");
+  DATA_DIR = join4(homedir4(), ".claude-memory-hub");
+  BATCH_DIR = join4(DATA_DIR, "batch");
+  QUEUE_PATH = join4(BATCH_DIR, "queue.jsonl");
+  LOCK_PATH = join4(BATCH_DIR, "queue.lock");
+  MAX_QUEUE_SIZE = 100 * 1024;
+});
 
 // src/hooks-entry/stop.ts
+init_batch_queue();
 async function main() {
   if (process.env["CLAUDE_MEMORY_HUB_SKIP_HOOKS"] === "1")
     return;

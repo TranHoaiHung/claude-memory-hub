@@ -1,6 +1,6 @@
 {
   "name": "claude-memory-hub",
-  "version": "0.15.2",
+  "version": "0.16.0",
   "description": "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + Obsidian export.",
   "type": "module",
   "main": "dist/index.js",
@@ -19,7 +19,8 @@
     "build": "bun build src/index.ts --outdir dist --target bun --entry-naming [name].js --external @huggingface/transformers",
     "build:cli": "bun build src/cli/main.ts --outdir dist --target bun --entry-naming cli.js --external @huggingface/transformers",
     "build:hooks": "bun build src/hooks-entry/post-tool-use.ts src/hooks-entry/session-end.ts src/hooks-entry/session-start.ts src/hooks-entry/stop.ts src/hooks-entry/user-prompt-submit.ts src/hooks-entry/pre-compact.ts src/hooks-entry/post-compact.ts --outdir dist/hooks --target bun --entry-naming [name].js --external @huggingface/transformers",
-    "build:all": "bun run build && bun run build:cli && bun run build:hooks",
+    "build:worker": "bun build src/worker/worker-main.ts --outdir dist --target bun --entry-naming worker.js --external @huggingface/transformers",
+    "build:all": "bun run build && bun run build:cli && bun run build:hooks && bun run build:worker",
     "dev": "bun run --watch src/index.ts",
     "prepublishOnly": "test -f dist/index.js || bun run build:all",
     "typecheck": "tsc --noEmit",

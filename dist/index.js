@@ -6775,8 +6775,7 @@ function applyMigrations(db) {
     db.run(`
       CREATE TRIGGER IF NOT EXISTS fts_messages_delete
         AFTER DELETE ON messages BEGIN
-          INSERT INTO fts_messages(fts_messages, rowid, session_id, role, content)
-          VALUES ('delete', old.id, old.session_id, old.role, old.content);
+          DELETE FROM fts_messages WHERE rowid = old.id;
         END
     `);
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (5, ?)", [Date.now()]);
@@ -6906,6 +6905,21 @@ function applyMigrations(db) {
     } catch {}
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (10, ?)", [Date.now()]);
     log.info("Migration v10 complete");
+  }
+  if (currentVersion < 11) {
+    log.info("Applying migration v11: fix fts_messages delete trigger");
+    db.run("DROP TRIGGER IF EXISTS fts_messages_delete");
+    db.run(`
+      CREATE TRIGGER fts_messages_delete
+        AFTER DELETE ON messages BEGIN
+          DELETE FROM fts_messages WHERE rowid = old.id;
+        END
+    `);
+    try {
+      db.run("INSERT INTO fts_messages(fts_messages) VALUES('rebuild')");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (11, ?)", [Date.now()]);
+    log.info("Migration v11 complete");
   }
 }
 function getDatabase() {
@@ -9840,6 +9854,110 @@ var init_hook_handler = __esm(() => {
   init_injection_state();
 });
 
+// src/graph/codegraph-bridge.ts
+var exports_codegraph_bridge = {};
+__export(exports_codegraph_bridge, {
+  getCodegraphCalls: () => getCodegraphCalls,
+  findCodegraphDb: () => findCodegraphDb
+});
+import { existsSync as existsSync8 } from "fs";
+import { dirname as dirname2, join as join8 } from "path";
+import { Database as Database2 } from "bun:sqlite";
+function findCodegraphDb(startDir) {
+  let dir = startDir;
+  for (let i = 0;i < WALK_UP_LEVELS; i++) {
+    const candidate = join8(dir, ".codegraph", "codegraph.db");
+    if (existsSync8(candidate))
+      return candidate;
+    const parent = dirname2(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return null;
+}
+function getCodegraphCalls(filePath) {
+  if (!filePath.startsWith("/"))
+    return null;
+  const dbPath = findCodegraphDb(dirname2(filePath));
+  if (!dbPath)
+    return null;
+  try {
+    const db = new Database2(dbPath, { readonly: true });
+    try {
+      const schema = resolveSchema(dbPath, db);
+      if (!schema)
+        return null;
+      const like = `%${filePath.split("/").slice(-3).join("/")}`;
+      const kindFilter = schema.edgeKind ? `AND e.${schema.edgeKind} IN ('calls','call','CALLS')` : "";
+      const calls = db.prepare(`SELECT DISTINCT d.${schema.symName} as name, d.${schema.symFile} as file
+         FROM ${schema.edgeTable} e
+         JOIN ${schema.symbolTable} s ON s.${schema.symId} = e.${schema.edgeSrc}
+         JOIN ${schema.symbolTable} d ON d.${schema.symId} = e.${schema.edgeDst}
+         WHERE s.${schema.symFile} LIKE ? ${kindFilter}
+           AND d.${schema.symFile} NOT LIKE ?
+         LIMIT ?`).all(like, like, MAX_RESULTS);
+      const calledBy = db.prepare(`SELECT DISTINCT s.${schema.symName} as name, s.${schema.symFile} as file
+         FROM ${schema.edgeTable} e
+         JOIN ${schema.symbolTable} s ON s.${schema.symId} = e.${schema.edgeSrc}
+         JOIN ${schema.symbolTable} d ON d.${schema.symId} = e.${schema.edgeDst}
+         WHERE d.${schema.symFile} LIKE ? ${kindFilter}
+           AND s.${schema.symFile} NOT LIKE ?
+         LIMIT ?`).all(like, like, MAX_RESULTS);
+      if (calls.length === 0 && calledBy.length === 0)
+        return null;
+      const fmt = (r) => `${r.name} (${(r.file || "").split("/").pop()})`;
+      return { calls: calls.map(fmt), called_by: calledBy.map(fmt) };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+function resolveSchema(dbPath, db) {
+  const cached2 = schemaCache.get(dbPath);
+  if (cached2 !== undefined)
+    return cached2;
+  const result = introspect(db);
+  schemaCache.set(dbPath, result);
+  return result;
+}
+function introspect(db) {
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((t) => t.name);
+  const symbolTable = pick2(tables, ["symbols", "symbol", "nodes", "definitions"]);
+  const edgeTable = pick2(tables, ["edges", "edge", "refs", "references", "relationships", "calls"]);
+  if (!symbolTable || !edgeTable)
+    return null;
+  const symCols = columns(db, symbolTable);
+  const edgeCols = columns(db, edgeTable);
+  const symId = pick2(symCols, ["id", "symbol_id", "rowid"]);
+  const symName = pick2(symCols, ["name", "symbol", "identifier"]);
+  const symFile = pick2(symCols, ["file", "path", "file_path", "filepath"]);
+  const edgeSrc = pick2(edgeCols, ["src", "source", "from_id", "source_id", "caller_id", "from"]);
+  const edgeDst = pick2(edgeCols, ["dst", "target", "to_id", "target_id", "callee_id", "to"]);
+  const edgeKind = pick2(edgeCols, ["kind", "type", "edge_type", "rel"]);
+  if (!symId || !symName || !symFile || !edgeSrc || !edgeDst)
+    return null;
+  return { symbolTable, symId, symName, symFile, edgeTable, edgeSrc, edgeDst, edgeKind: edgeKind ?? null };
+}
+function columns(db, table) {
+  return db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all().map((c) => c.name);
+}
+function pick2(available, candidates) {
+  const lower = new Map(available.map((a) => [a.toLowerCase(), a]));
+  for (const c of candidates) {
+    const hit = lower.get(c);
+    if (hit)
+      return hit;
+  }
+  return null;
+}
+var MAX_RESULTS = 15, WALK_UP_LEVELS = 12, schemaCache;
+var init_codegraph_bridge = __esm(() => {
+  schemaCache = new Map;
+});
+
 // src/graph/graph-queries.ts
 var exports_graph_queries = {};
 __export(exports_graph_queries, {
@@ -9883,7 +10001,9 @@ function getFileImpact(file, db) {
     decisions: [],
     sessions: [],
     imports: [],
-    imported_by: []
+    imported_by: [],
+    calls: [],
+    called_by: []
   };
   const isTarget = (k) => k.includes(file);
   for (const e of rows) {
@@ -9917,6 +10037,17 @@ function getFileImpact(file, db) {
         break;
     }
   }
+  try {
+    const anchor = file.startsWith("/") ? file : rows.map((e) => [e.src_key, e.dst_key]).flat().find((k) => k.startsWith("/") && k.includes(file));
+    if (anchor) {
+      const { getCodegraphCalls: getCodegraphCalls2 } = (init_codegraph_bridge(), __toCommonJS(exports_codegraph_bridge));
+      const cg = getCodegraphCalls2(anchor);
+      if (cg) {
+        report.calls = cg.calls;
+        report.called_by = cg.called_by;
+      }
+    }
+  } catch {}
   return report;
 }
 function countEdges(db) {
@@ -18139,6 +18270,10 @@ async function handleMemoryImpact(args) {
     lines.push(`**Imports:** ${report.imports.join(", ")}`, "");
   if (report.imported_by.length > 0)
     lines.push(`**Imported by:** ${report.imported_by.join(", ")}`, "");
+  if (report.calls.length > 0)
+    lines.push(`**Calls (codegraph):** ${report.calls.join(", ")}`, "");
+  if (report.called_by.length > 0)
+    lines.push(`**Called by (codegraph):** ${report.called_by.join(", ")}`, "");
   if (report.sessions.length > 0) {
     lines.push(`**Touched by ${report.sessions.length} session(s)** \u2014 use \`memory_conversation\` with a session_id for details:`);
     for (const s of report.sessions.slice(0, 5))
