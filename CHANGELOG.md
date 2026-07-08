@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.16.1] - 2026-07-08
+
+**Worker reliability guards — every prompt is now guaranteed fresh code and bounded latency.**
+
+Two failure modes found by dogfooding v0.16.0 on day one:
+
+- **Version-skew guard**: a long-lived worker kept serving STALE code after a new dist was deployed (observed live). The worker now remembers its entry file's mtime; when `dist/worker.js` changes on disk it finishes the in-flight response and exits — the next hook auto-spawns the new code. Verified end-to-end (deploy → self-exit → respawn with new pid).
+- **Hung-worker watchdog**: a connection REFUSED means no worker (spawn one), but a TIMEOUT means a zombie owns the port — spawning is useless. After 2 consecutive timeouts the client kills the pid from `worker.pid` and respawns. Worst case per prompt is bounded: 4s timeout → in-process fallback still injects correctly.
+
+---
+
 ## [0.16.0] - 2026-07-08
 
 **Persistent worker (~20× faster hooks), codegraph integration, and a critical FTS trigger fix.**

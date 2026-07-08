@@ -4736,7 +4736,7 @@ var init_hook_dispatch = __esm(() => {
 });
 
 // src/worker/worker-client.ts
-import { existsSync as existsSync12, readFileSync as readFileSync8, writeFileSync as writeFileSync6 } from "fs";
+import { existsSync as existsSync12, readFileSync as readFileSync8, unlinkSync as unlinkSync3, writeFileSync as writeFileSync6 } from "fs";
 import { join as join12 } from "path";
 import { homedir as homedir11 } from "os";
 
@@ -4764,8 +4764,11 @@ function getWorkerPort() {
 // src/worker/worker-client.ts
 var HOOK_TIMEOUT_MS = 4000;
 var SPAWN_THROTTLE_MS = 30000;
+var HUNG_KILL_THRESHOLD = 2;
 var STABLE_DIR = join12(homedir11(), ".claude-memory-hub");
 var SPAWN_MARKER = join12(STABLE_DIR, "worker-spawn.json");
+var TIMEOUT_MARKER = join12(STABLE_DIR, "worker-timeouts.json");
+var PID_PATH2 = join12(STABLE_DIR, "worker.pid");
 async function callWorkerHook(event, raw, cwd) {
   if (process.env["CLAUDE_MEMORY_HUB_WORKER"] === "disabled")
     return;
@@ -4779,11 +4782,47 @@ async function callWorkerHook(event, raw, cwd) {
     if (!res.ok)
       return;
     const data = await res.json();
+    clearTimeoutStreak();
     return typeof data.out === "string" ? data.out : "";
-  } catch {
-    ensureWorkerSpawned();
+  } catch (err) {
+    if (isTimeout(err))
+      recordTimeoutAndMaybeKill();
+    else
+      ensureWorkerSpawned();
     return;
   }
+}
+function isTimeout(err) {
+  const name = err?.name ?? "";
+  return name === "TimeoutError" || name === "AbortError";
+}
+function clearTimeoutStreak() {
+  try {
+    if (existsSync12(TIMEOUT_MARKER))
+      unlinkSync3(TIMEOUT_MARKER);
+  } catch {}
+}
+function recordTimeoutAndMaybeKill() {
+  try {
+    let count = 0;
+    try {
+      if (existsSync12(TIMEOUT_MARKER)) {
+        count = Number(JSON.parse(readFileSync8(TIMEOUT_MARKER, "utf-8")).count) || 0;
+      }
+    } catch {}
+    count++;
+    writeFileSync6(TIMEOUT_MARKER, JSON.stringify({ count, at: Date.now() }), "utf-8");
+    if (count >= HUNG_KILL_THRESHOLD && existsSync12(PID_PATH2)) {
+      const pid = Number(readFileSync8(PID_PATH2, "utf-8"));
+      if (pid > 1) {
+        try {
+          process.kill(pid);
+        } catch {}
+      }
+      clearTimeoutStreak();
+      ensureWorkerSpawned();
+    }
+  } catch {}
 }
 function ensureWorkerSpawned() {
   try {

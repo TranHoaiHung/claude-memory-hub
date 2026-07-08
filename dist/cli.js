@@ -7267,7 +7267,7 @@ __export(exports_worker_server, {
   getWorkerPort: () => getWorkerPort,
   DEFAULT_WORKER_PORT: () => DEFAULT_WORKER_PORT
 });
-import { existsSync as existsSync18, mkdirSync as mkdirSync7, unlinkSync as unlinkSync3, writeFileSync as writeFileSync7 } from "fs";
+import { existsSync as existsSync18, mkdirSync as mkdirSync7, statSync as statSync9, unlinkSync as unlinkSync3, writeFileSync as writeFileSync7 } from "fs";
 import { join as join18 } from "path";
 import { homedir as homedir13 } from "os";
 function getWorkerPort() {
@@ -7277,6 +7277,23 @@ function startWorker() {
   const port = getWorkerPort();
   const startedAt = Date.now();
   let lastRequestAt = Date.now();
+  const entryPath = join18(homedir13(), ".claude-memory-hub", "dist", "worker.js");
+  const entryMtime = safeMtime(entryPath);
+  let exitScheduled = false;
+  const maybeScheduleRestart = () => {
+    if (exitScheduled || entryMtime === null)
+      return;
+    if (safeMtime(entryPath) !== entryMtime) {
+      exitScheduled = true;
+      log25.info("worker entry changed on disk \u2014 restarting after response");
+      setTimeout(() => {
+        try {
+          unlinkSync3(PID_PATH);
+        } catch {}
+        process.exit(0);
+      }, 250);
+    }
+  };
   let server;
   try {
     server = Bun.serve({
@@ -7299,6 +7316,7 @@ function startWorker() {
           try {
             const body = await req.json();
             const out = await dispatchHookEvent(event, body.raw ?? "", body.cwd ?? process.cwd(), { inWorker: true });
+            maybeScheduleRestart();
             return json2({ out });
           } catch (err) {
             log25.error("worker dispatch failed", { event, error: String(err) });
@@ -7340,6 +7358,13 @@ function json2(data, status = 200) {
     headers: { "Content-Type": "application/json" }
   });
 }
+function safeMtime(path) {
+  try {
+    return statSync9(path).mtimeMs;
+  } catch {
+    return null;
+  }
+}
 var log25, DEFAULT_WORKER_PORT = 37889, IDLE_EXIT_MS, PID_PATH, VALID_EVENTS;
 var init_worker_server = __esm(() => {
   init_logger();
@@ -7364,7 +7389,7 @@ __export(exports_worker_client, {
   ensureWorkerSpawned: () => ensureWorkerSpawned,
   callWorkerHook: () => callWorkerHook
 });
-import { existsSync as existsSync19, readFileSync as readFileSync10, writeFileSync as writeFileSync8 } from "fs";
+import { existsSync as existsSync19, readFileSync as readFileSync10, unlinkSync as unlinkSync4, writeFileSync as writeFileSync8 } from "fs";
 import { join as join19 } from "path";
 import { homedir as homedir14 } from "os";
 async function callWorkerHook(event, raw, cwd) {
@@ -7380,11 +7405,47 @@ async function callWorkerHook(event, raw, cwd) {
     if (!res.ok)
       return;
     const data = await res.json();
+    clearTimeoutStreak();
     return typeof data.out === "string" ? data.out : "";
-  } catch {
-    ensureWorkerSpawned();
+  } catch (err) {
+    if (isTimeout(err))
+      recordTimeoutAndMaybeKill();
+    else
+      ensureWorkerSpawned();
     return;
   }
+}
+function isTimeout(err) {
+  const name = err?.name ?? "";
+  return name === "TimeoutError" || name === "AbortError";
+}
+function clearTimeoutStreak() {
+  try {
+    if (existsSync19(TIMEOUT_MARKER))
+      unlinkSync4(TIMEOUT_MARKER);
+  } catch {}
+}
+function recordTimeoutAndMaybeKill() {
+  try {
+    let count = 0;
+    try {
+      if (existsSync19(TIMEOUT_MARKER)) {
+        count = Number(JSON.parse(readFileSync10(TIMEOUT_MARKER, "utf-8")).count) || 0;
+      }
+    } catch {}
+    count++;
+    writeFileSync8(TIMEOUT_MARKER, JSON.stringify({ count, at: Date.now() }), "utf-8");
+    if (count >= HUNG_KILL_THRESHOLD && existsSync19(PID_PATH2)) {
+      const pid = Number(readFileSync10(PID_PATH2, "utf-8"));
+      if (pid > 1) {
+        try {
+          process.kill(pid);
+        } catch {}
+      }
+      clearTimeoutStreak();
+      ensureWorkerSpawned();
+    }
+  } catch {}
 }
 function ensureWorkerSpawned() {
   try {
@@ -7422,11 +7483,13 @@ async function workerHealth() {
     return { ok: false };
   }
 }
-var HOOK_TIMEOUT_MS = 4000, SPAWN_THROTTLE_MS = 30000, STABLE_DIR2, SPAWN_MARKER;
+var HOOK_TIMEOUT_MS = 4000, SPAWN_THROTTLE_MS = 30000, HUNG_KILL_THRESHOLD = 2, STABLE_DIR2, SPAWN_MARKER, TIMEOUT_MARKER, PID_PATH2;
 var init_worker_client = __esm(() => {
   init_worker_server();
   STABLE_DIR2 = join19(homedir14(), ".claude-memory-hub");
   SPAWN_MARKER = join19(STABLE_DIR2, "worker-spawn.json");
+  TIMEOUT_MARKER = join19(STABLE_DIR2, "worker-timeouts.json");
+  PID_PATH2 = join19(STABLE_DIR2, "worker.pid");
 });
 
 // src/cli/daemon.ts
@@ -7511,7 +7574,7 @@ var exports_code_scanner = {};
 __export(exports_code_scanner, {
   scanRepoImports: () => scanRepoImports
 });
-import { readdirSync as readdirSync3, readFileSync as readFileSync11, statSync as statSync9, existsSync as existsSync21 } from "fs";
+import { readdirSync as readdirSync3, readFileSync as readFileSync11, statSync as statSync10, existsSync as existsSync21 } from "fs";
 import { join as join21, dirname as dirname3, resolve, extname } from "path";
 function scanRepoImports(repoPath, project, db) {
   const d = db ?? getDatabase();
@@ -7566,7 +7629,7 @@ function collectFiles(root, acc = []) {
       continue;
     const full = join21(root, entry);
     try {
-      const stat = statSync9(full);
+      const stat = statSync10(full);
       if (stat.isDirectory()) {
         collectFiles(full, acc);
       } else if (SCAN_EXTENSIONS.has(extname(entry))) {
@@ -7581,7 +7644,7 @@ function resolveImport(fromFile, spec) {
   for (const suffix of RESOLVE_SUFFIXES) {
     const candidate = base + suffix;
     try {
-      if (existsSync21(candidate) && statSync9(candidate).isFile())
+      if (existsSync21(candidate) && statSync10(candidate).isFile())
         return candidate;
     } catch {}
   }
@@ -7724,7 +7787,7 @@ var init_stats = __esm(() => {
 });
 
 // src/cli/main.ts
-import { existsSync as existsSync22, mkdirSync as mkdirSync9, readFileSync as readFileSync12, writeFileSync as writeFileSync10, readdirSync as readdirSync4, unlinkSync as unlinkSync4 } from "fs";
+import { existsSync as existsSync22, mkdirSync as mkdirSync9, readFileSync as readFileSync12, writeFileSync as writeFileSync10, readdirSync as readdirSync4, unlinkSync as unlinkSync5 } from "fs";
 import { homedir as homedir16 } from "os";
 import { join as join22, resolve as resolve2, dirname as dirname4 } from "path";
 
@@ -8165,7 +8228,7 @@ function uninstallCommands() {
     const p = join22(COMMANDS_DIR, file);
     try {
       if (existsSync22(p))
-        unlinkSync4(p);
+        unlinkSync5(p);
     } catch {}
   }
 }
@@ -8301,8 +8364,8 @@ function status() {
   console.log(`  Hooks:       ${hookCount}/5 registered`);
   console.log(`  Database:    ${hasData ? "exists" : "not created yet"}`);
   if (hasData) {
-    const { statSync: statSync10 } = __require("fs");
-    const stats = statSync10(join22(dataDir, "memory.db"));
+    const { statSync: statSync11 } = __require("fs");
+    const stats = statSync11(join22(dataDir, "memory.db"));
     console.log(`  DB size:     ${(stats.size / 1024).toFixed(1)} KB`);
   }
   if (!hasMcp || hookCount < 5) {
@@ -8427,7 +8490,7 @@ switch (command) {
       startWorker2();
       await new Promise(() => {});
     } else if (sub === "stop") {
-      const { readFileSync: readFileSync13, existsSync: existsSync23, unlinkSync: unlinkSync5 } = __require("fs");
+      const { readFileSync: readFileSync13, existsSync: existsSync23, unlinkSync: unlinkSync6 } = __require("fs");
       const { join: join23 } = __require("path");
       const { homedir: homedir17 } = __require("os");
       const pidPath = join23(homedir17(), ".claude-memory-hub", "worker.pid");
@@ -8440,7 +8503,7 @@ switch (command) {
           console.log("Worker pid file found but process not running.");
         }
         try {
-          unlinkSync5(pidPath);
+          unlinkSync6(pidPath);
         } catch {}
       } else {
         console.log("No worker pid file \u2014 worker not running.");

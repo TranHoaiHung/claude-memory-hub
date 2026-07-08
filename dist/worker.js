@@ -4526,7 +4526,7 @@ var init_compact_interceptor = __esm(() => {
 
 // src/worker/worker-server.ts
 init_logger();
-import { existsSync as existsSync12, mkdirSync as mkdirSync7, unlinkSync as unlinkSync3, writeFileSync as writeFileSync6 } from "fs";
+import { existsSync as existsSync12, mkdirSync as mkdirSync7, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync6 } from "fs";
 import { join as join11 } from "path";
 import { homedir as homedir10 } from "os";
 
@@ -4754,6 +4754,23 @@ function startWorker() {
   const port = getWorkerPort();
   const startedAt = Date.now();
   let lastRequestAt = Date.now();
+  const entryPath = join11(homedir10(), ".claude-memory-hub", "dist", "worker.js");
+  const entryMtime = safeMtime(entryPath);
+  let exitScheduled = false;
+  const maybeScheduleRestart = () => {
+    if (exitScheduled || entryMtime === null)
+      return;
+    if (safeMtime(entryPath) !== entryMtime) {
+      exitScheduled = true;
+      log18.info("worker entry changed on disk \u2014 restarting after response");
+      setTimeout(() => {
+        try {
+          unlinkSync3(PID_PATH);
+        } catch {}
+        process.exit(0);
+      }, 250);
+    }
+  };
   let server;
   try {
     server = Bun.serve({
@@ -4776,6 +4793,7 @@ function startWorker() {
           try {
             const body = await req.json();
             const out = await dispatchHookEvent(event, body.raw ?? "", body.cwd ?? process.cwd(), { inWorker: true });
+            maybeScheduleRestart();
             return json({ out });
           } catch (err) {
             log18.error("worker dispatch failed", { event, error: String(err) });
@@ -4816,6 +4834,13 @@ function json(data, status = 200) {
     status,
     headers: { "Content-Type": "application/json" }
   });
+}
+function safeMtime(path) {
+  try {
+    return statSync5(path).mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 // src/worker/worker-main.ts
