@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.2] - 2026-07-08
+
+**Windows CI caught what the audit missed — fixed, matrix green.**
+
+The 3-OS CI added in v0.17.1 did its job on the first run: `windows-latest` failed where macOS/Linux passed.
+
+- **Codegraph bridge returned empty on Windows**: codegraph stores native (backslash) paths, our LIKE suffix used forward slashes — zero matches. The path column is now normalized in SQL (`REPLACE(col, '\', '/')`), matching either storage style.
+- Test cleanups use `rmSync(..., { maxRetries })` — Windows runners hold transient file locks (EBUSY).
+
+---
+
 ## [0.17.1] - 2026-07-08
 
 **Windows parity + a clearer install guide.**

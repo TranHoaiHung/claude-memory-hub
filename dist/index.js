@@ -10025,24 +10025,25 @@ function getCodegraphCalls(filePath) {
       if (!schema)
         return null;
       const like = `%${filePath.split(/[\\/]/).slice(-3).join("/")}`;
+      const norm = (col) => `REPLACE(${col}, '\\', '/')`;
       const kindFilter = schema.edgeKind ? `AND e.${schema.edgeKind} IN ('calls','call','CALLS')` : "";
       const calls = db.prepare(`SELECT DISTINCT d.${schema.symName} as name, d.${schema.symFile} as file
          FROM ${schema.edgeTable} e
          JOIN ${schema.symbolTable} s ON s.${schema.symId} = e.${schema.edgeSrc}
          JOIN ${schema.symbolTable} d ON d.${schema.symId} = e.${schema.edgeDst}
-         WHERE s.${schema.symFile} LIKE ? ${kindFilter}
-           AND d.${schema.symFile} NOT LIKE ?
+         WHERE ${norm(`s.${schema.symFile}`)} LIKE ? ${kindFilter}
+           AND ${norm(`d.${schema.symFile}`)} NOT LIKE ?
          LIMIT ?`).all(like, like, MAX_RESULTS);
       const calledBy = db.prepare(`SELECT DISTINCT s.${schema.symName} as name, s.${schema.symFile} as file
          FROM ${schema.edgeTable} e
          JOIN ${schema.symbolTable} s ON s.${schema.symId} = e.${schema.edgeSrc}
          JOIN ${schema.symbolTable} d ON d.${schema.symId} = e.${schema.edgeDst}
-         WHERE d.${schema.symFile} LIKE ? ${kindFilter}
-           AND s.${schema.symFile} NOT LIKE ?
+         WHERE ${norm(`d.${schema.symFile}`)} LIKE ? ${kindFilter}
+           AND ${norm(`s.${schema.symFile}`)} NOT LIKE ?
          LIMIT ?`).all(like, like, MAX_RESULTS);
       if (calls.length === 0 && calledBy.length === 0)
         return null;
-      const fmt = (r) => `${r.name} (${(r.file || "").split("/").pop()})`;
+      const fmt = (r) => `${r.name} (${(r.file || "").split(/[\\/]/).pop()})`;
       return { calls: calls.map(fmt), called_by: calledBy.map(fmt) };
     } finally {
       db.close();
