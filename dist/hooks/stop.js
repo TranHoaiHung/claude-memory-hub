@@ -733,6 +733,19 @@ class SessionStore {
       const existing = this.db.query("SELECT COUNT(*) as c FROM messages WHERE uuid = ?").get(msg.uuid);
       if (existing && existing.c > 0)
         return -1;
+      const live = this.db.query(`SELECT id FROM messages
+           WHERE session_id = ? AND role = ? AND uuid IS NULL
+             AND substr(content, 1, 200) = substr(?, 1, 200)
+           ORDER BY id ASC LIMIT 1`).get(msg.session_id, msg.role, msg.content);
+      if (live) {
+        this.db.run("UPDATE messages SET uuid = ?, parent_uuid = ? WHERE id = ?", [msg.uuid, msg.parent_uuid ?? null, live.id]);
+        return -1;
+      }
+    } else {
+      const recent = this.db.query(`SELECT COUNT(*) c FROM messages
+           WHERE session_id = ? AND role = ? AND content = ? AND timestamp > ?`).get(msg.session_id, msg.role, msg.content, msg.timestamp - 120000);
+      if (recent && recent.c > 0)
+        return -1;
     }
     const result = this.db.run(`INSERT INTO messages(session_id, project, role, content, prompt_number, timestamp, uuid, parent_uuid)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [

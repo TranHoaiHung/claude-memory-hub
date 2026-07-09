@@ -733,6 +733,19 @@ class SessionStore {
       const existing = this.db.query("SELECT COUNT(*) as c FROM messages WHERE uuid = ?").get(msg.uuid);
       if (existing && existing.c > 0)
         return -1;
+      const live = this.db.query(`SELECT id FROM messages
+           WHERE session_id = ? AND role = ? AND uuid IS NULL
+             AND substr(content, 1, 200) = substr(?, 1, 200)
+           ORDER BY id ASC LIMIT 1`).get(msg.session_id, msg.role, msg.content);
+      if (live) {
+        this.db.run("UPDATE messages SET uuid = ?, parent_uuid = ? WHERE id = ?", [msg.uuid, msg.parent_uuid ?? null, live.id]);
+        return -1;
+      }
+    } else {
+      const recent = this.db.query(`SELECT COUNT(*) c FROM messages
+           WHERE session_id = ? AND role = ? AND content = ? AND timestamp > ?`).get(msg.session_id, msg.role, msg.content, msg.timestamp - 120000);
+      if (recent && recent.c > 0)
+        return -1;
     }
     const result = this.db.run(`INSERT INTO messages(session_id, project, role, content, prompt_number, timestamp, uuid, parent_uuid)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
@@ -3035,11 +3048,15 @@ function smartTruncate(text, maxChars) {
 function capForRole(role) {
   return ROLE_CAPS[role];
 }
+function isSyntheticUserMessage(content) {
+  const head = content.trimStart();
+  return head.startsWith("[Request interrupted") || head.startsWith("Base directory for this skill:") || head.startsWith("<command-name>") || head.startsWith("<local-command-");
+}
 var MIN_USEFUL_RATIO = 0.8, MARKER = `
 [truncated]`, ROLE_CAPS;
 var init_smart_truncate = __esm(() => {
   ROLE_CAPS = {
-    user: 2000,
+    user: 4000,
     assistant: 4000
   };
 });
@@ -3197,7 +3214,7 @@ async function handleUserPromptSubmit(hook, project) {
     status: "active"
   });
   const promptText = cleanPrompt || hook.prompt;
-  if (promptText.length > 5) {
+  if (promptText.trim().length > 0 && !isSyntheticUserMessage(promptText)) {
     const promptNum = store.getMessageCount(hook.session_id, "user");
     store.insertMessage({
       session_id: hook.session_id,
@@ -4322,7 +4339,9 @@ async function parseTranscript(transcriptPath, sessionId, project) {
         continue;
       const role = entry.type;
       const content = extractTextContent(entry.message.content);
-      if (!content || content.length < 3)
+      if (!content || content.trim().length === 0)
+        continue;
+      if (role === "user" && isSyntheticUserMessage(content))
         continue;
       if (role === "user" && messages.length > 0)
         promptNumber++;
@@ -4378,7 +4397,7 @@ function extractTextContent(content) {
 function stripNoiseTags(text) {
   return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]*>[\s\S]*?<\/local-command-[\w-]*>\s*/g, "").replace(/<command-[\w-]*>[\s\S]*?<\/command-[\w-]*>\s*/g, "").trim();
 }
-var log14, MAX_FILE_SIZE, MAX_MESSAGES = 200;
+var log14, MAX_FILE_SIZE, MAX_MESSAGES = 500;
 var init_transcript_parser = __esm(() => {
   init_logger();
   init_privacy_filter();

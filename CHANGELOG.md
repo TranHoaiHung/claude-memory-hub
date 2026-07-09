@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.7] - 2026-07-09
+
+**User-prompt capture audit — no misses, no duplicates, no synthetic noise.**
+
+Forensics on one day of real usage found the conversation store was quietly unfaithful:
+
+- **Every resumed session stored each prompt twice**: the live hook saves prompts without a uuid; the SessionEnd transcript parse re-inserted the same prompts WITH uuids (dedup was uuid-only). 610 twin rows found in production. `insertMessage` now upgrades the matching live row with the transcript uuid instead of inserting a duplicate, and a 120s same-content window absorbs worker-timeout double-fires — while genuine repeats ("tiếp tục công việc bên trên" typed again an hour later) are preserved.
+- **Short prompts were dropped**: the live path skipped anything ≤5 chars, so "ok"/"được" confirmations were lost whenever a session didn't end cleanly. Now everything non-empty is captured (verified live end-to-end).
+- **Synthetic messages stored as user prompts**: "[Request interrupted by user…]", Skill-tool payloads ("Base directory for this skill:…"). Both capture paths now filter them (`isSyntheticUserMessage`); 67 existing rows purged.
+- **Marathon sessions truncated**: transcript capture capped at 200 messages (a real session hit 180+ before its first compact) — raised to 500. User prompt storage cap raised 2000 → 4000 chars so long specs keep their tail.
+
+Production data repaired in place (backup taken first): 10,093 → 9,416 messages, all twins and noise removed, genuine repeat counts preserved.
+
+---
+
 ## [0.17.6] - 2026-07-09
 
 **Injection accuracy fixes — from a day of real dogfooding on v0.17.x.**
