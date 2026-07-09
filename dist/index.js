@@ -6590,6 +6590,10 @@ function getDbPath() {
   const override = process.env["CLAUDE_MEMORY_HUB_DB"];
   if (override)
     return override;
+  if (process.env["NODE_ENV"] === "test") {
+    const { tmpdir } = __require("os");
+    return join2(tmpdir(), `cmh-test-${process.pid}.db`);
+  }
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
@@ -9641,7 +9645,12 @@ function buildCuratedSection(notes) {
   const lines = ["**Curated notes (user-maintained, Obsidian vault \u2014 treat as authoritative):**"];
   for (const n of notes) {
     const scope = n.project ? n.project : "global";
-    const body = n.content.replace(/\s+/g, " ").trim().slice(0, NOTE_INJECT_CHARS);
+    const flat = n.content.replace(/\s+/g, " ").trim();
+    let body = flat;
+    if (flat.length > NOTE_INJECT_CHARS) {
+      const cut = flat.slice(0, NOTE_INJECT_CHARS);
+      body = cut.slice(0, Math.max(cut.lastIndexOf(" "), NOTE_INJECT_CHARS - 80)) + " \u2026";
+    }
     lines.push(`- [${scope}] ${n.title}: ${body}`);
   }
   return lines.join(`
@@ -9653,7 +9662,7 @@ function toFtsQuery(text) {
     return "";
   return words.map((w) => `"${w}"`).join(" OR ");
 }
-var NOTE_INJECT_CHARS = 500;
+var NOTE_INJECT_CHARS = 700;
 var init_curated_injector = __esm(() => {
   init_schema();
 });

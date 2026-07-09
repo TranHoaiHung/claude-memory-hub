@@ -103,6 +103,10 @@ function getDbPath() {
   const override = process.env["CLAUDE_MEMORY_HUB_DB"];
   if (override)
     return override;
+  if (process.env["NODE_ENV"] === "test") {
+    const { tmpdir } = __require("os");
+    return join2(tmpdir(), `cmh-test-${process.pid}.db`);
+  }
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
@@ -3115,7 +3119,12 @@ function buildCuratedSection(notes) {
   const lines = ["**Curated notes (user-maintained, Obsidian vault \u2014 treat as authoritative):**"];
   for (const n of notes) {
     const scope = n.project ? n.project : "global";
-    const body = n.content.replace(/\s+/g, " ").trim().slice(0, NOTE_INJECT_CHARS);
+    const flat = n.content.replace(/\s+/g, " ").trim();
+    let body = flat;
+    if (flat.length > NOTE_INJECT_CHARS) {
+      const cut = flat.slice(0, NOTE_INJECT_CHARS);
+      body = cut.slice(0, Math.max(cut.lastIndexOf(" "), NOTE_INJECT_CHARS - 80)) + " \u2026";
+    }
     lines.push(`- [${scope}] ${n.title}: ${body}`);
   }
   return lines.join(`
@@ -3127,7 +3136,7 @@ function toFtsQuery(text) {
     return "";
   return words.map((w) => `"${w}"`).join(" OR ");
 }
-var NOTE_INJECT_CHARS = 500;
+var NOTE_INJECT_CHARS = 700;
 var init_curated_injector = __esm(() => {
   init_schema();
 });
@@ -4903,10 +4912,12 @@ async function handlePostCompact(hook, project) {
   const files = store.getSessionFiles(hook.session_id);
   const decisions = store.getSessionDecisions(hook.session_id);
   const errors = store.getSessionErrors(hook.session_id);
+  const stripped = hook.compact_summary.replace(/<analysis>[\s\S]*?<\/analysis>/g, "").replace(/^\s*<analysis>\s*/, "").trim();
+  const cleaned = stripped.length >= 200 ? stripped : hook.compact_summary;
   const MAX_COMPACT_SUMMARY = 5000;
-  const summary = hook.compact_summary.length > MAX_COMPACT_SUMMARY ? hook.compact_summary.slice(0, MAX_COMPACT_SUMMARY - 20) + `
+  const summary = cleaned.length > MAX_COMPACT_SUMMARY ? cleaned.slice(0, MAX_COMPACT_SUMMARY - 20) + `
 
-[truncated]` : hook.compact_summary;
+[truncated]` : cleaned;
   ltStore.upsertSummary({
     session_id: hook.session_id,
     project,
@@ -5061,9 +5072,20 @@ async function handleSessionStart(hook, project) {
 }
 
 // src/worker/hook-dispatch.ts
+init_schema();
 init_entity_extractor();
 init_batch_queue();
 init_proactive_retrieval();
+function resolveProject(sessionId, cwd) {
+  if (sessionId) {
+    try {
+      const row = getDatabase().query("SELECT project FROM sessions WHERE id = ?").get(sessionId);
+      if (row?.project)
+        return row.project;
+    } catch {}
+  }
+  return projectFromCwd(cwd);
+}
 async function dispatchHookEvent(event, raw, cwd, options = {}) {
   let hook;
   try {
@@ -5087,7 +5109,7 @@ async function dispatchHookEvent(event, raw, cwd, options = {}) {
     }
     case "user-prompt-submit": {
       const h = hook;
-      const project = projectFromCwd(h.cwd ?? cwd);
+      const project = resolveProject(h.session_id, h.cwd ?? cwd);
       const { additionalContext } = await handleUserPromptSubmit(h, project);
       return additionalContext ? JSON.stringify({ additionalContext }) + `
 ` : "";
@@ -5097,24 +5119,26 @@ async function dispatchHookEvent(event, raw, cwd, options = {}) {
     case "session-end": {
       const h = hook;
       const { runSessionEnd: runSessionEnd2 } = await Promise.resolve().then(() => (init_session_end_pipeline(), exports_session_end_pipeline));
-      await runSessionEnd2(h, projectFromCwd(h.cwd ?? cwd));
+      await runSessionEnd2(h, resolveProject(h.session_id, h.cwd ?? cwd));
       return "";
     }
     case "pre-compact": {
       const { handlePreCompact: handlePreCompact2 } = await Promise.resolve().then(() => (init_compact_interceptor(), exports_compact_interceptor));
-      const instructions = await handlePreCompact2(hook, projectFromCwd(cwd));
+      const h = hook;
+      const instructions = await handlePreCompact2(hook, resolveProject(h.session_id, cwd));
       return instructions.trim() ? instructions : "";
     }
     case "post-compact": {
       const { handlePostCompact: handlePostCompact2 } = await Promise.resolve().then(() => (init_compact_interceptor(), exports_compact_interceptor));
-      await handlePostCompact2(hook, projectFromCwd(cwd));
+      const h = hook;
+      await handlePostCompact2(hook, resolveProject(h.session_id, cwd));
       return `Memory Hub: context preserved.
 `;
     }
   }
 }
 async function runPostToolUse(hook, cwd, inWorker) {
-  const project = projectFromCwd(cwd);
+  const project = resolveProject(hook.session_id, cwd);
   if (!inWorker && isBatchEnabled()) {
     try {
       const entities = extractEntities(hook);

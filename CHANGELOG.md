@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.6] - 2026-07-09
+
+**Injection accuracy fixes — from a day of real dogfooding on v0.17.x.**
+
+User report: injected "past session context" felt stale and wrong. All four causes found and fixed:
+
+- **Project drift (the big one)**: every hook derived `project` from its own cwd, so when Claude `cd`-ed into another repo mid-session, captures/summaries got tagged with the WRONG project — and the real project's baseline injection then showed months-old sessions as "most recent". A session's project is now fixed at SessionStart and resolved from the sessions table for every later event (`resolveProject` in hook-dispatch).
+- **Compactor scaffolding injected as memory**: compact summaries were stored verbatim, including the compactor's `<analysis>…</analysis>` reasoning block — later injected as context starting with "<analysis> Let me chronologically work through…". The block (closed or truncated-open) is now stripped before storing; 68 existing rows cleaned in place.
+- **Test fixtures in production (again)**: `bun test` run from OUTSIDE the repo skips `bunfig.toml`'s preload and used to hit the real DB — fixture sessions ("Session worked on auth system", project `p`) were injected as real history. `getDbPath()` now hard-redirects to a tmp DB whenever `NODE_ENV=test`, regardless of cwd/bunfig. Junk rows purged.
+- **Curated notes truncated mid-token**: a note cut at exactly 500 chars produced "npm view cla" — reads as wrong info. Now cuts at a word boundary with an ellipsis, cap raised to 700.
+
+---
+
 ## [0.17.5] - 2026-07-08
 
 **Follow-ups from the stale-version incident.**

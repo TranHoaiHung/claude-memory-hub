@@ -103,6 +103,10 @@ function getDbPath() {
   const override = process.env["CLAUDE_MEMORY_HUB_DB"];
   if (override)
     return override;
+  if (process.env["NODE_ENV"] === "test") {
+    const { tmpdir } = __require("os");
+    return join2(tmpdir(), `cmh-test-${process.pid}.db`);
+  }
   const dir = join2(homedir2(), ".claude-memory-hub");
   if (!existsSync2(dir)) {
     mkdirSync2(dir, { recursive: true, mode: 448 });
