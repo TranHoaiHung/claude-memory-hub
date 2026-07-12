@@ -152,6 +152,34 @@ function repairSchema(db) {
   } catch (e) {
     log.warn("FTS heal skipped", { error: String(e) });
   }
+  try {
+    healFtsCurated(db);
+  } catch (e) {
+    log.warn("fts_curated heal skipped", { error: String(e) });
+  }
+}
+function healFtsCurated(db) {
+  const count = (name, type) => db.query("SELECT COUNT(*) n FROM sqlite_master WHERE type = ? AND name = ?").get(type, name)?.n ?? 0;
+  if (!count("curated_notes", "table"))
+    return;
+  if (count("fts_curated", "table"))
+    return;
+  if (!count("fts_curated_insert", "trigger"))
+    return;
+  log.warn("fts_curated missing but triggers exist \u2014 rebuilding from curated_notes");
+  db.run(`
+    CREATE VIRTUAL TABLE fts_curated USING fts5(
+      path UNINDEXED,
+      project UNINDEXED,
+      title,
+      content,
+      tokenize = 'porter unicode61'
+    )
+  `);
+  db.run(`
+    INSERT INTO fts_curated(rowid, path, project, title, content)
+      SELECT id, path, project, title, content FROM curated_notes
+  `);
 }
 function healFtsMessages(db) {
   const triggerExists = db.query("SELECT COUNT(*) n FROM sqlite_master WHERE type='trigger' AND name='fts_messages_insert'").get()?.n ?? 0;

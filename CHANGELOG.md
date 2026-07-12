@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.8] - 2026-07-16
+
+**Week-1 cross-check on real data: one silent casualty found and healed.**
+
+The stale-binary incident (v0.17.4 notes) had one more victim discovered only by auditing production data: the old v0.14 code treated `fts_curated` as an orphaned FTS table and **dropped it**, while its sync triggers survived — so every `curated_notes` write since then failed with "no such table" and **vault read-back died silently for a week**. The user's 37 note edits were safe on disk the whole time (the exporter's hash-guard never overwrites), just not indexed.
+
+- New self-heal in schema repair (same pattern as `healFtsMessages`): triggers present + table missing → recreate `fts_curated` and reindex from `curated_notes`. Runs on every DB open, so any past or future drop recovers automatically. Regression test included.
+- On the audited machine the heal recovered all 37 curated notes with zero loss.
+
+Also verified on a week of real data: zero new message twins, zero synthetic rows, zero `<analysis>` summaries, zero project drift, zero test pollution — the v0.17.6/0.17.7 fixes are holding.
+
+---
+
 ## [0.17.7] - 2026-07-09
 
 **User-prompt capture audit — no misses, no duplicates, no synthetic noise.**
