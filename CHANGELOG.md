@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.10] - 2026-07-16
+
+**Long-session accuracy — user report confirmed, three compounding causes fixed.**
+
+Field report: "prompts run inaccurately in long sessions since ~0.17.3". Verified true. Telemetry from one real 235-prompt session showed exactly why:
+
+- **History-intent false positives (29/235 prompts)**: multilingual MiniLM scores "same casual Vietnamese" higher than "same topic" — ordinary bug reports ("có 1 vấn đề là…") matched Vietnamese history exemplars and dumped ~1.7k chars of stale context into unrelated tasks. New lexical gate: the embedding only runs when the prompt contains a temporal/history cue ("lần trước", "gần nhất", "previous", "last session", …). The four real production false positives are now regression tests.
+- **Resume re-injected the baseline** — the same session received its ~2.7k-char baseline 9 times (once per resume). SessionStart now checks injection state and skips when the baseline was already delivered; a genuinely new session is unaffected (state is cleaned at SessionEnd).
+- **37 falsely-"curated" notes**: auto-generated file notes were flagged as user-edited (a mid-sync worker restart had persisted files but not their hashes) and re-injected as "authoritative". Removed from curated memory, reclaimed by the exporter, and the exporter now persists sync-state after every section so an interrupted sync can never orphan written files again.
+
+---
+
 ## [0.17.9] - 2026-07-16
 
 **First data-driven injection tuning — cut what telemetry disproved, instrument what it can't yet see.**

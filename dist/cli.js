@@ -2885,6 +2885,10 @@ var init_resource_matcher = __esm(() => {
 });
 
 // src/context/history-intent.ts
+function hasHistoryCue(prompt) {
+  const lower = prompt.toLowerCase();
+  return TEMPORAL_CUES.some((cue) => lower.includes(cue));
+}
 async function ensureExemplarsLoaded() {
   if (cachedExemplarVectors)
     return;
@@ -2898,6 +2902,8 @@ async function ensureExemplarsLoaded() {
 }
 async function detectHistoryIntent(prompt) {
   if (!prompt || prompt.length < 6)
+    return { match: false, score: 0 };
+  if (!hasHistoryCue(prompt))
     return { match: false, score: 0 };
   await embeddingModel.embed("warmup");
   if (!embeddingModel.isAvailable)
@@ -2924,7 +2930,7 @@ function cosine(a, b) {
     dot += a[i] * b[i];
   return dot;
 }
-var HISTORY_EXEMPLARS, SIMILARITY_THRESHOLD = 0.55, cachedExemplarVectors = null, cachedExemplarsLoading = null;
+var HISTORY_EXEMPLARS, SIMILARITY_THRESHOLD = 0.55, TEMPORAL_CUES, cachedExemplarVectors = null, cachedExemplarsLoading = null;
 var init_history_intent = __esm(() => {
   init_embedding_model();
   HISTORY_EXEMPLARS = [
@@ -2938,6 +2944,34 @@ var init_history_intent = __esm(() => {
     "cu\u1ED9c tr\xF2 chuy\u1EC7n tr\u01B0\u1EDBc \u0111\xE2y",
     "l\u1ECBch s\u1EED chat c\u1EE7a t\xF4i",
     "what was I working on"
+  ];
+  TEMPORAL_CUES = [
+    "tr\u01B0\u1EDBc",
+    "g\u1EA7n nh\u1EA5t",
+    "v\u1EEBa r\u1ED3i",
+    "v\u1EEBa n\xE3y",
+    "l\xFAc n\xE3y",
+    "h\xF4m qua",
+    "h\xF4m tr\u01B0\u1EDBc",
+    "tu\u1EA7n tr\u01B0\u1EDBc",
+    "l\u1ECBch s\u1EED",
+    "\u0111\xE3 l\xE0m g\xEC",
+    "phi\xEAn c\u0169",
+    "\u0111\u1EE3t tr\u01B0\u1EDBc",
+    "khi n\xE3y",
+    "previous",
+    "last time",
+    "last message",
+    "last session",
+    "earlier",
+    "before",
+    "history",
+    "recently",
+    "yesterday",
+    "what did we",
+    "worked on",
+    "we discussed",
+    "last chat"
   ];
 });
 
@@ -3832,6 +3866,7 @@ function syncObsidianVault(options = {}) {
     result.sessions_exported++;
     state.last_summary_at = Math.max(state.last_summary_at, row.created_at);
   }
+  saveSyncState(root, state);
   const decisionRows = d.query(`SELECT id, project, entity_value, context, importance, created_at, session_id
      FROM entities
      WHERE entity_type IN ('decision','observation') AND importance >= 3 AND created_at > ?
@@ -3844,6 +3879,7 @@ function syncObsidianVault(options = {}) {
     result.decisions_exported++;
     state.last_decision_at = Math.max(state.last_decision_at, row.created_at);
   }
+  saveSyncState(root, state);
   const hotFiles = d.query(`SELECT project, entity_value, SUM(touch_count) touches, MAX(created_at) last_seen
      FROM entities
      WHERE entity_type IN ('file_modified','file_created')
@@ -3857,6 +3893,7 @@ function syncObsidianVault(options = {}) {
     write(join8(dir, fileNoteName(f.entity_value)), renderFileNote(f, d));
     result.file_notes_exported++;
   }
+  saveSyncState(root, state);
   const projects = d.query(`SELECT project, COUNT(*) sessions FROM long_term_summaries GROUP BY project ORDER BY MAX(created_at) DESC`).all();
   result.projects = projects.length;
   for (const p of projects) {
@@ -4169,6 +4206,9 @@ var init_obsidian_readback = __esm(() => {
 async function handleSessionStart(hook, project) {
   if (hook.source === "compact")
     return { additionalContext: "" };
+  if (loadInjectionState(hook.session_id).baselineInjected) {
+    return { additionalContext: "" };
+  }
   const store = new SessionStore;
   const ltStore = new LongTermStore;
   store.upsertSession({
@@ -8569,7 +8609,7 @@ function buildSummaryText(s) {
 // package.json
 var package_default = {
   name: "claude-memory-hub",
-  version: "0.17.9",
+  version: "0.17.10",
   description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
   type: "module",
   main: "dist/index.js",

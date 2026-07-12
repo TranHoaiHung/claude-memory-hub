@@ -9433,6 +9433,10 @@ var init_claude_md_tracker = __esm(() => {
 });
 
 // src/context/history-intent.ts
+function hasHistoryCue(prompt) {
+  const lower = prompt.toLowerCase();
+  return TEMPORAL_CUES.some((cue) => lower.includes(cue));
+}
 async function ensureExemplarsLoaded() {
   if (cachedExemplarVectors)
     return;
@@ -9446,6 +9450,8 @@ async function ensureExemplarsLoaded() {
 }
 async function detectHistoryIntent(prompt) {
   if (!prompt || prompt.length < 6)
+    return { match: false, score: 0 };
+  if (!hasHistoryCue(prompt))
     return { match: false, score: 0 };
   await embeddingModel.embed("warmup");
   if (!embeddingModel.isAvailable)
@@ -9472,7 +9478,7 @@ function cosine(a, b) {
     dot += a[i] * b[i];
   return dot;
 }
-var HISTORY_EXEMPLARS, SIMILARITY_THRESHOLD = 0.55, cachedExemplarVectors = null, cachedExemplarsLoading = null;
+var HISTORY_EXEMPLARS, SIMILARITY_THRESHOLD = 0.55, TEMPORAL_CUES, cachedExemplarVectors = null, cachedExemplarsLoading = null;
 var init_history_intent = __esm(() => {
   init_embedding_model();
   HISTORY_EXEMPLARS = [
@@ -9486,6 +9492,34 @@ var init_history_intent = __esm(() => {
     "cu\u1ED9c tr\xF2 chuy\u1EC7n tr\u01B0\u1EDBc \u0111\xE2y",
     "l\u1ECBch s\u1EED chat c\u1EE7a t\xF4i",
     "what was I working on"
+  ];
+  TEMPORAL_CUES = [
+    "tr\u01B0\u1EDBc",
+    "g\u1EA7n nh\u1EA5t",
+    "v\u1EEBa r\u1ED3i",
+    "v\u1EEBa n\xE3y",
+    "l\xFAc n\xE3y",
+    "h\xF4m qua",
+    "h\xF4m tr\u01B0\u1EDBc",
+    "tu\u1EA7n tr\u01B0\u1EDBc",
+    "l\u1ECBch s\u1EED",
+    "\u0111\xE3 l\xE0m g\xEC",
+    "phi\xEAn c\u0169",
+    "\u0111\u1EE3t tr\u01B0\u1EDBc",
+    "khi n\xE3y",
+    "previous",
+    "last time",
+    "last message",
+    "last session",
+    "earlier",
+    "before",
+    "history",
+    "recently",
+    "yesterday",
+    "what did we",
+    "worked on",
+    "we discussed",
+    "last chat"
   ];
 });
 
