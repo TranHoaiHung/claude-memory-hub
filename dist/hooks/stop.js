@@ -533,6 +533,14 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (12, ?)", [Date.now()]);
     log.info("Migration v12 complete");
   }
+  if (currentVersion < 13) {
+    log.info("Applying migration v13: curated_chars telemetry column");
+    try {
+      db.run("ALTER TABLE injection_log ADD COLUMN curated_chars INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (13, ?)", [Date.now()]);
+    log.info("Migration v13 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {

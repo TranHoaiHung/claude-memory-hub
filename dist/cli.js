@@ -555,6 +555,14 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (12, ?)", [Date.now()]);
     log.info("Migration v12 complete");
   }
+  if (currentVersion < 13) {
+    log.info("Applying migration v13: curated_chars telemetry column");
+    try {
+      db.run("ALTER TABLE injection_log ADD COLUMN curated_chars INTEGER NOT NULL DEFAULT 0");
+    } catch {}
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (13, ?)", [Date.now()]);
+    log.info("Migration v13 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -3044,8 +3052,8 @@ function logInjection(entry, db) {
          memory_section_chars, claude_md_chars,
          recent_convo_chars, awareness_hint_chars,
          total_injection_chars,
-         history_intent_matched, injected_at, dedup_skipped, timestamp
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         history_intent_matched, injected_at, dedup_skipped, curated_chars, timestamp
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
       entry.session_id,
       entry.project,
       entry.intent,
@@ -3061,6 +3069,7 @@ function logInjection(entry, db) {
       entry.history_intent_matched ? 1 : 0,
       entry.injected_at ?? "prompt",
       entry.dedup_skipped ?? 0,
+      entry.curated_chars ?? 0,
       Date.now()
     ]);
   } catch (err) {
@@ -3078,7 +3087,9 @@ function aggregateInjections(options = {}) {
         AVG(smart_match_top_score)                   as avg_top_score,
         SUM(CASE WHEN smart_match_count   > 0 THEN 1 ELSE 0 END) as with_match,
         SUM(CASE WHEN history_intent_matched = 1 THEN 1 ELSE 0 END) as with_history,
-        SUM(CASE WHEN awareness_hint_chars > 0 THEN 1 ELSE 0 END) as with_hint
+        SUM(CASE WHEN awareness_hint_chars > 0 THEN 1 ELSE 0 END) as with_hint,
+        AVG(curated_chars)                           as avg_curated,
+        SUM(CASE WHEN curated_chars > 0 THEN 1 ELSE 0 END) as with_curated
      FROM injection_log WHERE timestamp >= ?`).get(since);
   const total = totals?.n ?? 0;
   const toolUse = d.query(`SELECT COUNT(DISTINCT session_id) as sessions,
@@ -3100,6 +3111,8 @@ function aggregateInjections(options = {}) {
     prompts_with_match_pct: total > 0 ? Number(((totals?.with_match ?? 0) / total * 100).toFixed(1)) : 0,
     history_intent_count: totals?.with_history ?? 0,
     awareness_hint_count: totals?.with_hint ?? 0,
+    avg_curated_chars: Math.round(totals?.avg_curated ?? 0),
+    curated_shown_count: totals?.with_curated ?? 0,
     sessions_with_memory_tool_use: toolUse?.used ?? 0,
     memory_tool_hit_rate_pct: (toolUse?.sessions ?? 0) > 0 ? Number(((toolUse?.used ?? 0) / (toolUse?.sessions ?? 1) * 100).toFixed(1)) : 0,
     by_intent: byIntent.map((b) => ({
@@ -3438,7 +3451,7 @@ async function handleUserPromptSubmit(hook, project) {
   } catch {}
   const memorySection = buildMemorySection(results, memoryHint);
   let awarenessHint = "";
-  if (!baselineDone || memorySection.length > 0 || recentConvoSection.length > 0 || curatedSection.length > 0) {
+  if (!baselineDone || historyIntentMatched) {
     try {
       awarenessHint = buildAwarenessHint({
         project,
@@ -3473,7 +3486,8 @@ async function handleUserPromptSubmit(hook, project) {
       total_injection_chars: safeContext.length,
       history_intent_matched: historyIntentMatched,
       injected_at: baselineDone ? "prompt" : "first_prompt",
-      dedup_skipped: dedupSkipped
+      dedup_skipped: dedupSkipped,
+      curated_chars: curatedSection.length
     });
   } catch {}
   return { additionalContext: safeContext };
@@ -4251,7 +4265,8 @@ async function handleSessionStart(hook, project) {
       total_injection_chars: safeContext.length,
       history_intent_matched: false,
       injected_at: "session_start",
-      dedup_skipped: 0
+      dedup_skipped: 0,
+      curated_chars: curatedSection.length
     });
   } catch {}
   return { additionalContext: safeContext };
@@ -8239,6 +8254,7 @@ function runInjectionStats() {
   console.log("Other signals:");
   console.log(`  History intent fired: ${agg.history_intent_count} prompts`);
   console.log(`  Awareness hint shown: ${agg.awareness_hint_count} prompts`);
+  console.log(`  Curated notes shown:  ${agg.curated_shown_count} prompts (avg ${agg.avg_curated_chars} chars)`);
   console.log("");
   console.log("Effectiveness (memory_* tool called after injection):");
   console.log(`  Sessions with memory tool use: ${agg.sessions_with_memory_tool_use}  (hit rate ${agg.memory_tool_hit_rate_pct}%)`);
@@ -8553,7 +8569,7 @@ function buildSummaryText(s) {
 // package.json
 var package_default = {
   name: "claude-memory-hub",
-  version: "0.17.8",
+  version: "0.17.9",
   description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
   type: "module",
   main: "dist/index.js",

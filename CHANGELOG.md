@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.17.9] - 2026-07-16
+
+**First data-driven injection tuning — cut what telemetry disproved, instrument what it can't yet see.**
+
+Before touching anything, the 0% memory-tool hit rate was cross-checked against `resource_usage`: it is real behavior (all past memory_* calls predate the metric), not a broken counter.
+
+- **Awareness hint no longer re-emits** alongside every fresh memory/curated section (it was shown on 56% of injections while measurably driving zero tool calls). It now appears only at the session baseline and on explicit history questions — the two moments discoverability actually matters.
+- **Migration v13: `curated_chars` telemetry column** + `stats --injections` line. Curated notes went live in v0.17 but their injection size was invisible — the next (bigger) tuning pass on the memory-section budget will have full per-section numbers instead of guesses.
+- Deliberately NOT cut: the memory section (~1.5k chars avg). Its passive value (578 history-intent answers this month) is real but not yet instrumented per-section — cutting it today would be guesswork, not tuning.
+
+---
+
 ## [0.17.8] - 2026-07-16
 
 **Week-1 cross-check on real data: one silent casualty found and healed.**
