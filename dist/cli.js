@@ -2965,7 +2965,11 @@ var init_history_intent = __esm(() => {
     "what was I working on"
   ];
   TEMPORAL_CUES = [
-    "tr\u01B0\u1EDBc",
+    "l\u1EA7n tr\u01B0\u1EDBc",
+    "phi\xEAn tr\u01B0\u1EDBc",
+    "bu\u1ED5i tr\u01B0\u1EDBc",
+    "tr\u01B0\u1EDBc \u0111\xF3",
+    "tr\u01B0\u1EDBc \u0111\xE2y",
     "g\u1EA7n nh\u1EA5t",
     "v\u1EEBa r\u1ED3i",
     "v\u1EEBa n\xE3y",
@@ -2983,7 +2987,7 @@ var init_history_intent = __esm(() => {
     "last message",
     "last session",
     "earlier",
-    "before",
+    "did before",
     "history",
     "recently",
     "yesterday",
@@ -8819,7 +8823,7 @@ function buildSummaryText(s) {
 // package.json
 var package_default = {
   name: "claude-memory-hub",
-  version: "0.18.1",
+  version: "0.18.2",
   description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
   type: "module",
   main: "dist/index.js",

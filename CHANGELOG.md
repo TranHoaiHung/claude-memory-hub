@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.18.2] - 2026-07-13
+
+**History-intent gate, round 2 — bare "trước" was the residual false-positive.**
+
+A telemetry audit of the first day on 0.17.10+ showed the lexical gate still firing on ordinary Vietnamese task prompts: 5 of 6 matches were prompts like "trước mắt hãy commit", "dịch trước các ngôn ngữ", "không cần run trước" — "trước" alone means "first/beforehand" in instructions far more often than "in the past". The cue list now requires multi-word history phrases ("lần trước", "phiên trước", "trước đó", …); bare English "before" dropped for the same reason. All five production false positives are regression tests; every genuine-history test still passes.
+
+---
+
 ## [0.18.1] - 2026-07-13
 
 **Production backtest of 0.18.0 + Obsidian visibility in the viewer.**
