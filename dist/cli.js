@@ -4710,7 +4710,7 @@ var init_transcript_parser = __esm(() => {
 
 // src/summarizer/summarizer-prompts.ts
 function stripNoiseTags2(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").replace(/<(?:task-notification|system-reminder)>[\s\S]*$/, "").trim();
 }
 function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   const parts = [];
@@ -4763,7 +4763,7 @@ function isClaudeCliAvailable() {
   return _cliAvailable;
 }
 function stripNoise(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").replace(/<(?:task-notification|system-reminder)>[\s\S]*$/, "").trim();
 }
 function buildCliPrompt(ctx) {
   const sections = [
@@ -4941,7 +4941,7 @@ class SessionSummarizer {
     const hasModified = this.sessionStore.hasModifiedFiles(session_id);
     if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && messages.length === 0)
       return;
-    const userMsgs = messages.filter((m) => m.role === "user");
+    const userMsgs = messages.filter((m) => m.role === "user" && !isSyntheticUserMessage(m.content));
     const userChars = userMsgs.reduce((n, m) => n + m.content.trim().length, 0);
     if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && userChars < 300)
       return;
@@ -5022,6 +5022,7 @@ var init_session_summarizer = __esm(() => {
   init_session_store();
   init_long_term_store();
   init_cli_summarizer();
+  init_smart_truncate();
   init_logger();
   log16 = createLogger("session-summarizer");
 });
@@ -6517,6 +6518,20 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
 
 /* Graph view */
 #graphView { display: none; }
+
+/* Obsidian tab */
+#obsidianView { display: none; }
+.obs-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+.obs-flow { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 20px; margin-bottom: 20px; font-size: 13px; color: var(--text-secondary); line-height: 1.8; }
+.obs-flow b { color: var(--text); }
+.obs-flow .arrow { color: var(--accent-light); font-weight: 600; }
+.obs-kv { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.obs-kv:last-child { border-bottom: none; }
+.obs-kv .k { color: var(--text-muted); }
+.obs-kv .v { color: var(--text); text-align: right; word-break: break-all; }
+.obs-pill { padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.obs-pill.user { background: var(--green-bg); color: var(--green); }
+.obs-pill.edited { background: var(--blue-bg); color: var(--blue); }
 .graph-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .graph-controls select, .graph-controls input[type=text] { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); padding: 8px 12px; font-size: 13px; outline: none; }
 .graph-controls select:focus, .graph-controls input[type=text]:focus { border-color: var(--accent); }
@@ -6579,6 +6594,7 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
     <button class="tab" data-tab="sessions">Sessions <span class="count" id="cnt-sessions"></span></button>
     <button class="tab" data-tab="entities">Entities <span class="count" id="cnt-entities"></span></button>
     <button class="tab" data-tab="graph">Graph <span class="count" id="cnt-graph"></span></button>
+    <button class="tab" data-tab="obsidian">Obsidian <span class="count" id="cnt-obsidian"></span></button>
   </div>
 
   <div id="results"></div>
@@ -6612,6 +6628,8 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
       <div class="graph-panel" id="gPanel" hidden></div>
     </div>
   </div>
+
+  <div id="obsidianView"></div>
 </div>
 
 <script>
@@ -6992,6 +7010,54 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
     gLoad();
   }
 
+  // ==========================================================================
+  // Obsidian tab \u2014 two-way vault status: WHEN it synced, WHAT flows each way,
+  // and whether curated notes are actually reaching injections.
+  // ==========================================================================
+  function loadObsidian() {
+    var el = document.getElementById("obsidianView");
+    el.innerHTML = '<div class="empty"><div class="empty-text">Loading...</div></div>';
+    api("/api/obsidian").then(function(o) {
+      if (!o || o.error) {
+        el.innerHTML = '<div class="empty"><div class="empty-text">' + esc((o && o.error) || "No data") + '</div></div>';
+        return;
+      }
+      var html = '';
+      html += '<div class="obs-flow">'
+        + '<b>Two-way vault</b> \u2014 notes are plain Markdown, written for <b>you</b> to read in Obsidian; the AI reads back only what you curate.<br>'
+        + '<span class="arrow">Hub &rarr; vault:</span> session summaries + decisions exported as readable notes (auto, at session end / nightly 03:30).<br>'
+        + '<span class="arrow">Vault &rarr; AI:</span> anything in <b>Notes/</b> or any exported note <b>you edit</b> becomes "curated" \u2014 injected as highest-trust memory at session start and on matching prompts.'
+        + '</div>';
+
+      var pills = [
+        { v: o.exported_notes, l: 'exported notes (for you)' },
+        { v: o.curated_user, l: 'curated: your notes' },
+        { v: o.curated_edited, l: 'curated: your edits' },
+        { v: o.injected_30d, l: 'prompts injected (30d)' },
+      ];
+      html += '<div class="obs-grid">' + pills.map(function(p) {
+        return '<div class="stat-card"><div class="stat-value">' + p.v + '</div><div class="stat-label">' + p.l + '</div></div>';
+      }).join('') + '</div>';
+
+      html += '<div class="card"><div class="card-content expanded">'
+        + '<div class="obs-kv"><span class="k">Vault</span><span class="v">' + esc(o.vault) + (o.vault_exists ? '' : ' <span class="obs-pill edited">missing</span>') + '</span></div>'
+        + '<div class="obs-kv"><span class="k">Last export sync (Hub &rarr; vault)</span><span class="v">' + fmtDate(o.last_sync_at) + '</span></div>'
+        + '<div class="obs-kv"><span class="k">Last read-back (vault &rarr; AI)</span><span class="v">' + fmtDate(o.last_readback_at) + '</span></div>'
+        + '<div class="obs-kv"><span class="k">Avg curated chars per injection (30d)</span><span class="v">' + o.injected_avg_chars + '</span></div>'
+        + (o.daemon_installed === null ? '' : '<div class="obs-kv"><span class="k">Nightly daemon (03:30)</span><span class="v">' + (o.daemon_installed ? 'installed' : 'not installed \u2014 run: claude-memory-hub install-daemon') + '</span></div>')
+        + '</div></div>';
+
+      if (o.recent_curated && o.recent_curated.length) {
+        html += o.recent_curated.map(function(n) {
+          return '<div class="card"><div class="card-header"><span class="obs-pill ' + esc(n.origin) + '">' + (n.origin === 'user' ? 'your note' : 'your edit') + '</span><div class="card-meta"><span>' + fmtDate(n.mtime) + '</span><span>' + esc(n.project || 'global') + '</span></div></div><div class="card-content">' + esc(n.title) + ' &mdash; ' + esc(n.path) + '</div></div>';
+        }).join('');
+      } else {
+        html += '<div class="empty"><div class="empty-text">No curated notes yet \u2014 write one in the vault\\'s Notes/ folder (add a "project:" frontmatter to scope it) and it becomes the AI\\'s highest-trust memory.</div></div>';
+      }
+      el.innerHTML = html;
+    });
+  }
+
   // Tab click handlers
   document.querySelectorAll("[data-tab]").forEach(function(btn) {
     btn.addEventListener("click", function() {
@@ -7000,11 +7066,15 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
       document.querySelectorAll(".tab").forEach(function(b){ b.classList.remove("active"); });
       this.classList.add("active");
       var isGraph = currentTab === "graph";
-      document.getElementById("results").style.display = isGraph ? "none" : "flex";
-      document.getElementById("pagination").style.display = isGraph ? "none" : "flex";
-      document.getElementById("searchWrap").style.display = isGraph ? "none" : "block";
+      var isObs = currentTab === "obsidian";
+      var isList = !isGraph && !isObs;
+      document.getElementById("results").style.display = isList ? "flex" : "none";
+      document.getElementById("pagination").style.display = isList ? "flex" : "none";
+      document.getElementById("searchWrap").style.display = isList ? "block" : "none";
       document.getElementById("graphView").style.display = isGraph ? "block" : "none";
+      document.getElementById("obsidianView").style.display = isObs ? "block" : "none";
       if (isGraph) { initGraph(); gResize(); }
+      else if (isObs) loadObsidian();
       else loadTab();
     });
   });
@@ -7027,6 +7097,8 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', syst
     var cntS = document.getElementById("cnt-summaries"); if(cntS) cntS.textContent = stats.summaries || "";
     var cntSe = document.getElementById("cnt-sessions"); if(cntSe) cntSe.textContent = stats.sessions || "";
     var cntE = document.getElementById("cnt-entities"); if(cntE) cntE.textContent = stats.entities || "";
+    var cntO = document.getElementById("cnt-obsidian");
+    if (cntO) api("/api/obsidian").then(function(o){ if (o && !o.error) cntO.textContent = ((o.curated_user || 0) + (o.curated_edited || 0)) || ""; });
     var cntG = document.getElementById("cnt-graph");
     if (cntG && gprojects && gprojects.length) {
       var totalEdges = 0;
@@ -7324,6 +7396,43 @@ async function handleApi(url) {
         return json2({ error: "file param required" }, 400);
       const { getFileImpact: getFileImpact2 } = await Promise.resolve().then(() => (init_graph_queries(), exports_graph_queries));
       return json2(getFileImpact2(file, db));
+    }
+    if (path === "/api/obsidian") {
+      const { getMemoryHubRoot: getMemoryHubRoot2, loadSyncState: loadSyncState2 } = await Promise.resolve().then(() => (init_obsidian_exporter(), exports_obsidian_exporter));
+      const { existsSync: existsSync18, statSync: statSync8 } = await import("fs");
+      const { join: join17 } = await import("path");
+      const { homedir: homedir14 } = await import("os");
+      const root = getMemoryHubRoot2();
+      const vaultExists = existsSync18(root);
+      let lastSyncAt = null;
+      let exportedNotes = 0;
+      if (vaultExists) {
+        try {
+          const statePath3 = join17(root, "_meta", "sync-state.json");
+          if (existsSync18(statePath3)) {
+            lastSyncAt = Math.round(statSync8(statePath3).mtimeMs);
+            exportedNotes = Object.keys(loadSyncState2(root).written ?? {}).length;
+          }
+        } catch {}
+      }
+      const curated = db.prepare("SELECT origin, COUNT(*) as c FROM curated_notes GROUP BY origin").all();
+      const recentCurated = db.prepare("SELECT id, path, project, title, origin, mtime FROM curated_notes ORDER BY mtime DESC LIMIT 10").all();
+      const injected = db.prepare("SELECT COUNT(*) as c, COALESCE(AVG(curated_chars),0) as avg_chars FROM injection_log WHERE curated_chars > 0 AND timestamp > ?").get(Date.now() - 2592000000);
+      const lastReadback = db.prepare("SELECT MAX(indexed_at) as t FROM curated_notes").get()?.t ?? null;
+      const daemonInstalled = process.platform === "darwin" ? existsSync18(join17(homedir14(), "Library", "LaunchAgents", "com.kihutech.claude-memory-hub.plist")) : null;
+      return json2({
+        vault: root,
+        vault_exists: vaultExists,
+        last_sync_at: lastSyncAt,
+        last_readback_at: lastReadback,
+        exported_notes: exportedNotes,
+        curated_user: curated.find((x) => x.origin === "user")?.c ?? 0,
+        curated_edited: curated.find((x) => x.origin === "edited")?.c ?? 0,
+        injected_30d: injected?.c ?? 0,
+        injected_avg_chars: Math.round(injected?.avg_chars ?? 0),
+        daemon_installed: daemonInstalled,
+        recent_curated: recentCurated
+      });
     }
     return json2({ error: "Not found" }, 404);
   } catch (e) {
@@ -8710,7 +8819,7 @@ function buildSummaryText(s) {
 // package.json
 var package_default = {
   name: "claude-memory-hub",
-  version: "0.18.0",
+  version: "0.18.1",
   description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
   type: "module",
   main: "dist/index.js",

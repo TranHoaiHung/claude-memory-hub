@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.18.1] - 2026-07-13
+
+**Production backtest of 0.18.0 + Obsidian visibility in the viewer.**
+
+A read-only backtest of the new summarizer over the full production DB (23 compact summaries, 107 sessions/60d, live prompt builds) confirmed the 0.18.0 logic — and caught one leak:
+
+- **Unclosed harness tags leaked into summary prompts**: message rows stored before the capture-side filter can be truncated mid-`<task-notification>`, so closed-pair stripping let the whole block through. Fixed at read time (synthetic rows filtered out of the conversation arc) and in the strippers (unclosed openers removed to end of entry). Regression test uses the exact production shape.
+- **Viewer: new Obsidian tab** — answers "when did the vault sync, is it working, and who is it for": last export (Hub → vault) and last read-back (vault → AI) timestamps, exported-note count, curated notes by origin (your notes / your edits), prompts that received curated content in 30d + avg chars, nightly-daemon status, and the 10 most recent curated notes. Backed by `/api/obsidian`.
+- Backtest numbers on real data: 22/23 stored compact summaries gain a distilled lead; the trivial gate would have prevented 10 junk summaries that are in the DB today while keeping all 94 real sessions.
+
+---
+
 ## [0.18.0] - 2026-07-13
 
 **Summary quality overhaul — the injected memory is only as trustworthy as the worst summary in it.**

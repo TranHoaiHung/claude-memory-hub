@@ -4627,7 +4627,7 @@ var init_transcript_parser = __esm(() => {
 
 // src/summarizer/summarizer-prompts.ts
 function stripNoiseTags2(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").replace(/<(?:task-notification|system-reminder)>[\s\S]*$/, "").trim();
 }
 function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   const parts = [];
@@ -4680,7 +4680,7 @@ function isClaudeCliAvailable() {
   return _cliAvailable;
 }
 function stripNoise(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").replace(/<(?:task-notification|system-reminder)>[\s\S]*$/, "").trim();
 }
 function buildCliPrompt(ctx) {
   const sections = [
@@ -4852,7 +4852,7 @@ class SessionSummarizer {
     const hasModified = this.sessionStore.hasModifiedFiles(session_id);
     if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && messages.length === 0)
       return;
-    const userMsgs = messages.filter((m) => m.role === "user");
+    const userMsgs = messages.filter((m) => m.role === "user" && !isSyntheticUserMessage(m.content));
     const userChars = userMsgs.reduce((n, m) => n + m.content.trim().length, 0);
     if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && userChars < 300)
       return;
@@ -4921,6 +4921,7 @@ var init_session_summarizer = __esm(() => {
   init_session_store();
   init_long_term_store();
   init_cli_summarizer();
+  init_smart_truncate();
   init_logger();
   log16 = createLogger("session-summarizer");
 });
