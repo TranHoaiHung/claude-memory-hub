@@ -541,6 +541,19 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (13, ?)", [Date.now()]);
     log.info("Migration v13 complete");
   }
+  if (currentVersion < 14) {
+    log.info("Applying migration v14: summary tier column");
+    try {
+      db.run("ALTER TABLE long_term_summaries ADD COLUMN tier TEXT NOT NULL DEFAULT 'unknown'");
+    } catch {}
+    db.run(`UPDATE long_term_summaries SET tier = 'compact'
+            WHERE tier = 'unknown' AND (summary LIKE '%Primary Request%' OR summary LIKE '<summary>%')`);
+    db.run(`UPDATE long_term_summaries SET tier = 'rule-based'
+            WHERE tier = 'unknown' AND (summary LIKE 'Task:%' OR summary LIKE 'Session in project%')`);
+    db.run(`UPDATE long_term_summaries SET tier = 'cli' WHERE tier = 'unknown'`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (14, ?)", [Date.now()]);
+    log.info("Migration v14 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -851,14 +864,15 @@ class LongTermStore {
     this.db = db ?? getDatabase();
   }
   upsertSummary(summary) {
-    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at, tier)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          summary       = excluded.summary,
          files_touched = excluded.files_touched,
          decisions     = excluded.decisions,
          errors_fixed  = excluded.errors_fixed,
-         token_savings = excluded.token_savings`, [
+         token_savings = excluded.token_savings,
+         tier          = excluded.tier`, [
       summary.session_id,
       summary.project,
       summary.summary,
@@ -866,8 +880,13 @@ class LongTermStore {
       summary.decisions,
       summary.errors_fixed,
       summary.token_savings,
-      summary.created_at
+      summary.created_at,
+      summary.tier ?? "unknown"
     ]);
+  }
+  getRuleBasedSummaries(days, limit) {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    return this.db.query("SELECT * FROM long_term_summaries WHERE tier = 'rule-based' AND created_at > ? ORDER BY created_at DESC LIMIT ?").all(cutoff, limit);
   }
   getSummary(session_id) {
     return this.db.query("SELECT * FROM long_term_summaries WHERE session_id = ?").get(session_id) ?? null;
@@ -3121,7 +3140,7 @@ function capForRole(role) {
 }
 function isSyntheticUserMessage(content) {
   const head = content.trimStart();
-  return head.startsWith("[Request interrupted") || head.startsWith("Base directory for this skill:") || head.startsWith("<command-name>") || head.startsWith("<local-command-");
+  return head.startsWith("[Request interrupted") || head.startsWith("Base directory for this skill:") || head.startsWith("<command-name>") || head.startsWith("<local-command-") || head.startsWith("<task-notification>");
 }
 var MIN_USEFUL_RATIO = 0.8, MARKER = `
 [truncated]`, ROLE_CAPS;
@@ -3232,7 +3251,7 @@ var init_curated_injector = __esm(() => {
 // src/capture/hook-handler.ts
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
-  return prompt.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
+  return prompt.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
 }
 async function handlePostToolUse(hook, project) {
   const store = new SessionStore;
@@ -3277,11 +3296,12 @@ async function handleUserPromptSubmit(hook, project) {
   const ltStore = new LongTermStore;
   const privacyConfig = loadPrivacyConfig();
   const cleanPrompt = sanitize(stripIdeTags(hook.prompt), privacyConfig);
+  const sessionPrompt = cleanPrompt && !isSyntheticUserMessage(cleanPrompt) ? cleanPrompt.slice(0, 500) : undefined;
   store.upsertSession({
     id: hook.session_id,
     project,
     started_at: Date.now(),
-    user_prompt: cleanPrompt.slice(0, 500) || hook.prompt.slice(0, 500),
+    ...sessionPrompt ? { user_prompt: sessionPrompt } : {},
     status: "active"
   });
   const promptText = cleanPrompt || hook.prompt;
@@ -4607,7 +4627,7 @@ var init_transcript_parser = __esm(() => {
 
 // src/summarizer/summarizer-prompts.ts
 function stripNoiseTags2(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").trim();
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, "").replace(/<command-name>[\s\S]*?<\/command-name>\s*/g, "").replace(/<command-message>[\s\S]*?<\/command-message>\s*/g, "").replace(/<command-args>[\s\S]*?<\/command-args>\s*/g, "").replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
 }
 function buildRuleBasedSummary(session, files, errors, decisions, notes = []) {
   const parts = [];
@@ -4660,17 +4680,21 @@ function isClaudeCliAvailable() {
   return _cliAvailable;
 }
 function stripNoise(text) {
-  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").trim();
+  return text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<local-command-[\w-]+>[\s\S]*?<\/local-command-[\w-]+>\s*/g, "").replace(/<command-[\w-]+>[\s\S]*?<\/command-[\w-]+>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
 }
 function buildCliPrompt(ctx) {
   const sections = [
-    "Summarize this coding session in 4-6 plain sentences. No markdown, no headers, no code blocks.",
+    "Summarize this coding session in 5-10 plain sentences \u2014 scale length to how much actually happened. No markdown, no headers, no code blocks.",
     "Cover: (1) what was accomplished and why, (2) key decisions with their reasons, (3) errors hit and how they were resolved, (4) anything left unfinished or planned next.",
     "Write in English, but preserve Vietnamese feature names, domain terms, and user requirements VERBATIM in quotes.",
     "Include exact file names, function names, and error identifiers so keyword search can find this session later.",
+    "State only what the context below supports \u2014 never invent work that is not evidenced.",
     "",
     `Project: ${ctx.project}`
   ];
+  if (ctx.conversation && ctx.conversation.length > 0) {
+    sections.push(`Conversation (chronological): ${ctx.conversation.map(stripNoise).join(" | ")}`);
+  }
   if (ctx.files.length > 0) {
     sections.push(`Files modified: ${ctx.files.slice(0, 15).join(", ")}`);
   }
@@ -4692,6 +4716,14 @@ function buildCliPrompt(ctx) {
     prompt = prompt.slice(0, MAX_PROMPT_CHARS - 3) + "...";
   }
   return prompt;
+}
+function capAtSentence(text, max) {
+  if (text.length <= max)
+    return text;
+  const cut = text.slice(0, max);
+  const lastEnd = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf(`.
+`), cut.lastIndexOf("? "), cut.lastIndexOf("! "));
+  return lastEnd > max * 0.6 ? cut.slice(0, lastEnd + 1) : cut;
 }
 function consumeDailyBudget() {
   const max = Number(process.env["CLAUDE_MEMORY_HUB_LLM_DAILY_MAX"]) || DEFAULT_DAILY_MAX;
@@ -4728,7 +4760,7 @@ async function tryCliSummary(ctx, timeoutMs) {
   }
   const prompt = buildCliPrompt(ctx);
   for (let attempt = 1;attempt <= MAX_RETRIES; attempt++) {
-    const result = await attemptCliCall(prompt, timeout, attempt);
+    const result = await attemptCliCall(prompt, timeout, attempt, attempt === 1);
     if (result)
       return result;
     if (attempt < MAX_RETRIES)
@@ -4737,9 +4769,11 @@ async function tryCliSummary(ctx, timeoutMs) {
   log15.warn("Tier 2 CLI summary exhausted retries", { retries: MAX_RETRIES });
   return;
 }
-async function attemptCliCall(prompt, timeout, attempt) {
+async function attemptCliCall(prompt, timeout, attempt, pinModel) {
   try {
-    const argv = process.platform === "win32" ? ["cmd", "/c", "claude", "-p"] : ["claude", "-p"];
+    const model = process.env["CLAUDE_MEMORY_HUB_LLM_MODEL"] || DEFAULT_MODEL;
+    const modelArgs = pinModel ? ["--model", model] : [];
+    const argv = process.platform === "win32" ? ["cmd", "/c", "claude", ...modelArgs, "-p"] : ["claude", ...modelArgs, "-p"];
     const proc = Bun.spawn(argv, {
       stdout: "pipe",
       stderr: "pipe",
@@ -4772,7 +4806,7 @@ async function attemptCliCall(prompt, timeout, attempt) {
         return;
       }
       const cleaned = text.replace(/^#+\s+.*/gm, "").replace(/```[\s\S]*?```/g, "").replace(/\n{2,}/g, " ").trim();
-      return cleaned.slice(0, MAX_OUTPUT_CHARS);
+      return capAtSentence(cleaned, MAX_OUTPUT_CHARS);
     })();
     const result = await Promise.race([outputPromise, timeoutPromise]);
     if (result) {
@@ -4786,7 +4820,7 @@ async function attemptCliCall(prompt, timeout, attempt) {
     return;
   }
 }
-var log15, MAX_PROMPT_CHARS = 6000, MAX_OUTPUT_CHARS = 2000, DEFAULT_TIMEOUT_MS = 30000, _cliAvailable, _cliCheckedAt = 0, CLI_CHECK_TTL_MS, MAX_RETRIES = 2, DEFAULT_DAILY_MAX = 20;
+var log15, MAX_PROMPT_CHARS = 16000, MAX_OUTPUT_CHARS = 3000, DEFAULT_TIMEOUT_MS = 90000, DEFAULT_MODEL = "haiku", _cliAvailable, _cliCheckedAt = 0, CLI_CHECK_TTL_MS, MAX_RETRIES = 2, DEFAULT_DAILY_MAX = 20;
 var init_cli_summarizer = __esm(() => {
   init_logger();
   log15 = createLogger("cli-summarizer");
@@ -4801,11 +4835,11 @@ class SessionSummarizer {
     this.sessionStore = new SessionStore;
     this.ltStore = new LongTermStore;
   }
-  async summarize(session_id, project) {
+  async summarize(session_id, project, opts) {
     const session = this.sessionStore.getSession(session_id);
     if (!session)
       return;
-    if (this.ltStore.getSummary(session_id))
+    if (!opts?.upgradeOnly && this.ltStore.getSummary(session_id))
       return;
     const files = this.sessionStore.getSessionFiles(session_id);
     const errors = this.sessionStore.getSessionErrors(session_id);
@@ -4818,33 +4852,45 @@ class SessionSummarizer {
     const hasModified = this.sessionStore.hasModifiedFiles(session_id);
     if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && messages.length === 0)
       return;
-    const userPrompts = messages.filter((m) => m.role === "user").slice(0, 10).map((m, i) => `[${i + 1}] ${m.content.slice(0, 150)}`);
-    const conversationDigest = userPrompts.length > 0 ? `User requests (${userPrompts.length}): ${userPrompts.join("; ")}` : "";
+    const userMsgs = messages.filter((m) => m.role === "user");
+    const userChars = userMsgs.reduce((n, m) => n + m.content.trim().length, 0);
+    if (!hasModified && errors.length === 0 && decisions.length === 0 && notes.length === 0 && observations.length === 0 && userChars < 300)
+      return;
+    const arc = userMsgs.length <= 10 ? userMsgs : [...userMsgs.slice(0, 5), ...userMsgs.slice(-5)];
+    const arcNote = userMsgs.length > 10 ? ` (${userMsgs.length} total, first 5 + last 5)` : "";
+    const userPrompts = arc.map((m) => m.content.slice(0, 250));
+    const outcome = messages.filter((m) => m.role === "assistant").slice(-2).map((m) => m.content.slice(0, 400));
+    const conversationDigest = userPrompts.length > 0 ? `User requests${arcNote}: ${userPrompts.join("; ")}` : "";
     const obsValues = observations.slice(0, 8).map((o) => o.entity_value);
     let summaryText;
     let tier = "rule-based";
     const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
-    if (llmMode !== "rule-based") {
+    if (llmMode !== "rule-based" && llmMode !== "disabled") {
       const decisionDetails = decisions.slice(0, 8).map((d) => {
         const ctx2 = d.context ? ` \u2192 ${d.context.slice(0, 200)}` : "";
         return d.entity_value.slice(0, 150) + ctx2;
       });
-      const allNotes = [...notes.slice(0, 5)];
+      const conversation = [];
       if (conversationDigest)
-        allNotes.push(conversationDigest);
+        conversation.push(conversationDigest);
+      if (outcome.length > 0)
+        conversation.push(`Final assistant output: ${outcome.join(" \u2026 ")}`);
       const ctx = {
         sessionId: session_id,
         project,
         files,
         errors: errors.slice(0, 5).map((e) => e.entity_value.slice(0, 150)),
         decisions: decisionDetails,
-        notes: allNotes,
-        observations: obsValues.slice(0, 5)
+        notes: notes.slice(0, 5),
+        observations: obsValues.slice(0, 5),
+        conversation
       };
       summaryText = await tryCliSummary(ctx);
       if (summaryText)
         tier = "cli";
     }
+    if (opts?.upgradeOnly && tier !== "cli")
+      return;
     if (!summaryText) {
       const allNotes = [...notes, ...obsValues];
       if (conversationDigest)
@@ -4852,15 +4898,17 @@ class SessionSummarizer {
       summaryText = buildRuleBasedSummary(session, files, errors, decisions, allNotes);
     }
     log16.info("Summary generated", { session_id, tier, length: summaryText.length });
+    const existing = opts?.upgradeOnly ? this.ltStore.getSummary(session_id) : null;
     const ltSummary = {
       session_id,
       project,
+      tier,
       summary: summaryText,
       files_touched: JSON.stringify(files.slice(0, 50)),
       decisions: JSON.stringify(decisions.slice(0, 20).map((d) => d.entity_value)),
       errors_fixed: JSON.stringify(errors.slice(0, 10).map((e) => e.entity_value.slice(0, 100))),
       token_savings: estimateTokenSavings(files.length, errors.length, notes.length),
-      created_at: Date.now()
+      created_at: existing?.created_at ?? Date.now()
     };
     this.ltStore.upsertSummary(ltSummary);
   }
@@ -5065,6 +5113,7 @@ var init_session_end_pipeline = __esm(() => {
 // src/compact/compact-interceptor.ts
 var exports_compact_interceptor = {};
 __export(exports_compact_interceptor, {
+  prependCompactLead: () => prependCompactLead,
   handlePreCompact: () => handlePreCompact,
   handlePostCompact: () => handlePostCompact
 });
@@ -5130,15 +5179,17 @@ async function handlePostCompact(hook, project) {
   const files = store.getSessionFiles(hook.session_id);
   const decisions = store.getSessionDecisions(hook.session_id);
   const errors = store.getSessionErrors(hook.session_id);
-  const stripped = hook.compact_summary.replace(/<analysis>[\s\S]*?<\/analysis>/g, "").replace(/^\s*<analysis>\s*/, "").trim();
+  const stripped = hook.compact_summary.replace(/<analysis>[\s\S]*?<\/analysis>/g, "").replace(/^\s*<analysis>\s*/, "").replace(/<\/?summary>/g, "").trim();
   const cleaned = stripped.length >= 200 ? stripped : hook.compact_summary;
-  const MAX_COMPACT_SUMMARY = 5000;
-  const summary = cleaned.length > MAX_COMPACT_SUMMARY ? cleaned.slice(0, MAX_COMPACT_SUMMARY - 20) + `
+  const withLead = prependCompactLead(cleaned);
+  const MAX_COMPACT_SUMMARY = 5500;
+  const summary = withLead.length > MAX_COMPACT_SUMMARY ? withLead.slice(0, MAX_COMPACT_SUMMARY - 20) + `
 
-[truncated]` : cleaned;
+[truncated]` : withLead;
   ltStore.upsertSummary({
     session_id: hook.session_id,
     project,
+    tier: "compact",
     summary,
     files_touched: JSON.stringify(files.slice(0, 50)),
     decisions: JSON.stringify(decisions.slice(0, 20).map((d) => d.entity_value)),
@@ -5148,6 +5199,27 @@ async function handlePostCompact(hook, project) {
   });
   const summarizer = new SessionSummarizer;
   await summarizer.summarize(hook.session_id, project).catch(() => {});
+}
+function extractCompactSection(text, names) {
+  for (const name of names) {
+    const re = new RegExp(`\\d+\\.\\s*${name}[^:\\n]*:\\s*([\\s\\S]*?)(?=\\n\\s*\\d+\\.\\s|$)`, "i");
+    const m = text.match(re);
+    if (m?.[1]?.trim())
+      return m[1].replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+function prependCompactLead(summary) {
+  const intent = extractCompactSection(summary, ["Primary Request and Intent", "Primary Request"]);
+  if (!intent)
+    return summary;
+  let lead = intent.slice(0, 500);
+  const current = extractCompactSection(summary, ["Current Work", "Current State", "Current work"]);
+  if (current)
+    lead += ` Currently: ${current.slice(0, 300)}`;
+  return `${lead}
+
+${summary}`;
 }
 function recencyWeight(createdAt, now) {
   const hoursAgo = (now - createdAt) / (1000 * 60 * 60);

@@ -541,6 +541,19 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (13, ?)", [Date.now()]);
     log.info("Migration v13 complete");
   }
+  if (currentVersion < 14) {
+    log.info("Applying migration v14: summary tier column");
+    try {
+      db.run("ALTER TABLE long_term_summaries ADD COLUMN tier TEXT NOT NULL DEFAULT 'unknown'");
+    } catch {}
+    db.run(`UPDATE long_term_summaries SET tier = 'compact'
+            WHERE tier = 'unknown' AND (summary LIKE '%Primary Request%' OR summary LIKE '<summary>%')`);
+    db.run(`UPDATE long_term_summaries SET tier = 'rule-based'
+            WHERE tier = 'unknown' AND (summary LIKE 'Task:%' OR summary LIKE 'Session in project%')`);
+    db.run(`UPDATE long_term_summaries SET tier = 'cli' WHERE tier = 'unknown'`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (14, ?)", [Date.now()]);
+    log.info("Migration v14 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {

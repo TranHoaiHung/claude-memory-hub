@@ -7028,6 +7028,19 @@ function applyMigrations(db) {
     db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (13, ?)", [Date.now()]);
     log.info("Migration v13 complete");
   }
+  if (currentVersion < 14) {
+    log.info("Applying migration v14: summary tier column");
+    try {
+      db.run("ALTER TABLE long_term_summaries ADD COLUMN tier TEXT NOT NULL DEFAULT 'unknown'");
+    } catch {}
+    db.run(`UPDATE long_term_summaries SET tier = 'compact'
+            WHERE tier = 'unknown' AND (summary LIKE '%Primary Request%' OR summary LIKE '<summary>%')`);
+    db.run(`UPDATE long_term_summaries SET tier = 'rule-based'
+            WHERE tier = 'unknown' AND (summary LIKE 'Task:%' OR summary LIKE 'Session in project%')`);
+    db.run(`UPDATE long_term_summaries SET tier = 'cli' WHERE tier = 'unknown'`);
+    db.run("INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES (14, ?)", [Date.now()]);
+    log.info("Migration v14 complete");
+  }
 }
 function getDatabase() {
   if (!_db) {
@@ -7364,7 +7377,7 @@ function capForRole(role) {
 }
 function isSyntheticUserMessage(content) {
   const head = content.trimStart();
-  return head.startsWith("[Request interrupted") || head.startsWith("Base directory for this skill:") || head.startsWith("<command-name>") || head.startsWith("<local-command-");
+  return head.startsWith("[Request interrupted") || head.startsWith("Base directory for this skill:") || head.startsWith("<command-name>") || head.startsWith("<local-command-") || head.startsWith("<task-notification>");
 }
 var MIN_USEFUL_RATIO = 0.8, MARKER = `
 [truncated]`, ROLE_CAPS;
@@ -7382,14 +7395,15 @@ class LongTermStore {
     this.db = db ?? getDatabase();
   }
   upsertSummary(summary) {
-    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    this.db.run(`INSERT INTO long_term_summaries(session_id, project, summary, files_touched, decisions, errors_fixed, token_savings, created_at, tier)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          summary       = excluded.summary,
          files_touched = excluded.files_touched,
          decisions     = excluded.decisions,
          errors_fixed  = excluded.errors_fixed,
-         token_savings = excluded.token_savings`, [
+         token_savings = excluded.token_savings,
+         tier          = excluded.tier`, [
       summary.session_id,
       summary.project,
       summary.summary,
@@ -7397,8 +7411,13 @@ class LongTermStore {
       summary.decisions,
       summary.errors_fixed,
       summary.token_savings,
-      summary.created_at
+      summary.created_at,
+      summary.tier ?? "unknown"
     ]);
+  }
+  getRuleBasedSummaries(days, limit) {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    return this.db.query("SELECT * FROM long_term_summaries WHERE tier = 'rule-based' AND created_at > ? ORDER BY created_at DESC LIMIT ?").all(cutoff, limit);
   }
   getSummary(session_id) {
     return this.db.query("SELECT * FROM long_term_summaries WHERE session_id = ?").get(session_id) ?? null;
@@ -9768,7 +9787,7 @@ __export(exports_hook_handler, {
 });
 import { basename as basename3 } from "path";
 function stripIdeTags(prompt) {
-  return prompt.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").trim();
+  return prompt.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, "").replace(/<ide_selection>[\s\S]*?<\/ide_selection>\s*/g, "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "").replace(/<task-notification>[\s\S]*?<\/task-notification>\s*/g, "").trim();
 }
 async function handlePostToolUse(hook, project) {
   const store = new SessionStore;
@@ -9813,11 +9832,12 @@ async function handleUserPromptSubmit(hook, project) {
   const ltStore = new LongTermStore;
   const privacyConfig = loadPrivacyConfig();
   const cleanPrompt = sanitize(stripIdeTags(hook.prompt), privacyConfig);
+  const sessionPrompt = cleanPrompt && !isSyntheticUserMessage(cleanPrompt) ? cleanPrompt.slice(0, 500) : undefined;
   store.upsertSession({
     id: hook.session_id,
     project,
     started_at: Date.now(),
-    user_prompt: cleanPrompt.slice(0, 500) || hook.prompt.slice(0, 500),
+    ...sessionPrompt ? { user_prompt: sessionPrompt } : {},
     status: "active"
   });
   const promptText = cleanPrompt || hook.prompt;

@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.18.0] - 2026-07-13
+
+**Summary quality overhaul — the injected memory is only as trustworthy as the worst summary in it.**
+
+Production data showed why summaries ranked below CLAUDE.md in trust: the CLI summarizer was being SIGTERM'd by its own 30s timeout (exit 143 — default model + extended thinking), silently downgrading real 105-file sessions to the "Task: …" template; trivial sessions ("version") crowded the recent baseline; good summaries were hard-cut mid-word; compact summaries injected raw scaffold headers.
+
+- **Tier 2 now finishes**: `claude -p` pins a fast model (`--model haiku`, override via `CLAUDE_MEMORY_HUB_LLM_MODEL`; retry drops the flag for older CLIs) and the timeout is 90s. `CLAUDE_MEMORY_HUB_LLM=disabled` now actually disables Tier 2.
+- **Tier 2 sees the conversation**: input includes the request ARC (first 5 + last 5 user prompts — long sessions pivot) and the final assistant messages (the conclusions), with the prompt budget raised 6k → 16k chars. Output scales 5-10 sentences and truncates at a sentence boundary (3k cap).
+- **Trivial-session gate**: sessions with nothing modified/decided/noted and <300 chars of user content are no longer summarized — they polluted the recent-3 baseline and burned the daily CLI budget.
+- **Compact summaries get a distilled lead**: intent + current work in plain text ahead of the 9-section body, so the injection preview carries memory instead of "1. Primary Request and Intent:". `<summary>` wrapper stripped.
+- **`<task-notification>` scaffolding** is now filtered everywhere a user prompt is captured (one production summary's "Task:" was an agent-completion notification; raw-prompt fallback removed).
+- **Migration v14: `tier` column** ('compact' | 'cli' | 'rule-based', backfilled by shape) + `stats` tier breakdown. Nightly maintenance re-summarizes recent rule-based (timeout-casualty) summaries via Tier 2 while the daily budget is fresh, preserving original timestamps — a failed upgrade keeps the existing text.
+
+---
+
 ## [0.17.10] - 2026-07-16
 
 **Long-session accuracy — user report confirmed, three compounding causes fixed.**
