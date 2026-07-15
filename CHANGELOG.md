@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.18.3] - 2026-07-13
+
+**Knowledge-graph data quality — foundation for file-context recall.**
+
+A pre-implementation backtest of "inject file history when Claude touches a file" failed on data quality: 42% of `decided_about` edges were agent PROMPTS recorded as decisions, and every entity carried `prompt_number=0` — collapsing edge-builder's ±3-prompt window so decisions smeared across every file a session touched (an nginx header note was attached to `TagManager.swift`).
+
+- **Agent/Skill invocations retyped `decision` → `observation`**: they are records of what ran, not decisions about files. Summaries keep the agent results (observation context now flows into Tier-2 input); the graph, Obsidian decision export, and decision stats stop ingesting prompts. 1,030 production rows retyped, 743 junk edges removed.
+- **`prompt_number` is now recorded** on entities at PostToolUse (from the session's message count) and on prompt observations (was hardcoded 0) — activating the prompt-window linking edge-builder was designed with. Historical edges built from zeroed data remain and will dilute as correctly-windowed edges accumulate.
+- **edge-builder** additionally refuses `agent:`/`skill:` records in `decided_about` regardless of type.
+- The file-context injector itself is deliberately NOT built yet: measured hit rate is 3% with the current graph. Re-audit after 2–3 weeks of correctly-stamped data; build only if useful-hit-rate clears ~10-15%.
+
+---
+
 ## [0.18.2] - 2026-07-13
 
 **History-intent gate, round 2 — bare "trước" was the residual false-positive.**

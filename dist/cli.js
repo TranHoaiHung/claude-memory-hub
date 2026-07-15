@@ -1439,14 +1439,14 @@ function extractEntities(hook, promptNumber = 0) {
       const subagentType = stringField2(tool_input, "subagent_type") ?? "general-purpose";
       const prompt = stringField2(tool_input, "prompt") ?? "";
       const agentResult = extractAgentResult(tool_response);
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
+      raw.push(makeEntity(session_id, project, tool_name, "observation", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
       break;
     }
     case "Skill": {
       const skillName = stringField2(tool_input, "skill") ?? "unknown";
       const args = stringField2(tool_input, "args") ?? "";
       const skillResult = extractAgentResult(tool_response);
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
+      raw.push(makeEntity(session_id, project, tool_name, "observation", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
       break;
     }
     default:
@@ -3348,7 +3348,8 @@ async function handlePostToolUse(hook, project) {
     started_at: Date.now(),
     status: "active"
   });
-  const entities = extractEntities(hook);
+  const promptNum = Math.max(0, store.getMessageCount(hook.session_id, "user") - 1);
+  const entities = extractEntities(hook, promptNum);
   for (const entity of entities) {
     store.insertEntity({ ...entity, project });
   }
@@ -3392,8 +3393,8 @@ async function handleUserPromptSubmit(hook, project) {
     status: "active"
   });
   const promptText = cleanPrompt || hook.prompt;
+  const promptNum = store.getMessageCount(hook.session_id, "user");
   if (promptText.trim().length > 0 && !isSyntheticUserMessage(promptText)) {
-    const promptNum = store.getMessageCount(hook.session_id, "user");
     store.insertMessage({
       session_id: hook.session_id,
       project,
@@ -3403,7 +3404,7 @@ async function handleUserPromptSubmit(hook, project) {
       timestamp: Date.now()
     });
   }
-  const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
+  const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, promptNum);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
   const state = loadInjectionState(hook.session_id);
@@ -4954,7 +4955,10 @@ class SessionSummarizer {
     const userPrompts = arc.map((m) => m.content.slice(0, 250));
     const outcome = messages.filter((m) => m.role === "assistant").slice(-2).map((m) => m.content.slice(0, 400));
     const conversationDigest = userPrompts.length > 0 ? `User requests${arcNote}: ${userPrompts.join("; ")}` : "";
-    const obsValues = observations.slice(0, 8).map((o) => o.entity_value);
+    const obsValues = observations.slice(0, 8).map((o) => {
+      const ctx = o.context ? ` \u2192 ${o.context.slice(0, 200)}` : "";
+      return o.entity_value.slice(0, 150) + ctx;
+    });
     let summaryText;
     let tier = "rule-based";
     const llmMode = process.env["CLAUDE_MEMORY_HUB_LLM"] ?? "auto";
@@ -5114,7 +5118,7 @@ function buildSessionEdges(sessionId, project, db) {
       upsert.run(project, "error", key(err.entity_value), "file", key(target.entity_value), "error_in", 1, now, now);
       edges++;
     }
-    const decisions = entities.filter((e) => (e.entity_type === "decision" || e.entity_type === "observation") && e.importance >= 3).slice(0, 10);
+    const decisions = entities.filter((e) => (e.entity_type === "decision" || e.entity_type === "observation") && e.importance >= 3).filter((e) => !e.entity_value.startsWith("agent:") && !e.entity_value.startsWith("skill:")).slice(0, 10);
     for (const dec of decisions) {
       let linked = 0;
       for (const f of modified) {
@@ -8823,7 +8827,7 @@ function buildSummaryText(s) {
 // package.json
 var package_default = {
   name: "claude-memory-hub",
-  version: "0.18.2",
+  version: "0.18.3",
   description: "Persistent memory system for Claude Code. Zero API key. Zero Python. 7 hooks + MCP server + SQLite FTS5 + semantic search + knowledge graph + two-way Obsidian vault.",
   type: "module",
   main: "dist/index.js",

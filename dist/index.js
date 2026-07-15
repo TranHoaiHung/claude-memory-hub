@@ -9150,14 +9150,14 @@ function extractEntities(hook, promptNumber = 0) {
       const subagentType = stringField2(tool_input, "subagent_type") ?? "general-purpose";
       const prompt = stringField2(tool_input, "prompt") ?? "";
       const agentResult = extractAgentResult(tool_response);
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
+      raw.push(makeEntity(session_id, project, tool_name, "observation", `agent:${subagentType}: ${prompt.slice(0, 200)}`, 3, now, promptNumber, agentResult || undefined));
       break;
     }
     case "Skill": {
       const skillName = stringField2(tool_input, "skill") ?? "unknown";
       const args = stringField2(tool_input, "args") ?? "";
       const skillResult = extractAgentResult(tool_response);
-      raw.push(makeEntity(session_id, project, tool_name, "decision", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
+      raw.push(makeEntity(session_id, project, tool_name, "observation", `skill:${skillName} ${args.slice(0, 120)}`.trim(), 2, now, promptNumber, skillResult || undefined));
       break;
     }
     default:
@@ -9801,7 +9801,8 @@ async function handlePostToolUse(hook, project) {
     started_at: Date.now(),
     status: "active"
   });
-  const entities = extractEntities(hook);
+  const promptNum = Math.max(0, store.getMessageCount(hook.session_id, "user") - 1);
+  const entities = extractEntities(hook, promptNum);
   for (const entity of entities) {
     store.insertEntity({ ...entity, project });
   }
@@ -9845,8 +9846,8 @@ async function handleUserPromptSubmit(hook, project) {
     status: "active"
   });
   const promptText = cleanPrompt || hook.prompt;
+  const promptNum = store.getMessageCount(hook.session_id, "user");
   if (promptText.trim().length > 0 && !isSyntheticUserMessage(promptText)) {
-    const promptNum = store.getMessageCount(hook.session_id, "user");
     store.insertMessage({
       session_id: hook.session_id,
       project,
@@ -9856,7 +9857,7 @@ async function handleUserPromptSubmit(hook, project) {
       timestamp: Date.now()
     });
   }
-  const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, 0);
+  const promptObs = extractObservationFromPrompt(cleanPrompt || hook.prompt, hook.session_id, project, promptNum);
   if (promptObs)
     store.insertEntity({ ...promptObs, project });
   const state = loadInjectionState(hook.session_id);
